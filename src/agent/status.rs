@@ -249,6 +249,22 @@ impl StatusBlock {
         self.active_workers.iter().any(|w| w.id == worker_id)
     }
 
+    /// Check if an active worker already exists with a matching task.
+    ///
+    /// The status block stores OpenCode tasks with a `[opencode] ` prefix, so
+    /// comparisons strip that prefix before matching. Returns the existing
+    /// worker's ID if found.
+    pub fn find_duplicate_worker_task(&self, task: &str) -> Option<WorkerId> {
+        let normalized = task.strip_prefix("[opencode] ").unwrap_or(task);
+        self.active_workers.iter().find_map(|worker| {
+            let existing = worker
+                .task
+                .strip_prefix("[opencode] ")
+                .unwrap_or(&worker.task);
+            (existing == normalized).then_some(worker.id)
+        })
+    }
+
     /// Get the number of active branches.
     pub fn active_branch_count(&self) -> usize {
         self.active_branches.len()

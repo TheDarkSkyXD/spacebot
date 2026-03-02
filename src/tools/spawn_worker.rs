@@ -147,6 +147,19 @@ impl Tool for SpawnWorkerTool {
         let readiness = self.state.deps.runtime_config.work_readiness();
         let is_opencode = args.worker_type.as_deref() == Some("opencode");
 
+        // Reject if an active worker already has the same task. This prevents
+        // duplicate workers when the LLM emits multiple spawn_worker calls in
+        // a single response and one fails/retries.
+        {
+            let status = self.state.status_block.read().await;
+            if let Some(existing_id) = status.find_duplicate_worker_task(&args.task) {
+                return Err(SpawnWorkerError(format!(
+                    "a worker is already running this task (worker {existing_id}). \
+                     Wait for it to complete or cancel it before spawning another."
+                )));
+            }
+        }
+
         let worker_id = if is_opencode {
             let directory = args.directory.as_deref().ok_or_else(|| {
                 SpawnWorkerError("directory is required for opencode workers".into())

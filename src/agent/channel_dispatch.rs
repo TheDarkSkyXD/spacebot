@@ -234,6 +234,25 @@ async fn check_worker_limit(state: &ChannelState) -> std::result::Result<(), Age
     Ok(())
 }
 
+/// Reject spawn if an active worker already has the same task.
+///
+/// This prevents duplicate workers when the LLM emits multiple spawn_worker
+/// calls in a single response and one fails then gets retried on the next
+/// depth.
+async fn check_duplicate_task(
+    state: &ChannelState,
+    task: &str,
+) -> std::result::Result<(), AgentError> {
+    let status = state.status_block.read().await;
+    if let Some(existing_id) = status.find_duplicate_worker_task(task) {
+        return Err(AgentError::DuplicateWorkerTask {
+            channel_id: state.channel_id.to_string(),
+            existing_worker_id: existing_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Spawn a worker from a ChannelState. Used by the SpawnWorkerTool.
 pub async fn spawn_worker_from_state(
     state: &ChannelState,
@@ -242,8 +261,9 @@ pub async fn spawn_worker_from_state(
     suggested_skills: &[&str],
 ) -> std::result::Result<WorkerId, AgentError> {
     check_worker_limit(state).await?;
-    ensure_dispatch_readiness(state, "worker");
     let task = task.into();
+    check_duplicate_task(state, &task).await?;
+    ensure_dispatch_readiness(state, "worker");
 
     let rc = &state.deps.runtime_config;
     let prompt_engine = rc.prompts.load();
@@ -376,8 +396,9 @@ pub async fn spawn_opencode_worker_from_state(
     interactive: bool,
 ) -> std::result::Result<crate::WorkerId, AgentError> {
     check_worker_limit(state).await?;
-    ensure_dispatch_readiness(state, "opencode_worker");
     let task = task.into();
+    check_duplicate_task(state, &task).await?;
+    ensure_dispatch_readiness(state, "opencode_worker");
     let directory = std::path::PathBuf::from(directory);
 
     let rc = &state.deps.runtime_config;
