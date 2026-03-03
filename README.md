@@ -560,3 +560,26 @@ Formatting is still enforced in CI, but the hook catches it earlier by running `
 ## License
 
 FSL-1.1-ALv2 — [Functional Source License](https://fsl.software/), converting to Apache 2.0 after two years. See [LICENSE](LICENSE) for details.
+
+
+## 安装
+
+```bash
+pip install package-name
+```
+
+或使用conda:
+
+```bash
+conda install -c conda-forge package-name
+```
+
+## 使用示例
+
+```python
+import package_name
+
+# 基本用法
+result = package_name.do_something()
+print(result)
+```
