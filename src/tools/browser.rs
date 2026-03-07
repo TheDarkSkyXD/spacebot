@@ -984,12 +984,31 @@ impl BrowserTool {
 
         match act_kind {
             ActKind::Click => {
-                let element = self.resolve_element_ref(&state, page, element_ref).await?;
-                element
-                    .click()
-                    .await
-                    .map_err(|error| BrowserError::new(format!("click failed: {error}")))?;
-                Ok(BrowserOutput::success("Clicked element"))
+                let selector_js = self.build_js_selector(&state, element_ref)?;
+                let js = format!(
+                    r#"(() => {{
+                        {selector_js}
+                        el.scrollIntoView({{block: 'center'}});
+                        el.click();
+                        return JSON.stringify({{
+                            success: true,
+                            tag: el.tagName,
+                            text: el.textContent.substring(0, 100).trim()
+                        }});
+                    }})()"#
+                );
+                let result = self.run_js_action(page, &js).await?;
+                let tag = result
+                    .get("tag")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("element");
+                let text = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let display = if text.is_empty() {
+                    format!("Clicked {tag}")
+                } else {
+                    format!("Clicked {tag}: '{}'", truncate_for_display(text, 50))
+                };
+                Ok(BrowserOutput::success(display))
             }
             ActKind::Type => {
                 let Some(text) = text else {
@@ -998,15 +1017,20 @@ impl BrowserTool {
                          example: {\"action\": \"act\", \"act_kind\": \"type\", \"element_ref\": \"e5\", \"text\": \"hello\"}",
                     ));
                 };
-                let element = self.resolve_element_ref(&state, page, element_ref).await?;
-                element
-                    .click()
-                    .await
-                    .map_err(|error| BrowserError::new(format!("focus failed: {error}")))?;
-                element
-                    .type_str(&text)
-                    .await
-                    .map_err(|error| BrowserError::new(format!("type failed: {error}")))?;
+                let selector_js = self.build_js_selector(&state, element_ref)?;
+                let text_json = serde_json::to_string(&text).unwrap_or_default();
+                let js = format!(
+                    r#"(() => {{
+                        {selector_js}
+                        let txt = {text_json};
+                        el.focus();
+                        el.value = txt;
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return JSON.stringify({{success: true}});
+                    }})()"#
+                );
+                self.run_js_action(page, &js).await?;
                 Ok(BrowserOutput::success(format!(
                     "Typed '{}' into element",
                     truncate_for_display(&text, 50)
@@ -1019,41 +1043,165 @@ impl BrowserTool {
                          example: {\"action\": \"act\", \"act_kind\": \"press_key\", \"key\": \"Enter\"}",
                     ));
                 };
+                // press_key can work without an element ref (sends to page)
                 if element_ref.is_some() {
-                    let element = self.resolve_element_ref(&state, page, element_ref).await?;
-                    element
-                        .press_key(&key)
-                        .await
-                        .map_err(|error| BrowserError::new(format!("press_key failed: {error}")))?;
+                    let selector_js = self.build_js_selector(&state, element_ref)?;
+                    let key_json = serde_json::to_string(&key).unwrap_or_default();
+                    let js = format!(
+                        r#"(() => {{
+                            {selector_js}
+                            el.focus();
+                            el.dispatchEvent(new KeyboardEvent('keydown', {{key: {key_json}, bubbles: true}}));
+                            el.dispatchEvent(new KeyboardEvent('keyup', {{key: {key_json}, bubbles: true}}));
+                            return JSON.stringify({{success: true}});
+                        }})()"#
+                    );
+                    self.run_js_action(page, &js).await?;
                 } else {
                     dispatch_key_press(page, &key).await?;
                 }
                 Ok(BrowserOutput::success(format!("Pressed key '{key}'")))
             }
             ActKind::Hover => {
-                let element = self.resolve_element_ref(&state, page, element_ref).await?;
-                element
-                    .hover()
-                    .await
-                    .map_err(|error| BrowserError::new(format!("hover failed: {error}")))?;
+                let selector_js = self.build_js_selector(&state, element_ref)?;
+                let js = format!(
+                    r#"(() => {{
+                        {selector_js}
+                        el.scrollIntoView({{block: 'center'}});
+                        el.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
+                        el.dispatchEvent(new MouseEvent('mouseenter', {{bubbles: true}}));
+                        return JSON.stringify({{success: true}});
+                    }})()"#
+                );
+                self.run_js_action(page, &js).await?;
                 Ok(BrowserOutput::success("Hovered over element"))
             }
             ActKind::ScrollIntoView => {
-                let element = self.resolve_element_ref(&state, page, element_ref).await?;
-                element.scroll_into_view().await.map_err(|error| {
-                    BrowserError::new(format!("scroll_into_view failed: {error}"))
-                })?;
+                let selector_js = self.build_js_selector(&state, element_ref)?;
+                let js = format!(
+                    r#"(() => {{
+                        {selector_js}
+                        el.scrollIntoView({{block: 'center', behavior: 'smooth'}});
+                        return JSON.stringify({{success: true}});
+                    }})()"#
+                );
+                self.run_js_action(page, &js).await?;
                 Ok(BrowserOutput::success("Scrolled element into view"))
             }
             ActKind::Focus => {
-                let element = self.resolve_element_ref(&state, page, element_ref).await?;
-                element
-                    .focus()
-                    .await
-                    .map_err(|error| BrowserError::new(format!("focus failed: {error}")))?;
+                let selector_js = self.build_js_selector(&state, element_ref)?;
+                let js = format!(
+                    r#"(() => {{
+                        {selector_js}
+                        el.focus();
+                        return JSON.stringify({{success: true}});
+                    }})()"#
+                );
+                self.run_js_action(page, &js).await?;
                 Ok(BrowserOutput::success("Focused element"))
             }
         }
+    }
+
+    /// Build a JS snippet that resolves an element ref to a DOM element stored in `el`.
+    ///
+    /// Uses the accessibility tree ref's role and name to build CSS selectors,
+    /// with a text-content fallback across all interactive elements. This is
+    /// injected into a JS IIFE that must return a JSON result.
+    fn build_js_selector(
+        &self,
+        state: &BrowserState,
+        element_ref: Option<String>,
+    ) -> Result<String, BrowserError> {
+        let Some(ref_id) = element_ref else {
+            return Err(BrowserError::new(
+                "element_ref is required for this action — run snapshot first, \
+                 then use a ref like \"e0\", \"e1\" from the results",
+            ));
+        };
+
+        let elem_ref = state.element_refs.get(&ref_id).ok_or_else(|| {
+            BrowserError::new(format!(
+                "unknown element ref '{ref_id}' — run snapshot first to get fresh element refs"
+            ))
+        })?;
+
+        // Build CSS selectors to try, plus a text-content fallback.
+        let selectors = build_selectors_for_ref(elem_ref);
+        let selectors_json = serde_json::to_string(&selectors).unwrap_or_default();
+        let name_json = serde_json::to_string(&elem_ref.name).unwrap_or("null".to_string());
+
+        // JS that tries each CSS selector, then falls back to text matching
+        // across interactive elements. Sets `el` or returns an error.
+        Ok(format!(
+            r#"let el = null;
+            const selectors = {selectors_json};
+            for (const sel of selectors) {{
+                el = document.querySelector(sel);
+                if (el) break;
+            }}
+            if (!el) {{
+                const name = {name_json};
+                if (name) {{
+                    const candidates = document.querySelectorAll(
+                        'a, button, [role="button"], input, select, textarea, [onclick], [tabindex]'
+                    );
+                    const lower = name.toLowerCase();
+                    for (const e of candidates) {{
+                        const text = (e.textContent || '').trim().toLowerCase();
+                        const label = (e.getAttribute('aria-label') || '').toLowerCase();
+                        const title = (e.getAttribute('title') || '').toLowerCase();
+                        if (text === lower || label === lower || title === lower) {{ el = e; break; }}
+                    }}
+                    if (!el) {{
+                        for (const e of candidates) {{
+                            const text = (e.textContent || '').trim().toLowerCase();
+                            if (text.includes(lower)) {{ el = e; break; }}
+                        }}
+                    }}
+                }}
+            }}
+            if (!el) return JSON.stringify({{
+                success: false,
+                error: 'Element not found for ref {ref_id}. Run snapshot again to get fresh refs.'
+            }});"#
+        ))
+    }
+
+    /// Execute a JS action and parse the JSON result.
+    async fn run_js_action(
+        &self,
+        page: &chromiumoxide::Page,
+        js: &str,
+    ) -> Result<serde_json::Value, BrowserError> {
+        let result = page
+            .evaluate(js)
+            .await
+            .map_err(|error| BrowserError::new(format!("JS execution failed: {error}")))?;
+
+        let value = result.value().cloned().unwrap_or(serde_json::Value::Null);
+
+        // The JS returns a JSON string — parse it
+        let parsed = if let Some(json_str) = value.as_str() {
+            serde_json::from_str::<serde_json::Value>(json_str).unwrap_or(value)
+        } else {
+            value
+        };
+
+        // Check for JS-level errors
+        let success = parsed
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !success {
+            let error = parsed
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("action failed");
+            return Err(BrowserError::new(error.to_string()));
+        }
+
+        Ok(parsed)
     }
 
     async fn handle_screenshot(
@@ -1065,9 +1213,48 @@ impl BrowserTool {
         let page = self.require_active_page(&state)?;
 
         let screenshot_data = if let Some(ref_id) = element_ref {
-            let element = self.resolve_element_ref(&state, page, Some(ref_id)).await?;
-            element
-                .screenshot(CaptureScreenshotFormat::Png)
+            // Use JS to find the element and get its bounding rect, then take
+            // a clipped page screenshot. This avoids stale CDP node IDs.
+            let selector_js = self.build_js_selector(&state, Some(ref_id))?;
+            let js = format!(
+                r#"(() => {{
+                    {selector_js}
+                    el.scrollIntoView({{block: 'center'}});
+                    const rect = el.getBoundingClientRect();
+                    return JSON.stringify({{
+                        success: true,
+                        x: rect.x + window.scrollX,
+                        y: rect.y + window.scrollY,
+                        width: rect.width,
+                        height: rect.height
+                    }});
+                }})()"#
+            );
+            let result = self.run_js_action(page, &js).await?;
+            let x = result.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = result.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let width = result
+                .get("width")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(800.0);
+            let height = result
+                .get("height")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(600.0);
+
+            use chromiumoxide_cdp::cdp::browser_protocol::page::Viewport;
+            let clip = Viewport {
+                x,
+                y,
+                width,
+                height,
+                scale: 1.0,
+            };
+            let params = ScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .clip(clip)
+                .build();
+            page.screenshot(params)
                 .await
                 .map_err(|error| BrowserError::new(format!("element screenshot failed: {error}")))?
         } else {
@@ -1332,50 +1519,6 @@ impl BrowserTool {
             .get(target)
             .ok_or_else(|| BrowserError::new("active tab no longer exists"))
     }
-
-    /// Resolve an element ref (like "e3") to a chromiumoxide Element on the page.
-    async fn resolve_element_ref(
-        &self,
-        state: &BrowserState,
-        page: &chromiumoxide::Page,
-        element_ref: Option<String>,
-    ) -> Result<chromiumoxide::Element, BrowserError> {
-        let Some(ref_id) = element_ref else {
-            return Err(BrowserError::new(
-                "element_ref is required for this action — run snapshot first, \
-                 then use a ref like \"e0\", \"e1\" from the results",
-            ));
-        };
-
-        let elem_ref = state.element_refs.get(&ref_id).ok_or_else(|| {
-            BrowserError::new(format!(
-                "unknown element ref '{ref_id}' — run snapshot first to get fresh element refs"
-            ))
-        })?;
-
-        // Try multiple selector strategies. The accessibility tree role doesn't
-        // always map to an explicit [role] attribute in the DOM — native HTML
-        // elements (button, input, a) have implicit ARIA roles without the
-        // attribute being present.
-        let selectors = build_selectors_for_ref(elem_ref);
-
-        for selector in &selectors {
-            if let Ok(element) = page.find_element(selector).await {
-                return Ok(element);
-            }
-        }
-
-        Err(BrowserError::new(format!(
-            "failed to find element for ref '{ref_id}' \
-             (role: {}, name: {:?}) — the page may have changed since \
-             the last snapshot. Run snapshot again to get fresh refs, \
-             then retry with the updated ref. \
-             Selectors tried: {}",
-            elem_ref.role,
-            elem_ref.name,
-            selectors.join(", "),
-        )))
-    }
 }
 
 /// Dispatch a key press event to the page via CDP Input domain.
@@ -1427,9 +1570,11 @@ fn role_to_native_tag(role: &str) -> Option<&'static str> {
         "slider" => Some("input[type='range']"),
         "spinbutton" => Some("input[type='number']"),
         "combobox" => Some("select"),
+        "option" => Some("option"),
+        "listbox" => Some("select"),
         "switch" => Some("input[type='checkbox']"),
-        "tab" => Some("[role='tab']"),
         "menuitem" => Some("[role='menuitem']"),
+        "tab" => Some("[role='tab']"),
         _ => None,
     }
 }
