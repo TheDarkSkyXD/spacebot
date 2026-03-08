@@ -1,9 +1,8 @@
 //! Spawn worker tool for creating new workers.
 
 use crate::WorkerId;
-use crate::agent::channel::{
-    ChannelState, spawn_opencode_worker_from_state, spawn_worker_from_state,
-};
+use crate::agent::channel::ChannelState;
+use crate::agent::channel_dispatch::{spawn_opencode_worker_from_state, spawn_worker_from_state};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use schemars::JsonSchema;
@@ -40,16 +39,26 @@ pub struct SpawnWorkerArgs {
     /// suggested skills are flagged as recommended for this task.
     #[serde(default)]
     pub suggested_skills: Vec<String>,
-    /// Worker type: "builtin" (default) runs a Rig agent loop with shell/file/exec
+    /// Worker type: "builtin" (default) runs a Rig agent loop with shell/file
     /// tools. "opencode" spawns an OpenCode subprocess with full coding agent
     /// capabilities. Use "opencode" for complex coding tasks that benefit from
     /// codebase exploration and context management.
     #[serde(default)]
     pub worker_type: Option<String>,
-    /// Working directory for the worker. Required for "opencode" workers.
-    /// The OpenCode agent will operate in this directory.
+    /// Working directory for the worker. Required for "opencode" workers
+    /// unless project_id or worktree_id is set. The OpenCode agent will
+    /// operate in this directory.
     #[serde(default)]
     pub directory: Option<String>,
+    /// Project ID to associate this worker with. When set, the worker gets
+    /// project context in its prompt. If directory is not specified, defaults
+    /// to the project root.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Worktree ID within the project. If set, the worker's directory is
+    /// automatically set to the worktree path.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
 }
 
 /// Output from spawn worker tool.
@@ -78,7 +87,7 @@ impl Tool for SpawnWorkerTool {
         let web_search_enabled = rc.brave_search_key.load().is_some();
         let opencode_enabled = rc.opencode.load().enabled;
 
-        let mut tools_list = vec!["shell", "file", "exec"];
+        let mut tools_list = vec!["shell", "file_read", "file_write", "file_edit", "file_list"];
         if browser_enabled {
             tools_list.push("browser");
         }
@@ -87,7 +96,7 @@ impl Tool for SpawnWorkerTool {
         }
 
         let opencode_note = if opencode_enabled {
-            " Set worker_type to \"opencode\" with a directory path for complex coding tasks — this spawns a full OpenCode coding agent with codebase exploration, context management, and its own tool suite."
+            " Set `worker_type` to \"opencode\" with a `directory` path for complex coding tasks — this spawns a full OpenCode coding agent with codebase exploration, context management, and its own tool suite. If `worker_type` is omitted, the builtin worker is used."
         } else {
             ""
         };
@@ -105,7 +114,7 @@ impl Tool for SpawnWorkerTool {
             "interactive": {
                 "type": "boolean",
                 "default": false,
-                "description": "If true, the worker stays alive and accepts follow-up messages via route_to_worker. If false (default), the worker runs once and returns."
+                "description": "If true, the worker stays alive and accepts follow-up messages via route_to_worker. If false (default), the worker runs once and returns. OpenCode workers are always interactive regardless of this flag."
             },
             "suggested_skills": {
                 "type": "array",
@@ -121,14 +130,28 @@ impl Tool for SpawnWorkerTool {
                     "type": "string",
                     "enum": ["builtin", "opencode"],
                     "default": "builtin",
-                    "description": "\"builtin\" (default) runs a Rig agent loop. \"opencode\" spawns a full OpenCode coding agent — use for complex multi-file coding tasks."
+                    "description": "\"builtin\" (default) runs a Rig agent loop. \"opencode\" spawns a full OpenCode coding agent — use for complex multi-file coding tasks. Do not claim OpenCode unless this field is explicitly set to \"opencode\"."
                 }),
             );
             obj.insert(
                 "directory".to_string(),
                 serde_json::json!({
                     "type": "string",
-                    "description": "Working directory for the worker. Required when worker_type is \"opencode\". The OpenCode agent operates in this directory."
+                    "description": "Working directory for the worker. Required when worker_type is \"opencode\" unless project_id or worktree_id is set. The OpenCode agent operates in this directory."
+                }),
+            );
+            obj.insert(
+                "project_id".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Project ID to associate this worker with. When set, the worker gets project context. If directory is not specified, defaults to the project root."
+                }),
+            );
+            obj.insert(
+                "worktree_id".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Worktree ID within the project. If set, the worker's directory is automatically set to the worktree path."
                 }),
             );
         }
@@ -148,12 +171,24 @@ impl Tool for SpawnWorkerTool {
         let readiness = self.state.deps.runtime_config.work_readiness();
         let is_opencode = args.worker_type.as_deref() == Some("opencode");
 
+        // Resolve working directory from project/worktree if not explicitly set.
+        let resolved_directory = resolve_directory_from_project(
+            &self.state.deps,
+            args.directory.as_deref(),
+            args.project_id.as_deref(),
+            args.worktree_id.as_deref(),
+        )
+        .await;
+
         let worker_id = if is_opencode {
-            let directory = args.directory.as_deref().ok_or_else(|| {
-                SpawnWorkerError("directory is required for opencode workers".into())
+            let directory = resolved_directory.as_deref().ok_or_else(|| {
+                SpawnWorkerError(
+                    "directory is required for opencode workers (set directory, project_id, or worktree_id)".into(),
+                )
             })?;
 
-            spawn_opencode_worker_from_state(&self.state, &args.task, directory, args.interactive)
+            // OpenCode workers are always interactive — ignore args.interactive.
+            spawn_opencode_worker_from_state(&self.state, &args.task, directory, true)
                 .await
                 .map_err(|e| SpawnWorkerError(format!("{e}")))?
         } else {
@@ -171,8 +206,19 @@ impl Tool for SpawnWorkerTool {
             .map_err(|e| SpawnWorkerError(format!("{e}")))?
         };
 
+        // Link the worker to project/worktree if specified (fire-and-forget update).
+        if args.project_id.is_some() || args.worktree_id.is_some() {
+            self.state.process_run_logger.log_worker_project_link(
+                worker_id,
+                args.project_id.as_deref(),
+                args.worktree_id.as_deref(),
+            );
+        }
+
         let worker_type_label = if is_opencode { "OpenCode" } else { "builtin" };
-        let message = if args.interactive {
+        // OpenCode workers are always interactive regardless of args.interactive.
+        let effectively_interactive = args.interactive || is_opencode;
+        let message = if effectively_interactive {
             format!(
                 "Interactive {worker_type_label} worker {worker_id} spawned for: {}. Route follow-ups with route_to_worker.",
                 args.task
@@ -199,8 +245,59 @@ impl Tool for SpawnWorkerTool {
         Ok(SpawnWorkerOutput {
             worker_id,
             spawned: true,
-            interactive: args.interactive,
+            interactive: effectively_interactive,
             message: format!("{message}{readiness_note}"),
         })
     }
+}
+
+/// Resolve a working directory from project/worktree IDs.
+///
+/// Priority: explicit `directory` > `worktree_id` > `project_id` root.
+/// Returns the explicit directory if set, otherwise looks up worktree or
+/// project root from the store.
+async fn resolve_directory_from_project(
+    deps: &crate::AgentDeps,
+    directory: Option<&str>,
+    project_id: Option<&str>,
+    worktree_id: Option<&str>,
+) -> Option<String> {
+    // Explicit directory takes precedence.
+    if let Some(dir) = directory {
+        return Some(dir.to_string());
+    }
+
+    let store = &deps.project_store;
+    let agent_id = &deps.agent_id;
+
+    // Worktree resolution: look up the worktree, derive absolute path from project root.
+    if let Some(worktree_id) = worktree_id
+        && let Ok(Some(worktree)) = store.get_worktree(worktree_id).await
+    {
+        // Always use the worktree's own project_id to resolve the path.
+        // If the caller also provided a project_id, verify it matches.
+        if let Some(pid) = project_id
+            && pid != worktree.project_id
+        {
+            tracing::warn!(
+                worktree_id,
+                provided_project_id = pid,
+                actual_project_id = %worktree.project_id,
+                "project_id/worktree_id mismatch — using worktree's project"
+            );
+        }
+        if let Ok(Some(project)) = store.get_project(agent_id, &worktree.project_id).await {
+            let abs_path = std::path::Path::new(&project.root_path).join(&worktree.path);
+            return Some(abs_path.to_string_lossy().to_string());
+        }
+    }
+
+    // Project root resolution.
+    if let Some(project_id) = project_id
+        && let Ok(Some(project)) = store.get_project(agent_id, project_id).await
+    {
+        return Some(project.root_path.clone());
+    }
+
+    None
 }

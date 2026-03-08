@@ -49,6 +49,9 @@ enum Command {
     /// Manage authentication
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Manage secrets stored in the running instance
+    #[command(subcommand)]
+    Secrets(SecretsCommand),
 }
 
 #[derive(Subcommand)]
@@ -115,6 +118,64 @@ enum SkillCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum SecretsCommand {
+    /// Show store state and secret counts
+    Status,
+    /// List all secrets (name + category)
+    List,
+    /// Add or update a secret
+    Set {
+        /// Secret name (e.g. GH_TOKEN)
+        name: String,
+        /// Secret category (system or tool)
+        #[arg(short, long)]
+        category: Option<String>,
+        /// Read value from stdin instead of interactive prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Delete a secret
+    Delete {
+        /// Secret name
+        name: String,
+    },
+    /// Show secret metadata and config references
+    Info {
+        /// Secret name
+        name: String,
+    },
+    /// Auto-migrate plaintext keys from config.toml
+    Migrate,
+    /// Enable encryption (generate master key, encrypt all secrets)
+    Encrypt,
+    /// Unlock encrypted store
+    Unlock {
+        /// Read master key from stdin instead of interactive prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Lock encrypted store (clear key from memory)
+    Lock,
+    /// Rotate master key (encrypted mode only)
+    Rotate,
+    /// Export all secrets to a backup file
+    Export {
+        /// Output file path
+        #[arg(short, long)]
+        output: std::path::PathBuf,
+    },
+    /// Import secrets from a backup file
+    Import {
+        /// Input file path
+        #[arg(short, long)]
+        input: std::path::PathBuf,
+        /// Overwrite existing secrets with same name
+        #[arg(long)]
+        overwrite: bool,
+    },
+}
+
 /// Tracks an active conversation channel and its message sender.
 struct ActiveChannel {
     message_tx: mpsc::Sender<spacebot::InboundMessage>,
@@ -144,6 +205,7 @@ fn main() -> anyhow::Result<()> {
         Command::Status => cmd_status(),
         Command::Skill(skill_cmd) => cmd_skill(cli.config, skill_cmd),
         Command::Auth(auth_cmd) => cmd_auth(cli.config, auth_cmd),
+        Command::Secrets(secrets_cmd) => cmd_secrets(cli.config, secrets_cmd),
     }
 }
 
@@ -152,7 +214,10 @@ fn cmd_start(
     debug: bool,
     foreground: bool,
 ) -> anyhow::Result<()> {
-    let paths = spacebot::daemon::DaemonPaths::from_default();
+    // Use the config path (if provided) to derive the correct instance dir
+    // for the PID check, so it matches the PID file written during daemonize.
+    let instance_dir = resolve_instance_dir(&config_path);
+    let paths = spacebot::daemon::DaemonPaths::new(&instance_dir);
 
     // Bail if already running
     if let Some(pid) = spacebot::daemon::is_running(&paths) {
@@ -170,19 +235,28 @@ fn cmd_start(
         None
     };
 
-    // Validate config loads successfully before forking
-    let config = load_config(&resolved_config_path)?;
-
     if !foreground {
-        // Fork the process before creating any Tokio runtime. After daemonize()
-        // returns, we are in the child process — the parent has exited. Any
-        // runtime created before this point would be in a broken state inside
-        // the child (Tokio's I/O driver and thread pool don't survive fork),
-        // which is why tracing init (and the OTLP batch exporter it creates)
-        // must happen *after* this call.
-        let paths = spacebot::daemon::DaemonPaths::new(&config.instance_dir);
+        // Fork BEFORE touching the macOS Keychain or any CoreFoundation API.
+        //
+        // bootstrap_secrets_store() loads the master key from the macOS Keychain
+        // (Security framework), which initializes CoreFoundation internally.
+        // On macOS, CoreFoundation state is not safe to use after fork() — the
+        // child process receives SIGBUS from the kernel. To avoid this, we
+        // determine the instance directory (needed for the PID file path)
+        // without loading the full config or accessing the Keychain, then fork
+        // first. Config loading and secrets resolution happen in the child.
+        //
+        // Tokio's I/O driver and thread pool also don't survive fork, so the
+        // runtime and tracing init must happen after this call as well.
         spacebot::daemon::daemonize(&paths)?;
     }
+
+    // Open the instance-level secrets store so `secret:` references in config.toml
+    // resolve during Config::load(). Now safe to access the macOS Keychain —
+    // we are either in foreground mode (no fork) or in the daemon child process.
+    let bootstrapped_store = bootstrap_secrets_store(&resolved_config_path);
+
+    let config = load_config(&resolved_config_path)?;
 
     // Build a fresh Tokio runtime in this process (the child after daemonize,
     // or the foreground process). Tracing init — including the OTLP batch
@@ -202,8 +276,21 @@ fn cmd_start(
             spacebot::daemon::init_background_tracing(&paths, debug, &config.telemetry)
         };
 
-        run(config, foreground, otel_provider).await
+        run(config, foreground, otel_provider, bootstrapped_store).await
     })
+}
+
+/// Resolve the instance directory from the config path without loading the
+/// full config or touching platform credential stores. Used to determine
+/// daemon file paths (PID, socket) before fork.
+fn resolve_instance_dir(config_path: &Option<std::path::PathBuf>) -> std::path::PathBuf {
+    if let Some(path) = config_path {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    } else {
+        spacebot::config::Config::default_instance_dir()
+    }
 }
 
 #[tokio::main]
@@ -388,6 +475,475 @@ fn cmd_auth(config_path: Option<std::path::PathBuf>, auth_cmd: AuthCommand) -> a
             }
         }
     })
+}
+
+fn cmd_secrets(
+    config_path: Option<std::path::PathBuf>,
+    secrets_cmd: SecretsCommand,
+) -> anyhow::Result<()> {
+    // Bootstrap the secrets store so `secret:` references in config resolve.
+    bootstrap_secrets_store(&config_path);
+
+    let config = load_config(&config_path)?;
+    let api_base = format!("http://{}:{}/api", config.api.bind, config.api.port);
+    let auth_token = config.api.auth_token.clone();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    runtime.block_on(async {
+        let client = reqwest::Client::new();
+
+        match secrets_cmd {
+            SecretsCommand::Status => {
+                let response =
+                    secrets_api_get(&client, &api_base, &auth_token, "secrets/status").await?;
+                let body: serde_json::Value = response.json().await?;
+                eprintln!(
+                    "State:          {}",
+                    body["state"].as_str().unwrap_or("unknown")
+                );
+                eprintln!(
+                    "Encrypted:      {}",
+                    body["encrypted"].as_bool().unwrap_or(false)
+                );
+                eprintln!(
+                    "Total secrets:  {}",
+                    body["secret_count"].as_u64().unwrap_or(0)
+                );
+                eprintln!(
+                    "  System:       {}",
+                    body["system_count"].as_u64().unwrap_or(0)
+                );
+                eprintln!(
+                    "  Tool:         {}",
+                    body["tool_count"].as_u64().unwrap_or(0)
+                );
+                if body["platform_managed"].as_bool().unwrap_or(false) {
+                    eprintln!("  Managed by:   platform");
+                }
+                Ok(())
+            }
+            SecretsCommand::List => {
+                let response = secrets_api_get(&client, &api_base, &auth_token, "secrets").await?;
+                let body: serde_json::Value = response.json().await?;
+                let secrets = body["secrets"].as_array();
+                match secrets {
+                    Some(list) if !list.is_empty() => {
+                        eprintln!("{:<30} {:<10} UPDATED", "NAME", "CATEGORY");
+                        for secret in list {
+                            let name = secret["name"].as_str().unwrap_or("");
+                            let category = secret["category"].as_str().unwrap_or("");
+                            let updated = secret["updated_at"].as_str().unwrap_or("");
+                            // Truncate ISO timestamp to date + time.
+                            let short_date = &updated[..updated.len().min(16)];
+                            eprintln!("{:<30} {:<10} {}", name, category, short_date);
+                        }
+                    }
+                    _ => {
+                        eprintln!("No secrets stored.");
+                    }
+                }
+                Ok(())
+            }
+            SecretsCommand::Set {
+                name,
+                category,
+                stdin,
+            } => {
+                let value = if stdin {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf.trim_end().to_string()
+                } else {
+                    dialoguer::Password::new()
+                        .with_prompt("Enter value")
+                        .interact()
+                        .context("failed to read secret value")?
+                };
+
+                if value.is_empty() {
+                    anyhow::bail!("secret value cannot be empty");
+                }
+
+                let mut body = serde_json::json!({ "value": value });
+                if let Some(cat) = &category {
+                    body["category"] = serde_json::json!(cat);
+                }
+
+                let response = secrets_api_put(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    &format!("secrets/{name}"),
+                    &body,
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!(
+                        "Secret {} saved ({}).",
+                        result["name"].as_str().unwrap_or(&name),
+                        result["category"].as_str().unwrap_or("unknown")
+                    );
+                    if result["reload_required"].as_bool().unwrap_or(false) {
+                        eprintln!(
+                            "Note: Reload config or restart for the new value to take effect."
+                        );
+                    }
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("unknown error"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Delete { name } => {
+                let response =
+                    secrets_api_delete(&client, &api_base, &auth_token, &format!("secrets/{name}"))
+                        .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!("Deleted {}.", result["deleted"].as_str().unwrap_or(&name));
+                    if let Some(warning) = result["warning"].as_str() {
+                        eprintln!("Warning: {warning}");
+                    }
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("unknown error"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Info { name } => {
+                let response = secrets_api_get(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    &format!("secrets/{name}/info"),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let info: serde_json::Value = response.json().await?;
+                    eprintln!("Name:     {}", info["name"].as_str().unwrap_or(""));
+                    eprintln!("Category: {}", info["category"].as_str().unwrap_or(""));
+                    eprintln!("Created:  {}", info["created_at"].as_str().unwrap_or(""));
+                    eprintln!("Updated:  {}", info["updated_at"].as_str().unwrap_or(""));
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("secret not found"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Migrate => {
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/migrate",
+                    &serde_json::json!({}),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!(
+                        "{}",
+                        result["message"].as_str().unwrap_or("Migration complete.")
+                    );
+                    if let Some(migrated) = result["migrated"].as_array() {
+                        for item in migrated {
+                            eprintln!(
+                                "  {} -> {} ({})",
+                                item["config_key"].as_str().unwrap_or(""),
+                                item["secret_name"].as_str().unwrap_or(""),
+                                item["category"].as_str().unwrap_or(""),
+                            );
+                        }
+                    }
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("migration failed"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Encrypt => {
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/encrypt",
+                    &serde_json::json!({}),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!();
+                    eprintln!("Encryption enabled.");
+                    eprintln!();
+                    eprintln!(
+                        "Master key: {}",
+                        result["master_key"].as_str().unwrap_or("")
+                    );
+                    eprintln!();
+                    eprintln!("IMPORTANT: Save this master key. You will need it to unlock");
+                    eprintln!("the secret store after a reboot (Linux) or if the Keychain");
+                    eprintln!("is reset (macOS). This is the only time the key will be shown.");
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("encryption failed"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Unlock { stdin } => {
+                let master_key = if stdin {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf.trim().to_string()
+                } else {
+                    dialoguer::Password::new()
+                        .with_prompt("Enter master key")
+                        .interact()
+                        .context("failed to read master key")?
+                };
+
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/unlock",
+                    &serde_json::json!({ "master_key": master_key }),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!("{}", result["message"].as_str().unwrap_or("Unlocked."));
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("unlock failed"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Lock => {
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/lock",
+                    &serde_json::json!({}),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!("{}", result["message"].as_str().unwrap_or("Locked."));
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("lock failed"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Rotate => {
+                eprintln!("WARNING: This will invalidate your current master key.");
+                eprintln!("You will need to save the new key for future unlocks.");
+                eprint!("Continue? [y/N]: ");
+                let mut confirm = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut confirm)?;
+                if !confirm.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("Cancelled.");
+                    return Ok(());
+                }
+
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/rotate",
+                    &serde_json::json!({}),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!();
+                    eprintln!(
+                        "New master key: {}",
+                        result["master_key"].as_str().unwrap_or("")
+                    );
+                    eprintln!();
+                    eprintln!("IMPORTANT: Save this new key. Your old key no longer works.");
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("rotation failed"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Export { output } => {
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/export",
+                    &serde_json::json!({}),
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let body: serde_json::Value = response.json().await?;
+                    let count = body["count"].as_u64().unwrap_or(0);
+                    let content = serde_json::to_string_pretty(&body)
+                        .context("failed to serialize export data")?;
+                    // Write with restrictive permissions — this file contains
+                    // plaintext secrets.
+                    #[cfg(unix)]
+                    {
+                        use std::io::Write as _;
+                        use std::os::unix::fs::OpenOptionsExt as _;
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o600)
+                            .open(&output)
+                            .with_context(|| format!("failed to create {}", output.display()))?;
+                        file.write_all(content.as_bytes())
+                            .with_context(|| format!("failed to write {}", output.display()))?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::write(&output, content)
+                            .with_context(|| format!("failed to write {}", output.display()))?;
+                    }
+                    eprintln!("Exported {count} secrets to {}", output.display());
+
+                    if let Some(warning) = body["warning"].as_str() {
+                        eprintln!();
+                        eprintln!("WARNING: {warning}");
+                    }
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("export failed"));
+                }
+                Ok(())
+            }
+            SecretsCommand::Import { input, overwrite } => {
+                let content = std::fs::read_to_string(&input)
+                    .with_context(|| format!("failed to read {}", input.display()))?;
+                let mut import_data: serde_json::Value = serde_json::from_str(&content)
+                    .context("failed to parse backup file as JSON")?;
+
+                import_data["overwrite"] = serde_json::json!(overwrite);
+
+                let response = secrets_api_post(
+                    &client,
+                    &api_base,
+                    &auth_token,
+                    "secrets/import",
+                    &import_data,
+                )
+                .await?;
+
+                if response.status().is_success() {
+                    let result: serde_json::Value = response.json().await?;
+                    eprintln!(
+                        "{}",
+                        result["message"].as_str().unwrap_or("Import complete.")
+                    );
+                    if let Some(skipped) = result["skipped"].as_array()
+                        && !skipped.is_empty()
+                    {
+                        for name in skipped {
+                            eprintln!(
+                                "  {} -- kept existing (use --overwrite to replace)",
+                                name.as_str().unwrap_or("")
+                            );
+                        }
+                    }
+                } else {
+                    let error: serde_json::Value = response.json().await?;
+                    anyhow::bail!("{}", error["error"].as_str().unwrap_or("import failed"));
+                }
+                Ok(())
+            }
+        }
+    })
+}
+
+/// Build an authenticated HTTP request to the control API.
+fn secrets_api_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    api_base: &str,
+    auth_token: &Option<String>,
+    path: &str,
+) -> reqwest::RequestBuilder {
+    let url = format!("{api_base}/{path}");
+    let mut request = client.request(method, &url);
+    if let Some(token) = auth_token {
+        request = request.bearer_auth(token);
+    }
+    request
+}
+
+async fn secrets_api_get(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth_token: &Option<String>,
+    path: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let response = secrets_api_request(client, reqwest::Method::GET, api_base, auth_token, path)
+        .send()
+        .await
+        .context("failed to connect to spacebot API — is the daemon running?")?;
+    Ok(response)
+}
+
+async fn secrets_api_post(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth_token: &Option<String>,
+    path: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<reqwest::Response> {
+    let response = secrets_api_request(client, reqwest::Method::POST, api_base, auth_token, path)
+        .json(body)
+        .send()
+        .await
+        .context("failed to connect to spacebot API — is the daemon running?")?;
+    Ok(response)
+}
+
+async fn secrets_api_put(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth_token: &Option<String>,
+    path: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<reqwest::Response> {
+    let response = secrets_api_request(client, reqwest::Method::PUT, api_base, auth_token, path)
+        .json(body)
+        .send()
+        .await
+        .context("failed to connect to spacebot API — is the daemon running?")?;
+    Ok(response)
+}
+
+async fn secrets_api_delete(
+    client: &reqwest::Client,
+    api_base: &str,
+    auth_token: &Option<String>,
+    path: &str,
+) -> anyhow::Result<reqwest::Response> {
+    let response = secrets_api_request(client, reqwest::Method::DELETE, api_base, auth_token, path)
+        .send()
+        .await
+        .context("failed to connect to spacebot API — is the daemon running?")?;
+    Ok(response)
 }
 
 fn cmd_skill(
@@ -587,6 +1143,182 @@ fn load_config(
     }
 }
 
+/// Pre-open secrets stores before config loading so `secret:` references in
+/// config.toml can resolve.
+///
+/// Config resolution happens in `Config::load()`, which calls `resolve_env_value()`
+/// for every credential field. That function checks the thread-local
+/// `RESOLVE_SECRETS_STORE` for `secret:` prefixed values. Without this bootstrap,
+/// all `secret:` references resolve to `None` and the config fails validation
+/// (e.g., messaging adapters see empty tokens and error out).
+///
+/// Returns the pre-opened stores keyed by agent ID. These are reused later in
+/// `initialize_agents()` to avoid double-opening the redb files.
+/// Keystore identifier for the instance-level master key.
+const KEYSTORE_INSTANCE_ID: &str = "instance";
+
+/// Open the instance-level secrets store at `<instance_dir>/data/secrets.redb`
+/// before config loading so that `secret:` references in config.toml resolve.
+///
+/// If no instance-level store exists but per-agent stores do (from the previous
+/// per-agent model), secrets are migrated from the first non-empty agent store.
+fn bootstrap_secrets_store(
+    config_path: &Option<std::path::PathBuf>,
+) -> Option<Arc<spacebot::secrets::store::SecretsStore>> {
+    // Probe kernel keyring support before any workers spawn. If keyctl is
+    // blocked (restrictive seccomp, gVisor, etc.), worker keyring isolation
+    // is disabled but workers still start normally.
+    spacebot::secrets::keystore::probe_keyring_support();
+
+    let instance_dir = resolve_instance_dir(config_path);
+
+    let data_dir = instance_dir.join("data");
+    if let Err(error) = std::fs::create_dir_all(&data_dir) {
+        eprintln!("warning: failed to create instance data directory: {error}");
+        return None;
+    }
+
+    let secrets_path = data_dir.join("secrets.redb");
+    let is_new_store = !secrets_path.exists();
+
+    let store = match spacebot::secrets::store::SecretsStore::new(&secrets_path) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("warning: failed to open secrets store: {error}");
+            return None;
+        }
+    };
+
+    // Migrate from legacy per-agent stores if the instance store is brand new.
+    if is_new_store {
+        migrate_legacy_agent_stores(&instance_dir, &store);
+    }
+
+    // Try to auto-unlock if encrypted.
+    if store.is_encrypted() {
+        let keystore = spacebot::secrets::keystore::platform_keystore();
+
+        // Hosted: check tmpfs-injected key.
+        let tmpfs_key_path = std::path::Path::new("/run/spacebot/master_key");
+        let master_key = if tmpfs_key_path.exists() {
+            std::fs::read(tmpfs_key_path).ok().inspect(|key| {
+                if let Err(error) = std::fs::remove_file(tmpfs_key_path) {
+                    tracing::warn!(%error, "failed to remove tmpfs master key — key may remain accessible");
+                }
+                if let Err(error) = keystore.store_key(KEYSTORE_INSTANCE_ID, key) {
+                    tracing::warn!(%error, "failed to persist master key to OS credential store");
+                }
+            })
+        } else {
+            // Try instance-level key first, then fall back to legacy agent keys.
+            keystore
+                .load_key(KEYSTORE_INSTANCE_ID)
+                .ok()
+                .flatten()
+                .or_else(|| load_legacy_keystore_key(&instance_dir))
+        };
+
+        if let Some(key) = master_key
+            && let Err(error) = store.unlock(&key)
+        {
+            tracing::warn!(%error, "failed to unlock secret store — secrets will be inaccessible");
+        }
+    }
+
+    // Set the store into the thread-local for config resolution.
+    spacebot::config::set_resolve_secrets_store(store.clone());
+
+    Some(store)
+}
+
+/// Migrate secrets from legacy per-agent redb stores into the new instance-level
+/// store. Only runs once when the instance-level store is first created.
+fn migrate_legacy_agent_stores(
+    instance_dir: &std::path::Path,
+    target_store: &spacebot::secrets::store::SecretsStore,
+) {
+    let agents_dir = instance_dir.join("agents");
+    let entries = match std::fs::read_dir(&agents_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    let mut total_migrated = 0usize;
+
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let secrets_path = entry.path().join("data").join("secrets.redb");
+        if !secrets_path.exists() {
+            continue;
+        }
+
+        // Open the legacy agent store (read-only access).
+        let legacy_store = match spacebot::secrets::store::SecretsStore::new(&secrets_path) {
+            Ok(store) => store,
+            Err(_) => continue,
+        };
+
+        // If the legacy store is encrypted, try to unlock it with OS keystore.
+        if legacy_store.is_encrypted() {
+            let agent_id = entry.file_name().to_string_lossy().to_string();
+            let keystore = spacebot::secrets::keystore::platform_keystore();
+            if let Some(key) = keystore.load_key(&agent_id).ok().flatten() {
+                let _ = legacy_store.unlock(&key);
+            } else {
+                continue; // Can't read encrypted store without key.
+            }
+        }
+
+        // Export all secrets from the legacy store.
+        let export = match legacy_store.export_all() {
+            Ok(export) => export,
+            Err(_) => continue,
+        };
+
+        // Import into the target store (don't overwrite — first agent wins for
+        // duplicates, which is fine since all agents had the same secrets).
+        match target_store.import_all(&export, false) {
+            Ok(result) => {
+                total_migrated += result.imported;
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to migrate secrets from {}: {error}",
+                    secrets_path.display()
+                );
+            }
+        }
+    }
+
+    if total_migrated > 0 {
+        eprintln!(
+            "info: migrated {total_migrated} secrets from legacy per-agent stores to instance store"
+        );
+    }
+}
+
+/// Try to load a master key from legacy per-agent keystore entries.
+fn load_legacy_keystore_key(instance_dir: &std::path::Path) -> Option<Vec<u8>> {
+    let agents_dir = instance_dir.join("agents");
+    let entries = std::fs::read_dir(&agents_dir).ok()?;
+    let keystore = spacebot::secrets::keystore::platform_keystore();
+
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            continue;
+        }
+        let agent_id = entry.file_name().to_string_lossy().to_string();
+        if let Ok(Some(key)) = keystore.load_key(&agent_id) {
+            // Migrate the key to the instance-level keystore entry.
+            let _ = keystore.store_key(KEYSTORE_INSTANCE_ID, &key);
+            return Some(key);
+        }
+    }
+    None
+}
+
 fn has_provider_credentials(
     llm_config: &spacebot::config::LlmConfig,
     instance_dir: &std::path::Path,
@@ -600,6 +1332,7 @@ async fn run(
     config: spacebot::config::Config,
     foreground: bool,
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    bootstrapped_store: Option<Arc<spacebot::secrets::store::SecretsStore>>,
 ) -> anyhow::Result<()> {
     let paths = spacebot::daemon::DaemonPaths::new(&config.instance_dir);
 
@@ -618,9 +1351,24 @@ async fn run(
     // Channel for removing agents from the main event loop
     let (agent_remove_tx, mut agent_remove_rx) = mpsc::channel::<String>(8);
 
+    // Channel for cross-agent message injection (e.g. delegated task completion notifications).
+    // The sender is shared with all agents via AgentDeps; the receiver is polled in the main loop.
+    let (injection_tx, mut injection_rx) =
+        tokio::sync::mpsc::channel::<spacebot::ChannelInjection>(64);
+
+    // Shared cross-agent task store registry. Populated after all agents are initialized.
+    let task_store_registry: Arc<
+        ArcSwap<std::collections::HashMap<String, Arc<spacebot::tasks::TaskStore>>>,
+    > = Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new()));
+
     // Start HTTP API server if enabled
-    let mut api_state =
-        spacebot::api::ApiState::new_with_provider_sender(provider_tx, agent_tx, agent_remove_tx);
+    let mut api_state = spacebot::api::ApiState::new_with_provider_sender(
+        provider_tx,
+        agent_tx,
+        agent_remove_tx,
+        injection_tx.clone(),
+        task_store_registry.clone(),
+    );
     api_state.auth_token = config.api.auth_token.clone();
     let api_state = Arc::new(api_state);
 
@@ -781,6 +1529,9 @@ async fn run(
             &mut telegram_permissions,
             &mut twitch_permissions,
             agent_links.clone(),
+            injection_tx.clone(),
+            task_store_registry.clone(),
+            &bootstrapped_store,
         )
         .await?;
         agents_initialized = true;
@@ -827,6 +1578,293 @@ async fn run(
 
     // Active conversation channels: conversation_id -> ActiveChannel
     let mut active_channels: HashMap<String, ActiveChannel> = HashMap::new();
+
+    // Resume idle interactive workers that survived the restart.
+    // For each idle worker, pre-create the channel if needed and spawn
+    // the resumed worker into its state so follow-ups route correctly.
+    if agents_initialized {
+        for (agent_id, agent) in agents.iter() {
+            let run_logger = spacebot::conversation::ProcessRunLogger::new(agent.db.sqlite.clone());
+            let idle_workers = match run_logger
+                .get_idle_interactive_workers(&agent.config.id)
+                .await
+            {
+                Ok(workers) => workers,
+                Err(error) => {
+                    tracing::warn!(agent_id = %agent_id, %error, "failed to query idle workers");
+                    continue;
+                }
+            };
+            if idle_workers.is_empty() {
+                continue;
+            }
+            tracing::info!(
+                agent_id = %agent_id,
+                idle_count = idle_workers.len(),
+                "found idle interactive workers to resume"
+            );
+
+            // Group idle workers by channel_id
+            let mut by_channel: HashMap<
+                String,
+                Vec<&spacebot::conversation::history::IdleWorkerRow>,
+            > = HashMap::new();
+            for worker in &idle_workers {
+                if let Some(channel_id) = &worker.channel_id {
+                    by_channel
+                        .entry(channel_id.clone())
+                        .or_default()
+                        .push(worker);
+                } else {
+                    // Workers without a channel_id can't be resumed (no follow-up
+                    // routing). Leave them as idle — the transcript is preserved
+                    // for inspection in the UI.
+                    tracing::warn!(
+                        worker_id = %worker.id,
+                        "idle worker has no channel_id, cannot resume (leaving as idle)"
+                    );
+                }
+            }
+
+            for (conversation_id, workers) in by_channel {
+                // Ensure the channel exists. If it's already in active_channels
+                // (unlikely at startup), use its state. Otherwise, pre-create it.
+                if !active_channels.contains_key(&conversation_id) {
+                    // First pass: retire any workers whose sessions can't be
+                    // reconnected. Only create the channel if at least one
+                    // worker has a chance of resuming.
+                    let mut resumable: Vec<&spacebot::conversation::history::IdleWorkerRow> =
+                        Vec::new();
+                    for idle_worker in &workers {
+                        if idle_worker.worker_type == "opencode"
+                            && idle_worker.opencode_session_id.is_none()
+                        {
+                            // OpenCode workers without session metadata can never
+                            // resume — the server died with kill_on_drop.
+                            if let Err(error) = run_logger.retire_idle_worker(&idle_worker.id).await
+                            {
+                                tracing::warn!(
+                                    worker_id = %idle_worker.id,
+                                    %error,
+                                    "failed to retire idle worker"
+                                );
+                            }
+                            tracing::info!(
+                                worker_id = %idle_worker.id,
+                                channel_id = %conversation_id,
+                                "retired idle opencode worker (no session metadata)"
+                            );
+                        } else {
+                            resumable.push(idle_worker);
+                        }
+                    }
+                    if resumable.is_empty() {
+                        continue;
+                    }
+
+                    let (response_tx, mut response_rx) =
+                        mpsc::channel::<spacebot::OutboundResponse>(32);
+                    let event_rx = agent.deps.event_tx.subscribe();
+                    let channel_id: spacebot::ChannelId = Arc::from(conversation_id.as_str());
+
+                    let (channel, channel_tx) = spacebot::agent::channel::Channel::new(
+                        channel_id,
+                        agent.deps.clone(),
+                        response_tx,
+                        event_rx,
+                        agent.config.screenshot_dir(),
+                        agent.config.logs_dir(),
+                    );
+                    agent
+                        .deps
+                        .process_control_registry
+                        .register_channel(channel.id.clone(), channel.control_handle().downgrade())
+                        .await;
+                    api_state
+                        .register_channel_status(
+                            conversation_id.clone(),
+                            channel.state.status_block.clone(),
+                        )
+                        .await;
+                    api_state
+                        .register_channel_state(conversation_id.clone(), channel.state.clone())
+                        .await;
+
+                    // Resume workers into the channel state before spawning the event loop.
+                    let mut any_resumed = false;
+                    for idle_worker in &resumable {
+                        match spacebot::agent::channel_dispatch::resume_idle_worker_into_state(
+                            &channel.state,
+                            idle_worker,
+                        )
+                        .await
+                        {
+                            Ok(worker_id) => {
+                                any_resumed = true;
+                                tracing::info!(
+                                    worker_id = %worker_id,
+                                    channel_id = %conversation_id,
+                                    "resumed idle worker"
+                                );
+                            }
+                            Err(reason) => {
+                                // Resume failed at runtime (e.g. OpenCode disabled,
+                                // transcript corrupt). Retire the worker.
+                                if let Err(error) =
+                                    run_logger.retire_idle_worker(&idle_worker.id).await
+                                {
+                                    tracing::warn!(
+                                        worker_id = %idle_worker.id,
+                                        %error,
+                                        "failed to retire idle worker"
+                                    );
+                                }
+                                tracing::info!(
+                                    worker_id = %idle_worker.id,
+                                    channel_id = %conversation_id,
+                                    %reason,
+                                    "retired idle worker (session expired)"
+                                );
+                            }
+                        }
+                    }
+
+                    // Spawn the channel event loop.
+                    let cleanup_channel_id = conversation_id.clone();
+                    let process_control_registry = agent.deps.process_control_registry.clone();
+                    let api_state_for_cleanup = api_state.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = channel.run().await {
+                            tracing::error!(%error, "channel event loop failed");
+                        }
+                        let scoped_channel_id: spacebot::ChannelId =
+                            Arc::from(cleanup_channel_id.as_str());
+                        process_control_registry
+                            .unregister_channel(&scoped_channel_id)
+                            .await;
+                        api_state_for_cleanup
+                            .unregister_channel_status(&cleanup_channel_id)
+                            .await;
+                        api_state_for_cleanup
+                            .unregister_channel_state(&cleanup_channel_id)
+                            .await;
+                    });
+
+                    // Outbound response routing for this pre-created channel.
+                    // Since there's no inbound message yet, we create a placeholder.
+                    let latest_message =
+                        Arc::new(tokio::sync::RwLock::new(spacebot::InboundMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            source: "internal".to_string(),
+                            adapter: None,
+                            conversation_id: conversation_id.clone(),
+                            content: spacebot::MessageContent::Text(String::new()),
+                            sender_id: String::new(),
+                            formatted_author: None,
+                            metadata: std::collections::HashMap::new(),
+                            agent_id: Some(agent_id.clone()),
+                            timestamp: chrono::Utc::now(),
+                        }));
+                    let outbound_message = latest_message.clone();
+                    let messaging_for_outbound = messaging_manager.clone();
+                    let api_event_tx = api_state.event_tx.clone();
+                    let sse_agent_id = agent_id.to_string();
+                    let sse_channel_id = conversation_id.clone();
+                    let outbound_handle = tokio::spawn(async move {
+                        while let Some(response) = response_rx.recv().await {
+                            match &response {
+                                spacebot::OutboundResponse::Text(text) => {
+                                    api_event_tx
+                                        .send(spacebot::api::ApiEvent::OutboundMessage {
+                                            agent_id: sse_agent_id.clone(),
+                                            channel_id: sse_channel_id.clone(),
+                                            text: text.clone(),
+                                        })
+                                        .ok();
+                                }
+                                spacebot::OutboundResponse::RichMessage { text, .. } => {
+                                    api_event_tx
+                                        .send(spacebot::api::ApiEvent::OutboundMessage {
+                                            agent_id: sse_agent_id.clone(),
+                                            channel_id: sse_channel_id.clone(),
+                                            text: text.clone(),
+                                        })
+                                        .ok();
+                                }
+                                spacebot::OutboundResponse::ThreadReply { text, .. } => {
+                                    api_event_tx
+                                        .send(spacebot::api::ApiEvent::OutboundMessage {
+                                            agent_id: sse_agent_id.clone(),
+                                            channel_id: sse_channel_id.clone(),
+                                            text: text.clone(),
+                                        })
+                                        .ok();
+                                }
+                                spacebot::OutboundResponse::Status(
+                                    spacebot::StatusUpdate::Thinking,
+                                ) => {
+                                    api_event_tx
+                                        .send(spacebot::api::ApiEvent::TypingState {
+                                            agent_id: sse_agent_id.clone(),
+                                            channel_id: sse_channel_id.clone(),
+                                            is_typing: true,
+                                        })
+                                        .ok();
+                                }
+                                spacebot::OutboundResponse::Status(
+                                    spacebot::StatusUpdate::StopTyping,
+                                ) => {
+                                    api_event_tx
+                                        .send(spacebot::api::ApiEvent::TypingState {
+                                            agent_id: sse_agent_id.clone(),
+                                            channel_id: sse_channel_id.clone(),
+                                            is_typing: false,
+                                        })
+                                        .ok();
+                                }
+                                _ => {}
+                            }
+                            let current_message = outbound_message.read().await.clone();
+                            match response {
+                                spacebot::OutboundResponse::Status(status) => {
+                                    if let Err(error) = messaging_for_outbound
+                                        .send_status(&current_message, status)
+                                        .await
+                                    {
+                                        tracing::warn!(%error, "failed to send status update");
+                                    }
+                                }
+                                response => {
+                                    if let Err(error) = messaging_for_outbound
+                                        .respond(&current_message, response)
+                                        .await
+                                    {
+                                        tracing::error!(%error, "failed to send outbound response");
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    active_channels.insert(
+                        conversation_id.clone(),
+                        ActiveChannel {
+                            message_tx: channel_tx,
+                            latest_message,
+                            _outbound_handle: outbound_handle,
+                        },
+                    );
+
+                    tracing::info!(
+                        conversation_id = %conversation_id,
+                        agent_id = %agent_id,
+                        any_resumed,
+                        "pre-created channel for idle worker resumption"
+                    );
+                }
+            }
+        }
+    }
 
     // Main event loop: route inbound messages to agent channels
     loop {
@@ -881,6 +1919,11 @@ async fn run(
                         agent.config.screenshot_dir(),
                         agent.config.logs_dir(),
                     );
+                    agent
+                        .deps
+                        .process_control_registry
+                        .register_channel(channel.id.clone(), channel.control_handle().downgrade())
+                        .await;
 
                     // Register the channel's status block with the API for snapshot queries
                     api_state.register_channel_status(
@@ -928,10 +1971,25 @@ async fn run(
                     }
 
                     // Spawn the channel's event loop
+                    let cleanup_channel_id = conversation_id.clone();
+                    let process_control_registry = agent.deps.process_control_registry.clone();
+                    let api_state_for_cleanup = api_state.clone();
                     tokio::spawn(async move {
                         if let Err(error) = channel.run().await {
                             tracing::error!(%error, "channel event loop failed");
                         }
+
+                        let scoped_channel_id: spacebot::ChannelId =
+                            Arc::from(cleanup_channel_id.as_str());
+                        process_control_registry
+                            .unregister_channel(&scoped_channel_id)
+                            .await;
+                        api_state_for_cleanup
+                            .unregister_channel_status(&cleanup_channel_id)
+                            .await;
+                        api_state_for_cleanup
+                            .unregister_channel_state(&cleanup_channel_id)
+                            .await;
                     });
 
                     // Spawn outbound response routing: reads from response_rx,
@@ -1070,6 +2128,32 @@ async fn run(
                     tracing::warn!(agent_id = %agent_id, "agent not found in main loop for removal");
                 }
             }
+            // Cross-agent message injection (e.g. delegated task completion retrigger).
+            // Forwards the injected message to the target channel if it exists.
+            Some(injection) = injection_rx.recv() => {
+                if let Some(active) = active_channels.get(&injection.conversation_id) {
+                    if let Err(error) = active.message_tx.send(injection.message).await {
+                        tracing::warn!(
+                            %error,
+                            conversation_id = %injection.conversation_id,
+                            agent_id = %injection.agent_id,
+                            "failed to forward injected message to channel"
+                        );
+                    } else {
+                        tracing::info!(
+                            conversation_id = %injection.conversation_id,
+                            agent_id = %injection.agent_id,
+                            "forwarded cross-agent injection to active channel"
+                        );
+                    }
+                } else {
+                    tracing::info!(
+                        conversation_id = %injection.conversation_id,
+                        agent_id = %injection.agent_id,
+                        "injection target channel not active, notification will be delivered on next message"
+                    );
+                }
+            }
             Some(_event) = provider_rx.recv(), if !agents_initialized => {
                 tracing::info!("providers configured, initializing agents");
 
@@ -1087,6 +2171,10 @@ async fn run(
                     Ok(new_config)
                         if has_provider_credentials(&new_config.llm, &new_config.instance_dir) =>
                     {
+                        // Refresh in-memory defaults so newly created agents
+                        // inherit the latest routing from the updated config.
+                        api_state.set_defaults_config(new_config.defaults.clone()).await;
+
                         // Rebuild LlmManager with the new keys
                         match spacebot::llm::LlmManager::with_instance_dir(
                             new_config.llm.clone(),
@@ -1119,6 +2207,9 @@ async fn run(
                                     &mut new_telegram_permissions,
                                     &mut new_twitch_permissions,
                                     agent_links.clone(),
+                                    injection_tx.clone(),
+                                    task_store_registry.clone(),
+                                    &bootstrapped_store,
                                 ).await {
                                     Ok(()) => {
                                         agents_initialized = true;
@@ -1257,6 +2348,11 @@ async fn initialize_agents(
     telegram_permissions: &mut Option<Arc<ArcSwap<spacebot::config::TelegramPermissions>>>,
     twitch_permissions: &mut Option<Arc<ArcSwap<spacebot::config::TwitchPermissions>>>,
     agent_links: Arc<ArcSwap<Vec<spacebot::links::AgentLink>>>,
+    injection_tx: tokio::sync::mpsc::Sender<spacebot::ChannelInjection>,
+    task_store_registry: Arc<
+        ArcSwap<std::collections::HashMap<String, Arc<spacebot::tasks::TaskStore>>>,
+    >,
+    bootstrapped_store: &Option<Arc<spacebot::secrets::store::SecretsStore>>,
 ) -> anyhow::Result<()> {
     let resolved_agents = config.resolve_agents();
 
@@ -1305,6 +2401,12 @@ async fn initialize_agents(
                 agent_config.logs_dir().display()
             )
         })?;
+        std::fs::create_dir_all(agent_config.saved_dir()).with_context(|| {
+            format!(
+                "failed to create saved dir: {}",
+                agent_config.saved_dir().display()
+            )
+        })?;
 
         // Per-agent database connections
         let db = spacebot::db::Db::connect(&agent_config.data_dir)
@@ -1315,6 +2417,27 @@ async fn initialize_agents(
                     agent_config.id
                 )
             })?;
+
+        let run_logger = spacebot::conversation::ProcessRunLogger::new(db.sqlite.clone());
+        let orphaned_workers = run_logger
+            .reconcile_running_workers_for_agent(
+                &agent_config.id,
+                "Worker interrupted: Spacebot restarted before completion.",
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to reconcile stale running workers for agent '{}'",
+                    agent_config.id
+                )
+            })?;
+        if orphaned_workers > 0 {
+            tracing::warn!(
+                agent_id = %agent_config.id,
+                orphaned_workers,
+                "marked stale running workers as failed during startup"
+            );
+        }
 
         // Per-agent settings store (redb-backed)
         let settings_path = agent_config.data_dir.join("settings.redb");
@@ -1331,6 +2454,7 @@ async fn initialize_agents(
         let memory_store =
             spacebot::memory::MemoryStore::with_agent_id(db.sqlite.clone(), &agent_config.id);
         let task_store = Arc::new(spacebot::tasks::TaskStore::new(db.sqlite.clone()));
+        let project_store = Arc::new(spacebot::projects::ProjectStore::new(db.sqlite.clone()));
         let embedding_table = spacebot::memory::EmbeddingTable::open_or_create(&db.lance)
             .await
             .with_context(|| {
@@ -1348,8 +2472,8 @@ async fn initialize_agents(
             embedding_model.clone(),
         ));
 
-        // Per-agent event bus (broadcast for fan-out to multiple channels)
-        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(256);
+        // Per-agent control and memory event buses (broadcast fan-out).
+        let (event_tx, memory_event_tx) = spacebot::create_process_event_buses();
 
         let agent_id: spacebot::AgentId = Arc::from(agent_config.id.as_str());
         let mcp_manager = Arc::new(spacebot::mcp::McpManager::new(agent_config.mcp.clone()));
@@ -1382,9 +2506,20 @@ async fn initialize_agents(
         ));
 
         // Set the settings store in RuntimeConfig and apply config-driven defaults
-        runtime_config.set_settings(settings_store.clone());
+        let explicit_listen_only = config
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_config.id)
+            .and_then(|agent| agent.channel.map(|channel| channel.listen_only_mode));
+        runtime_config.set_settings(settings_store.clone(), explicit_listen_only);
         if let Err(error) = settings_store.set_worker_log_mode(config.defaults.worker_log_mode) {
             tracing::warn!(%error, agent = %agent_config.id, "failed to set worker_log_mode from config");
+        }
+
+        // Share the instance-level secrets store with this agent.
+        if let Some(secrets_store) = bootstrapped_store {
+            runtime_config.set_secrets(secrets_store.clone());
+            spacebot::config::set_resolve_secrets_store(secrets_store.clone());
         }
 
         watcher_agents.push((
@@ -1396,7 +2531,7 @@ async fn initialize_agents(
 
         let sandbox = std::sync::Arc::new(
             spacebot::sandbox::Sandbox::new(
-                &agent_config.sandbox,
+                runtime_config.sandbox.clone(),
                 agent_config.workspace.clone(),
                 &config.instance_dir,
                 agent_config.data_dir.clone(),
@@ -1404,20 +2539,37 @@ async fn initialize_agents(
             .await,
         );
 
+        // Wire the instance-level secrets store into the sandbox for tool secret injection.
+        if let Some(secrets_store) = &bootstrapped_store {
+            sandbox.set_secrets_store(secrets_store.clone());
+        }
+
+        // Inject active project root paths into the sandbox allowlist so
+        // workers can access project directories even outside the workspace.
+        spacebot::projects::refresh_sandbox_project_paths(&project_store, &agent_id, &sandbox)
+            .await;
+
         let deps = spacebot::AgentDeps {
             agent_id: agent_id.clone(),
             memory_search,
             llm_manager: llm_manager.clone(),
             mcp_manager,
             task_store: task_store.clone(),
+            project_store: project_store.clone(),
             cron_tool: None,
             runtime_config,
             event_tx,
+            memory_event_tx,
             sqlite_pool: db.sqlite.clone(),
             messaging_manager: None,
             sandbox,
             links: agent_links.clone(),
             agent_names: agent_name_map.clone(),
+            task_store_registry: task_store_registry.clone(),
+            process_control_registry: Arc::new(
+                spacebot::agent::process_control::ProcessControlRegistry::new(),
+            ),
+            injection_tx: injection_tx.clone(),
         };
 
         let agent = spacebot::Agent {
@@ -1431,6 +2583,40 @@ async fn initialize_agents(
         agents.insert(agent_id, agent);
     }
 
+    // Populate the cross-agent task store registry now that all agents exist.
+    {
+        let registry: std::collections::HashMap<String, Arc<spacebot::tasks::TaskStore>> = agents
+            .iter()
+            .map(|(agent_id, agent)| (agent_id.to_string(), agent.deps.task_store.clone()))
+            .collect();
+        task_store_registry.store(Arc::new(registry));
+    }
+
+    // Pre-register both sides of every link channel so they appear in each
+    // agent's channel list from boot. The actual Channel instances are spawned
+    // on-demand when the first message arrives; this just creates the DB records
+    // so the UI can display them.
+    {
+        let all_links = agent_links.load();
+        let empty_meta = std::collections::HashMap::new();
+        for link in all_links.iter() {
+            let from_channel = link.channel_id_for(&link.from_agent_id);
+            let to_channel = link.channel_id_for(&link.to_agent_id);
+
+            if let Some(agent) = agents.get(&Arc::from(link.from_agent_id.as_str())) {
+                let store = spacebot::conversation::ChannelStore::new(agent.db.sqlite.clone());
+                store.upsert(&from_channel, &empty_meta);
+            }
+            if let Some(agent) = agents.get(&Arc::from(link.to_agent_id.as_str())) {
+                let store = spacebot::conversation::ChannelStore::new(agent.db.sqlite.clone());
+                store.upsert(&to_channel, &empty_meta);
+            }
+        }
+        if !all_links.is_empty() {
+            tracing::info!(link_count = all_links.len(), "pre-registered link channels");
+        }
+    }
+
     tracing::info!(agent_count = agents.len(), "all agents initialized");
 
     // Wire agent event streams, DB pools, and config summaries into the API server
@@ -1440,6 +2626,7 @@ async fn initialize_agents(
         let mut memory_searches = std::collections::HashMap::new();
         let mut mcp_managers = std::collections::HashMap::new();
         let mut task_stores = std::collections::HashMap::new();
+        let mut project_stores = std::collections::HashMap::new();
         let mut agent_workspaces = std::collections::HashMap::new();
         let mut runtime_configs = std::collections::HashMap::new();
         let mut sandboxes = std::collections::HashMap::new();
@@ -1450,6 +2637,7 @@ async fn initialize_agents(
             memory_searches.insert(agent_id.to_string(), agent.deps.memory_search.clone());
             mcp_managers.insert(agent_id.to_string(), agent.deps.mcp_manager.clone());
             task_stores.insert(agent_id.to_string(), agent.deps.task_store.clone());
+            project_stores.insert(agent_id.to_string(), agent.deps.project_store.clone());
             agent_workspaces.insert(agent_id.to_string(), agent.config.workspace.clone());
             runtime_configs.insert(agent_id.to_string(), agent.deps.runtime_config.clone());
             sandboxes.insert(agent_id.to_string(), agent.deps.sandbox.clone());
@@ -1469,9 +2657,14 @@ async fn initialize_agents(
         api_state.set_memory_searches(memory_searches);
         api_state.set_mcp_managers(mcp_managers);
         api_state.set_task_stores(task_stores);
+        api_state.set_project_stores(project_stores);
         api_state.set_runtime_configs(runtime_configs);
         api_state.set_agent_workspaces(agent_workspaces);
         api_state.set_sandboxes(sandboxes);
+        // Wire the instance-level secrets store into the API state.
+        if let Some(store) = &bootstrapped_store {
+            api_state.set_secrets_store(store.clone());
+        }
         api_state.set_instance_dir(config.instance_dir.clone());
     }
 
@@ -1821,7 +3014,13 @@ async fn initialize_agents(
         }
     }
 
-    let webchat_adapter = Arc::new(spacebot::messaging::webchat::WebChatAdapter::new());
+    let webchat_agent_pools = agents
+        .iter()
+        .map(|(agent_id, agent)| (agent_id.to_string(), agent.db.sqlite.clone()))
+        .collect();
+    let webchat_adapter = Arc::new(spacebot::messaging::webchat::WebChatAdapter::new(
+        webchat_agent_pools,
+    ));
     new_messaging_manager
         .register_shared(webchat_adapter.clone())
         .await;
@@ -1891,8 +3090,18 @@ async fn initialize_agents(
 
         match store.load_all().await {
             Ok(configs) => {
+                // Load last execution times so interval-based jobs can anchor
+                // their first tick to the previous run, surviving restarts.
+                let last_times = match store.last_execution_times().await {
+                    Ok(times) => times,
+                    Err(error) => {
+                        tracing::warn!(agent_id = %agent_id, %error, "failed to load cron last execution times");
+                        std::collections::HashMap::new()
+                    }
+                };
                 for cron_config in configs {
-                    if let Err(error) = scheduler.register(cron_config).await {
+                    let anchor = last_times.get(&cron_config.id).map(String::as_str);
+                    if let Err(error) = scheduler.register_with_anchor(cron_config, anchor).await {
                         tracing::warn!(agent_id = %agent_id, %error, "failed to register cron job");
                     }
                 }
@@ -1930,7 +3139,7 @@ async fn initialize_agents(
         }
     }
 
-    // Start cortex warmup, bulletin loops, and association loops for each agent
+    // Start cortex warmup, runtime, and association loops for each agent
     for (agent_id, agent) in agents.iter() {
         let cortex_logger = spacebot::agent::cortex::CortexLogger::new(agent.db.sqlite.clone());
         let warmup_handle =
@@ -1938,10 +3147,10 @@ async fn initialize_agents(
         cortex_handles.push(warmup_handle);
         tracing::info!(agent_id = %agent_id, "warmup loop started");
 
-        let bulletin_handle =
-            spacebot::agent::cortex::spawn_bulletin_loop(agent.deps.clone(), cortex_logger.clone());
-        cortex_handles.push(bulletin_handle);
-        tracing::info!(agent_id = %agent_id, "cortex bulletin loop started");
+        let cortex_handle =
+            spacebot::agent::cortex::spawn_cortex_loop(agent.deps.clone(), cortex_logger.clone());
+        cortex_handles.push(cortex_handle);
+        tracing::info!(agent_id = %agent_id, "cortex loop started");
 
         let association_handle =
             spacebot::agent::cortex::spawn_association_loop(agent.deps.clone(), cortex_logger);
@@ -1970,6 +3179,7 @@ async fn initialize_agents(
                 agent.deps.agent_id.clone(),
                 agent.deps.task_store.clone(),
                 agent.deps.memory_search.clone(),
+                agent.deps.memory_event_tx.clone(),
                 conversation_logger,
                 channel_store,
                 run_logger,
@@ -1978,6 +3188,7 @@ async fn initialize_agents(
                 brave_search_key,
                 agent.deps.runtime_config.workspace_dir.clone(),
                 agent.deps.sandbox.clone(),
+                agent.deps.runtime_config.clone(),
             );
             let store = spacebot::agent::cortex_chat::CortexChatStore::new(agent.db.sqlite.clone());
             let session = spacebot::agent::cortex_chat::CortexChatSession::new(

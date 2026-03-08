@@ -88,8 +88,12 @@ impl DiscordAdapter {
     fn extract_reply_message_id(message: &InboundMessage) -> Option<MessageId> {
         message
             .metadata
-            .get("discord_reply_to_message_id")
-            .and_then(|value| value.as_u64())
+            .get(crate::metadata_keys::REPLY_TO_MESSAGE_ID)
+            .and_then(|value| match value {
+                serde_json::Value::String(s) => s.parse::<u64>().ok(),
+                serde_json::Value::Number(n) => n.as_u64(),
+                _ => None,
+            })
             .map(MessageId::new)
     }
 }
@@ -160,7 +164,7 @@ impl Messaging for DiscordAdapter {
                 }
             }
             OutboundResponse::RichMessage {
-                text,
+                mut text,
                 cards,
                 interactive_elements,
                 poll,
@@ -168,6 +172,35 @@ impl Messaging for DiscordAdapter {
             } => {
                 self.stop_typing(message).await;
                 let reply_to = Self::extract_reply_message_id(message);
+
+                // Derive a plaintext fallback from cards when text is empty so
+                // the message is never blank (notifications, logging, etc.).
+                if text.trim().is_empty() {
+                    let derived = crate::OutboundResponse::text_from_cards(&cards);
+                    if !derived.trim().is_empty() {
+                        text = derived;
+                    }
+                }
+
+                // Enforce Discord API limits: max 10 embeds, 5 action rows.
+                let cards = if cards.len() > 10 {
+                    tracing::warn!(
+                        count = cards.len(),
+                        "truncating cards to Discord embed limit (10)"
+                    );
+                    &cards[..10]
+                } else {
+                    &cards
+                };
+                let interactive_elements = if interactive_elements.len() > 5 {
+                    tracing::warn!(
+                        count = interactive_elements.len(),
+                        "truncating interactive elements to Discord action row limit (5)"
+                    );
+                    &interactive_elements[..5]
+                } else {
+                    &interactive_elements
+                };
 
                 let chunks = split_message(&text, 2000);
                 for (i, chunk) in chunks.iter().enumerate() {
@@ -179,16 +212,13 @@ impl Messaging for DiscordAdapter {
 
                     // Attach rich content only to the final chunk
                     if is_last {
-                        let embeds: Vec<_> = cards.iter().take(10).map(build_embed).collect();
+                        let embeds: Vec<_> = cards.iter().map(build_embed).collect();
                         if !embeds.is_empty() {
                             msg = msg.embeds(embeds);
                         }
 
-                        let components: Vec<_> = interactive_elements
-                            .iter()
-                            .take(5)
-                            .map(build_action_row)
-                            .collect();
+                        let components: Vec<_> =
+                            interactive_elements.iter().map(build_action_row).collect();
                         if !components.is_empty() {
                             msg = msg.components(components);
                         }
@@ -418,13 +448,41 @@ impl Messaging for DiscordAdapter {
                     .context("failed to broadcast discord message")?;
             }
         } else if let OutboundResponse::RichMessage {
-            text,
+            mut text,
             cards,
             interactive_elements,
             poll,
             ..
         } = response
         {
+            // Derive a plaintext fallback from cards when text is empty.
+            if text.trim().is_empty() {
+                let derived = crate::OutboundResponse::text_from_cards(&cards);
+                if !derived.trim().is_empty() {
+                    text = derived;
+                }
+            }
+
+            // Enforce Discord API limits: max 10 embeds, 5 action rows.
+            let cards = if cards.len() > 10 {
+                tracing::warn!(
+                    count = cards.len(),
+                    "truncating cards to Discord embed limit (10)"
+                );
+                &cards[..10]
+            } else {
+                &cards
+            };
+            let interactive_elements = if interactive_elements.len() > 5 {
+                tracing::warn!(
+                    count = interactive_elements.len(),
+                    "truncating interactive elements to Discord action row limit (5)"
+                );
+                &interactive_elements[..5]
+            } else {
+                &interactive_elements
+            };
+
             let chunks = split_message(&text, 2000);
             for (i, chunk) in chunks.iter().enumerate() {
                 let is_last = i == chunks.len() - 1;
@@ -435,16 +493,13 @@ impl Messaging for DiscordAdapter {
 
                 // Attach rich content only to the final chunk
                 if is_last {
-                    let embeds: Vec<_> = cards.iter().take(10).map(build_embed).collect();
+                    let embeds: Vec<_> = cards.iter().map(build_embed).collect();
                     if !embeds.is_empty() {
                         msg = msg.embeds(embeds);
                     }
 
-                    let components: Vec<_> = interactive_elements
-                        .iter()
-                        .take(5)
-                        .map(build_action_row)
-                        .collect();
+                    let components: Vec<_> =
+                        interactive_elements.iter().map(build_action_row).collect();
                     if !components.is_empty() {
                         msg = msg.components(components);
                     }
@@ -718,9 +773,13 @@ impl EventHandler for Handler {
             "discord_message_id".into(),
             serde_json::Value::Number(component.message.id.get().into()),
         );
+        let discord_mentioned_bot = false;
+        let discord_reply_to_bot = true;
+        metadata.insert("discord_mentioned_bot".into(), discord_mentioned_bot.into());
+        metadata.insert("discord_reply_to_bot".into(), discord_reply_to_bot.into());
         metadata.insert(
             "discord_mentions_or_replies_to_bot".into(),
-            serde_json::Value::Bool(true),
+            (discord_mentioned_bot || discord_reply_to_bot).into(),
         );
         if let Some(guild_id) = component.guild_id {
             metadata.insert(
@@ -762,14 +821,21 @@ impl EventHandler for Handler {
 }
 
 fn is_mention_or_reply_to_bot(message: &Message, bot_user_id: Option<UserId>) -> bool {
+    is_mention_to_bot(message, bot_user_id) || is_reply_to_bot(message, bot_user_id)
+}
+
+fn is_mention_to_bot(message: &Message, bot_user_id: Option<UserId>) -> bool {
     let Some(bot_id) = bot_user_id else {
         return false;
     };
 
-    let directly_mentioned = message.mentions.iter().any(|user| user.id == bot_id);
-    if directly_mentioned {
-        return true;
-    }
+    message.mentions.iter().any(|user| user.id == bot_id)
+}
+
+fn is_reply_to_bot(message: &Message, bot_user_id: Option<UserId>) -> bool {
+    let Some(bot_id) = bot_user_id else {
+        return false;
+    };
 
     message
         .referenced_message
@@ -843,6 +909,10 @@ async fn build_metadata(
     metadata.insert("discord_channel_id".into(), message.channel_id.get().into());
     metadata.insert("discord_message_id".into(), message.id.get().into());
     metadata.insert(
+        crate::metadata_keys::MESSAGE_ID.into(),
+        serde_json::Value::String(message.id.get().to_string()),
+    );
+    metadata.insert(
         "discord_author_name".into(),
         message.author.name.clone().into(),
     );
@@ -882,7 +952,8 @@ async fn build_metadata(
 
         // Try to get guild name
         if let Ok(guild) = guild_id.to_partial_guild(&ctx.http).await {
-            metadata.insert("discord_guild_name".into(), guild.name.into());
+            metadata.insert("discord_guild_name".into(), guild.name.clone().into());
+            metadata.insert(crate::metadata_keys::SERVER_NAME.into(), guild.name.into());
         }
     }
 
@@ -892,6 +963,10 @@ async fn build_metadata(
     {
         metadata.insert(
             "discord_channel_name".into(),
+            guild_channel.name.clone().into(),
+        );
+        metadata.insert(
+            crate::metadata_keys::CHANNEL_NAME.into(),
             guild_channel.name.clone().into(),
         );
 
@@ -917,16 +992,28 @@ async fn build_metadata(
         let reply_content = resolve_mentions(&referenced.content, &referenced.mentions);
         // Truncate to avoid bloating context with long quoted messages
         let truncated = if reply_content.len() > 200 {
-            format!("{}...", &reply_content[..200])
+            format!(
+                "{}...",
+                &reply_content[..reply_content.floor_char_boundary(200)]
+            )
         } else {
             reply_content
         };
-        metadata.insert("reply_to_content".into(), truncated.into());
+        metadata.insert("reply_to_content".into(), truncated.clone().into());
+        metadata.insert(crate::metadata_keys::REPLY_TO_TEXT.into(), truncated.into());
     }
 
     metadata.insert(
         "discord_mentions_or_replies_to_bot".into(),
         is_mention_or_reply_to_bot(message, bot_user_id).into(),
+    );
+    metadata.insert(
+        "discord_mentioned_bot".into(),
+        is_mention_to_bot(message, bot_user_id).into(),
+    );
+    metadata.insert(
+        "discord_reply_to_bot".into(),
+        is_reply_to_bot(message, bot_user_id).into(),
     );
 
     (metadata, formatted_author)

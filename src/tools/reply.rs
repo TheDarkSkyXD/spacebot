@@ -372,18 +372,29 @@ impl Tool for ReplyTool {
             ));
         }
 
-        self.conversation_logger.log_bot_message_with_name(
-            &self.channel_id,
-            &converted_content,
-            Some(&self.agent_display_name),
-        );
+        let thread_name = args
+            .thread_name
+            .as_ref()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty());
 
-        let response = if let Some(ref name) = args.thread_name {
+        if let Some(leak) = crate::secrets::scrub::scan_for_leaks(&converted_content) {
+            tracing::error!(
+                conversation_id = %self.conversation_id,
+                leak_prefix = %&leak[..leak.len().min(8)],
+                "reply tool blocked content matching secret pattern"
+            );
+            return Err(ReplyError(
+                "blocked reply content: potential secret detected".into(),
+            ));
+        }
+
+        let response = if let Some(name) = thread_name {
             // Cap thread names at 100 characters (Discord limit)
             let thread_name = if name.len() > 100 {
                 name[..name.floor_char_boundary(100)].to_string()
             } else {
-                name.clone()
+                name.to_string()
             };
             OutboundResponse::ThreadReply {
                 thread_name,
@@ -393,7 +404,7 @@ impl Tool for ReplyTool {
         {
             OutboundResponse::RichMessage {
                 text: converted_content.clone(),
-                blocks: vec![], // No block generation for now; Slack adapters will fall back to text
+                blocks: vec![],
                 cards: args.cards.unwrap_or_default(),
                 interactive_elements: args.interactive_elements.unwrap_or_default(),
                 poll: args.poll,
@@ -406,6 +417,12 @@ impl Tool for ReplyTool {
             .send(response)
             .await
             .map_err(|e| ReplyError(format!("failed to send reply: {e}")))?;
+
+        self.conversation_logger.log_bot_message_with_name(
+            &self.channel_id,
+            &converted_content,
+            Some(&self.agent_display_name),
+        );
 
         // Mark the turn as handled so handle_agent_result skips the fallback send.
         self.replied_flag.store(true, Ordering::Relaxed);

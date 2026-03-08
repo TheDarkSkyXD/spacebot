@@ -32,6 +32,7 @@ use slack_morphism::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
+use tokio::time::{Duration, timeout};
 
 /// State shared with socket mode callbacks via `SlackClientEventsUserState`.
 struct SlackAdapterState {
@@ -260,6 +261,58 @@ async fn handle_message_event(
         &adapter_state.channel_name_cache,
     )
     .await;
+    let mut metadata = metadata;
+    let bot_mention = format!("<@{}>", adapter_state.bot_user_id);
+    let mentioned_bot = msg_event
+        .content
+        .as_ref()
+        .and_then(|content| content.text.as_ref())
+        .map(|text| text.contains(&bot_mention))
+        .unwrap_or(false);
+    let token = SlackApiToken::new(SlackApiTokenValue(adapter_state.bot_token.clone()));
+    let session = client.open_session(&token);
+    let replied_to_bot = if let Some(thread_ts) = msg_event.origin.thread_ts.as_ref() {
+        // For threaded replies, treat as explicit invoke only when the thread
+        // root message belongs to this bot.
+        if thread_ts.0 != ts {
+            let thread_replies_request = SlackApiConversationsRepliesRequest::new(
+                SlackChannelId(channel_id.clone()),
+                thread_ts.clone(),
+            )
+            .with_limit(1);
+            match timeout(
+                Duration::from_secs(2),
+                session.conversations_replies(&thread_replies_request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response
+                    .messages
+                    .first()
+                    .and_then(|message| message.sender.user.as_ref())
+                    .is_some_and(|user| user.0 == adapter_state.bot_user_id),
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "failed to resolve slack thread parent for reply invoke");
+                    false
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        "timed out resolving slack thread parent for reply invoke"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    metadata.insert(
+        "slack_mentions_or_replies_to_bot".into(),
+        serde_json::Value::Bool(mentioned_bot || replied_to_bot),
+    );
 
     send_inbound(
         &adapter_state.inbound_tx,
@@ -350,6 +403,11 @@ async fn handle_app_mention_event(
         &adapter_state.channel_name_cache,
     )
     .await;
+    let mut metadata = metadata;
+    metadata.insert(
+        "slack_mentions_or_replies_to_bot".into(),
+        serde_json::Value::Bool(true),
+    );
 
     send_inbound(
         &adapter_state.inbound_tx,
@@ -1342,9 +1400,14 @@ async fn build_metadata_and_author(
         "slack_channel_id".into(),
         serde_json::Value::String(channel_id.into()),
     );
+    let ts_string: String = ts.into();
     metadata.insert(
         "slack_message_ts".into(),
-        serde_json::Value::String(ts.into()),
+        serde_json::Value::String(ts_string.clone()),
+    );
+    metadata.insert(
+        crate::metadata_keys::MESSAGE_ID.into(),
+        serde_json::Value::String(ts_string),
     );
 
     if let Some(tts) = thread_ts {
@@ -1370,8 +1433,17 @@ async fn build_metadata_and_author(
     let session = client.open_session(&token);
 
     // Resolve channel name via cache or conversations.info API.
+    let is_dm = channel_id.starts_with('D');
     if let Some(name) = channel_name_cache.read().await.get(channel_id).cloned() {
-        metadata.insert("slack_channel_name".into(), serde_json::Value::String(name));
+        metadata.insert(
+            "slack_channel_name".into(),
+            serde_json::Value::String(name.clone()),
+        );
+        let display_name = if is_dm { name } else { format!("#{name}") };
+        metadata.insert(
+            crate::metadata_keys::CHANNEL_NAME.into(),
+            serde_json::Value::String(display_name),
+        );
     } else {
         match session
             .conversations_info(&SlackApiConversationsInfoRequest::new(SlackChannelId(
@@ -1385,11 +1457,19 @@ async fn build_metadata_and_author(
                         .write()
                         .await
                         .insert(channel_id.to_string(), name.clone());
-                    metadata.insert("slack_channel_name".into(), serde_json::Value::String(name));
+                    metadata.insert(
+                        "slack_channel_name".into(),
+                        serde_json::Value::String(name.clone()),
+                    );
+                    let display_name = if is_dm { name } else { format!("#{name}") };
+                    metadata.insert(
+                        crate::metadata_keys::CHANNEL_NAME.into(),
+                        serde_json::Value::String(display_name),
+                    );
                 }
             }
             // DM channels (D-prefixed) don't support conversations.info in all cases
-            Err(error) if !channel_id.starts_with('D') => {
+            Err(error) if !is_dm => {
                 tracing::warn!(
                     %error,
                     channel_id = %channel_id,
@@ -1445,9 +1525,14 @@ async fn build_metadata_and_author(
         && !metadata.contains_key("slack_channel_name")
         && let Some(display_name) = metadata.get("sender_display_name").and_then(|v| v.as_str())
     {
+        let dm_channel_name = format!("dm-{display_name}");
         metadata.insert(
             "slack_channel_name".into(),
-            serde_json::Value::String(format!("dm-{display_name}")),
+            serde_json::Value::String(dm_channel_name.clone()),
+        );
+        metadata.insert(
+            crate::metadata_keys::CHANNEL_NAME.into(),
+            serde_json::Value::String(dm_channel_name),
         );
     }
 

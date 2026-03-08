@@ -4,12 +4,14 @@ use crate::agent::channel::ChannelState;
 use crate::agent::cortex_chat::CortexChatSession;
 use crate::agent::status::StatusBlock;
 use crate::config::{Binding, DefaultsConfig, DiscordPermissions, RuntimeConfig, SlackPermissions};
+use crate::conversation::worker_transcript::{ActionContent, TranscriptStep};
 use crate::cron::{CronStore, Scheduler};
 use crate::llm::LlmManager;
 use crate::mcp::McpManager;
 use crate::memory::{EmbeddingModel, MemorySearch};
 use crate::messaging::MessagingManager;
 use crate::messaging::webchat::WebChatAdapter;
+use crate::projects::ProjectStore;
 use crate::prompts::PromptEngine;
 use crate::tasks::TaskStore;
 use crate::update::SharedUpdateStatus;
@@ -68,12 +70,16 @@ pub struct ApiState {
     pub cron_schedulers: arc_swap::ArcSwap<HashMap<String, Arc<Scheduler>>>,
     /// Per-agent task stores for task CRUD operations.
     pub task_stores: arc_swap::ArcSwap<HashMap<String, Arc<TaskStore>>>,
+    /// Per-agent project stores for project/repo/worktree CRUD operations.
+    pub project_stores: arc_swap::ArcSwap<HashMap<String, Arc<ProjectStore>>>,
     /// Per-agent RuntimeConfig for reading live hot-reloaded configuration.
     pub runtime_configs: ArcSwap<HashMap<String, Arc<RuntimeConfig>>>,
     /// Per-agent MCP managers for status and reconnect APIs.
     pub mcp_managers: ArcSwap<HashMap<String, Arc<McpManager>>>,
     /// Per-agent sandbox instances for process containment.
     pub sandboxes: ArcSwap<HashMap<String, Arc<crate::sandbox::Sandbox>>>,
+    /// Instance-level secrets store (shared across all agents).
+    pub secrets_store: ArcSwap<Option<Arc<crate::secrets::store::SecretsStore>>>,
     /// Shared reference to the Discord permissions ArcSwap (same instance used by the adapter and file watcher).
     pub discord_permissions: RwLock<Option<Arc<ArcSwap<DiscordPermissions>>>>,
     /// Shared reference to the Slack permissions ArcSwap (same instance used by the adapter and file watcher).
@@ -102,6 +108,11 @@ pub struct ApiState {
     pub agent_remove_tx: mpsc::Sender<String>,
     /// Shared webchat adapter for session management from API handlers.
     pub webchat_adapter: ArcSwap<Option<Arc<WebChatAdapter>>>,
+    /// Cross-agent task store registry for delegation.
+    pub task_store_registry:
+        Arc<ArcSwap<std::collections::HashMap<String, Arc<crate::tasks::TaskStore>>>>,
+    /// Sender for cross-agent message injection.
+    pub injection_tx: mpsc::Sender<crate::ChannelInjection>,
     /// Instance-level agent links for the communication graph.
     pub agent_links: ArcSwap<Vec<crate::links::AgentLink>>,
     /// Visual agent groups for the topology UI.
@@ -110,6 +121,11 @@ pub struct ApiState {
     pub agent_humans: ArcSwap<Vec<crate::config::HumanDef>>,
     /// SSH server manager.
     pub ssh_manager: tokio::sync::Mutex<crate::ssh::SshManager>,
+    /// Live transcript cache for running workers. Accumulates `TranscriptStep`s
+    /// from `ToolStarted`/`ToolCompleted` events so that page refreshes can
+    /// recover the transcript without waiting for the worker to complete.
+    /// Keyed by worker_id, cleared on worker completion.
+    pub live_worker_transcripts: Arc<RwLock<HashMap<String, Vec<TranscriptStep>>>>,
 }
 
 /// Events sent to SSE clients. Wraps ProcessEvents with agent context.
@@ -136,6 +152,13 @@ pub enum ApiEvent {
         channel_id: String,
         is_typing: bool,
     },
+    /// Streaming text delta for an outbound assistant message.
+    OutboundMessageDelta {
+        agent_id: String,
+        channel_id: String,
+        text_delta: String,
+        aggregated_text: String,
+    },
     /// A worker was started.
     WorkerStarted {
         agent_id: String,
@@ -143,6 +166,7 @@ pub enum ApiEvent {
         worker_id: String,
         task: String,
         worker_type: String,
+        interactive: bool,
     },
     /// A worker's status changed.
     WorkerStatusUpdate {
@@ -150,6 +174,12 @@ pub enum ApiEvent {
         channel_id: Option<String>,
         worker_id: String,
         status: String,
+    },
+    /// A worker entered the idle state (waiting for follow-up input).
+    WorkerIdle {
+        agent_id: String,
+        channel_id: Option<String>,
+        worker_id: String,
     },
     /// A worker completed.
     WorkerCompleted {
@@ -215,6 +245,18 @@ pub enum ApiEvent {
         /// "created", "updated", or "deleted".
         action: String,
     },
+    /// A finalized content part from an OpenCode worker session.
+    OpenCodePartUpdated {
+        agent_id: String,
+        worker_id: String,
+        part: crate::opencode::types::OpenCodePart,
+    },
+    /// A worker emitted text content (model reasoning between tool calls).
+    WorkerText {
+        agent_id: String,
+        worker_id: String,
+        text: String,
+    },
 }
 
 impl ApiState {
@@ -222,6 +264,10 @@ impl ApiState {
         provider_setup_tx: mpsc::Sender<crate::ProviderSetupEvent>,
         agent_tx: mpsc::Sender<crate::Agent>,
         agent_remove_tx: mpsc::Sender<String>,
+        injection_tx: mpsc::Sender<crate::ChannelInjection>,
+        task_store_registry: Arc<
+            ArcSwap<std::collections::HashMap<String, Arc<crate::tasks::TaskStore>>>,
+        >,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(512);
         Self {
@@ -239,9 +285,11 @@ impl ApiState {
             cron_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             cron_schedulers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             task_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            project_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             runtime_configs: ArcSwap::from_pointee(HashMap::new()),
             mcp_managers: ArcSwap::from_pointee(HashMap::new()),
             sandboxes: ArcSwap::from_pointee(HashMap::new()),
+            secrets_store: ArcSwap::from_pointee(None),
             discord_permissions: RwLock::new(None),
             slack_permissions: RwLock::new(None),
             bindings: RwLock::new(None),
@@ -255,6 +303,8 @@ impl ApiState {
             defaults_config: RwLock::new(None),
             agent_tx,
             agent_remove_tx,
+            task_store_registry,
+            injection_tx,
             webchat_adapter: ArcSwap::from_pointee(None),
             agent_links: ArcSwap::from_pointee(Vec::new()),
             agent_groups: ArcSwap::from_pointee(Vec::new()),
@@ -262,6 +312,7 @@ impl ApiState {
             ssh_manager: tokio::sync::Mutex::new(crate::ssh::SshManager::new(
                 std::path::Path::new(""),
             )),
+            live_worker_transcripts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -292,6 +343,16 @@ impl ApiState {
         self.channel_states.write().await.remove(channel_id);
     }
 
+    /// Retrieve the live transcript cache for a running worker.
+    ///
+    /// Returns `Some` with the accumulated transcript steps if the worker is
+    /// currently running and has emitted tool calls. Returns `None` if no
+    /// cached transcript exists (worker completed or never started).
+    pub async fn get_live_transcript(&self, worker_id: &str) -> Option<Vec<TranscriptStep>> {
+        let guard = self.live_worker_transcripts.read().await;
+        guard.get(worker_id).cloned()
+    }
+
     /// Register an agent's event stream. Spawns a task that forwards
     /// ProcessEvents into the aggregated API event stream.
     pub fn register_agent_events(
@@ -300,6 +361,7 @@ impl ApiState {
         mut agent_event_rx: broadcast::Receiver<ProcessEvent>,
     ) {
         let api_tx = self.event_tx.clone();
+        let live_transcripts = self.live_worker_transcripts.clone();
         tokio::spawn(async move {
             loop {
                 match agent_event_rx.recv().await {
@@ -311,8 +373,13 @@ impl ApiState {
                                 channel_id,
                                 task,
                                 worker_type,
+                                interactive,
                                 ..
                             } => {
+                                live_transcripts
+                                    .write()
+                                    .await
+                                    .insert(worker_id.to_string(), Vec::new());
                                 api_tx
                                     .send(ApiEvent::WorkerStarted {
                                         agent_id: agent_id.clone(),
@@ -320,6 +387,7 @@ impl ApiState {
                                         worker_id: worker_id.to_string(),
                                         task: task.clone(),
                                         worker_type: worker_type.clone(),
+                                        interactive: *interactive,
                                     })
                                     .ok();
                             }
@@ -353,6 +421,19 @@ impl ApiState {
                                     })
                                     .ok();
                             }
+                            ProcessEvent::WorkerIdle {
+                                worker_id,
+                                channel_id,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::WorkerIdle {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.as_deref().map(|s| s.to_string()),
+                                        worker_id: worker_id.to_string(),
+                                    })
+                                    .ok();
+                            }
                             ProcessEvent::WorkerComplete {
                                 worker_id,
                                 channel_id,
@@ -360,6 +441,10 @@ impl ApiState {
                                 success,
                                 ..
                             } => {
+                                live_transcripts
+                                    .write()
+                                    .await
+                                    .remove(&worker_id.to_string());
                                 api_tx
                                     .send(ApiEvent::WorkerCompleted {
                                         agent_id: agent_id.clone(),
@@ -393,6 +478,21 @@ impl ApiState {
                                 ..
                             } => {
                                 let (process_type, id_str) = process_id_info(process_id);
+                                // Accumulate tool call into live transcript for workers.
+                                if let ProcessId::Worker(worker_id) = process_id {
+                                    let call_id = format!("live_{}", uuid::Uuid::new_v4());
+                                    let step = TranscriptStep::Action {
+                                        content: vec![ActionContent::ToolCall {
+                                            id: call_id,
+                                            name: tool_name.clone(),
+                                            args: args.clone(),
+                                        }],
+                                    };
+                                    let mut guard = live_transcripts.write().await;
+                                    if let Some(steps) = guard.get_mut(&worker_id.to_string()) {
+                                        steps.push(step);
+                                    }
+                                }
                                 api_tx
                                     .send(ApiEvent::ToolStarted {
                                         agent_id: agent_id.clone(),
@@ -412,6 +512,18 @@ impl ApiState {
                                 ..
                             } => {
                                 let (process_type, id_str) = process_id_info(process_id);
+                                // Accumulate tool result into live transcript for workers.
+                                if let ProcessId::Worker(worker_id) = process_id {
+                                    let step = TranscriptStep::ToolResult {
+                                        call_id: String::new(),
+                                        name: tool_name.clone(),
+                                        text: result.clone(),
+                                    };
+                                    let mut guard = live_transcripts.write().await;
+                                    if let Some(steps) = guard.get_mut(&worker_id.to_string()) {
+                                        steps.push(step);
+                                    }
+                                }
                                 api_tx
                                     .send(ApiEvent::ToolCompleted {
                                         agent_id: agent_id.clone(),
@@ -470,13 +582,73 @@ impl ApiState {
                                     })
                                     .ok();
                             }
+                            ProcessEvent::TextDelta {
+                                channel_id: Some(channel_id),
+                                text_delta,
+                                aggregated_text,
+                                ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::OutboundMessageDelta {
+                                        agent_id: agent_id.clone(),
+                                        channel_id: channel_id.to_string(),
+                                        text_delta: text_delta.clone(),
+                                        aggregated_text: aggregated_text.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::OpenCodePartUpdated {
+                                worker_id, part, ..
+                            } => {
+                                api_tx
+                                    .send(ApiEvent::OpenCodePartUpdated {
+                                        agent_id: agent_id.clone(),
+                                        worker_id: worker_id.to_string(),
+                                        part: part.clone(),
+                                    })
+                                    .ok();
+                            }
+                            ProcessEvent::WorkerText {
+                                worker_id, text, ..
+                            } => {
+                                // Accumulate into live transcript cache
+                                let step = TranscriptStep::Action {
+                                    content: vec![ActionContent::Text { text: text.clone() }],
+                                };
+                                let mut guard = live_transcripts.write().await;
+                                if let Some(steps) = guard.get_mut(&worker_id.to_string()) {
+                                    steps.push(step);
+                                }
+                                drop(guard);
+
+                                api_tx
+                                    .send(ApiEvent::WorkerText {
+                                        agent_id: agent_id.clone(),
+                                        worker_id: worker_id.to_string(),
+                                        text: text.clone(),
+                                    })
+                                    .ok();
+                            }
                             _ => {}
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(count)) => {
-                        tracing::debug!(agent_id = %agent_id, count, "API event forwarder lagged, skipped events");
+                    Err(error) => {
+                        match crate::classify_broadcast_recv_result::<crate::ProcessEvent>(Err(
+                            error,
+                        )) {
+                            crate::BroadcastRecvResult::Lagged(count) => {
+                                tracing::debug!(
+                                    agent_id = %agent_id,
+                                    count,
+                                    "API event forwarder lagged, skipped events"
+                                );
+                            }
+                            crate::BroadcastRecvResult::Closed => break,
+                            crate::BroadcastRecvResult::Event(_) => unreachable!(
+                                "classifying an Err recv result should never produce Event"
+                            ),
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -528,6 +700,11 @@ impl ApiState {
         self.task_stores.store(Arc::new(stores));
     }
 
+    /// Set the project stores for all agents.
+    pub fn set_project_stores(&self, stores: HashMap<String, Arc<ProjectStore>>) {
+        self.project_stores.store(Arc::new(stores));
+    }
+
     /// Set the runtime configs for all agents.
     pub fn set_runtime_configs(&self, configs: HashMap<String, Arc<RuntimeConfig>>) {
         self.runtime_configs.store(Arc::new(configs));
@@ -541,6 +718,11 @@ impl ApiState {
     /// Set the sandbox instances for all agents.
     pub fn set_sandboxes(&self, sandboxes: HashMap<String, Arc<crate::sandbox::Sandbox>>) {
         self.sandboxes.store(Arc::new(sandboxes));
+    }
+
+    /// Set the instance-level secrets store.
+    pub fn set_secrets_store(&self, store: Arc<crate::secrets::store::SecretsStore>) {
+        self.secrets_store.store(Arc::new(Some(store)));
     }
 
     /// Share the Discord permissions ArcSwap with the API so reads get hot-reloaded values.

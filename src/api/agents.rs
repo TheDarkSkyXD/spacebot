@@ -66,6 +66,7 @@ struct HeatmapCell {
 struct CronJobInfo {
     id: String,
     prompt: String,
+    cron_expr: Option<String>,
     interval_secs: u64,
     delivery_target: String,
     enabled: bool,
@@ -400,8 +401,12 @@ pub(super) async fn trigger_warmup(
         let llm_manager = llm_manager.clone();
         let force = request.force;
         let agent_id = agent_id.clone();
+        let task_store_registry = state.task_store_registry.clone();
+        let injection_tx = state.injection_tx.clone();
         tokio::spawn(async move {
-            let (event_tx, _event_rx) = tokio::sync::broadcast::channel(16);
+            let (event_tx, memory_event_tx) = crate::create_process_event_buses();
+            let project_store =
+                std::sync::Arc::new(crate::projects::ProjectStore::new(sqlite_pool.clone()));
             let deps = crate::AgentDeps {
                 agent_id: Arc::from(agent_id.as_str()),
                 memory_search,
@@ -410,12 +415,19 @@ pub(super) async fn trigger_warmup(
                 cron_tool: None,
                 runtime_config,
                 event_tx,
+                memory_event_tx,
                 sqlite_pool: sqlite_pool.clone(),
                 messaging_manager: None,
                 sandbox,
                 task_store,
+                project_store,
                 links: Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new())),
                 agent_names: Arc::new(std::collections::HashMap::new()),
+                task_store_registry,
+                process_control_registry: Arc::new(
+                    crate::agent::process_control::ProcessControlRegistry::new(),
+                ),
+                injection_tx,
             };
             let logger = CortexLogger::new(sqlite_pool);
             crate::agent::cortex::run_warmup_once(&deps, &logger, "api_trigger", force).await;
@@ -508,11 +520,36 @@ pub(super) async fn create_agent(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let defaults = state.defaults_config.read().await;
-    let defaults = defaults.as_ref().ok_or_else(|| {
-        tracing::error!("defaults config not available");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    // Read defaults directly from the config we just wrote to disk rather than
+    // relying on the cached `defaults_config` which may be stale (e.g. if a
+    // provider was configured but the in-memory cache wasn't refreshed yet).
+    let disk_defaults = match crate::config::Config::load_from_path(&config_path) {
+        Ok(fresh_config) => {
+            // Also update the in-memory cache so subsequent operations
+            // (e.g. creating another agent) don't hit stale defaults.
+            state
+                .set_defaults_config(fresh_config.defaults.clone())
+                .await;
+            Some(fresh_config.defaults)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to reload config.toml for defaults; falling back to cached defaults"
+            );
+            None
+        }
+    };
+    let cached_defaults;
+    let defaults = if let Some(ref d) = disk_defaults {
+        d
+    } else {
+        cached_defaults = state.defaults_config.read().await;
+        cached_defaults.as_ref().ok_or_else(|| {
+            tracing::error!("defaults config not available");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
 
     let raw_config = crate::config::AgentConfig {
         id: agent_id.clone(),
@@ -533,15 +570,16 @@ pub(super) async fn create_agent(
         cortex: None,
         warmup: None,
         browser: None,
+        channel: None,
         mcp: None,
         brave_search_key: None,
         cron_timezone: None,
         user_timezone: None,
         sandbox: None,
+        projects: None,
         cron: Vec::new(),
     };
     let agent_config = raw_config.resolve(&instance_dir, defaults);
-    let _ = defaults;
 
     for dir in [
         &agent_config.workspace,
@@ -601,7 +639,7 @@ pub(super) async fn create_agent(
     ));
     let task_store = std::sync::Arc::new(crate::tasks::TaskStore::new(db.sqlite.clone()));
 
-    let (event_tx, _) = tokio::sync::broadcast::channel(256);
+    let (event_tx, memory_event_tx) = crate::create_process_event_buses();
     let arc_agent_id: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
 
     crate::identity::scaffold_identity_files(&agent_config.workspace)
@@ -627,7 +665,9 @@ pub(super) async fn create_agent(
             .clone()
     };
 
-    let defaults_for_runtime = {
+    let defaults_for_runtime = if let Some(d) = disk_defaults {
+        d
+    } else {
         let guard = state.defaults_config.read().await;
         guard
             .as_ref()
@@ -646,7 +686,8 @@ pub(super) async fn create_agent(
         identity,
         skills,
     ));
-    runtime_config.set_settings(settings_store.clone());
+    let explicit_listen_only = raw_config.channel.map(|channel| channel.listen_only_mode);
+    runtime_config.set_settings(settings_store.clone(), explicit_listen_only);
 
     let llm_manager = {
         let guard = state.llm_manager.read().await;
@@ -664,7 +705,7 @@ pub(super) async fn create_agent(
 
     let sandbox = std::sync::Arc::new(
         crate::sandbox::Sandbox::new(
-            &agent_config.sandbox,
+            runtime_config.sandbox.clone(),
             agent_config.workspace.clone(),
             &instance_dir,
             agent_config.data_dir.clone(),
@@ -672,15 +713,22 @@ pub(super) async fn create_agent(
         .await,
     );
 
+    let project_store = std::sync::Arc::new(crate::projects::ProjectStore::new(db.sqlite.clone()));
+
+    // Inject active project root paths into the sandbox allowlist.
+    crate::projects::refresh_sandbox_project_paths(&project_store, &arc_agent_id, &sandbox).await;
+
     let deps = crate::AgentDeps {
         agent_id: arc_agent_id.clone(),
         memory_search: memory_search.clone(),
         llm_manager,
         mcp_manager: mcp_manager.clone(),
         task_store: task_store.clone(),
+        project_store: project_store.clone(),
         cron_tool: None,
         runtime_config: runtime_config.clone(),
         event_tx: event_tx.clone(),
+        memory_event_tx: memory_event_tx.clone(),
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: {
             let guard = state.messaging_manager.read().await;
@@ -690,6 +738,11 @@ pub(super) async fn create_agent(
         links: Arc::new(arc_swap::ArcSwap::from_pointee(
             (**state.agent_links.load()).clone(),
         )),
+        task_store_registry: state.task_store_registry.clone(),
+        process_control_registry: Arc::new(
+            crate::agent::process_control::ProcessControlRegistry::new(),
+        ),
+        injection_tx: state.injection_tx.clone(),
         agent_names: {
             let configs = state.agent_configs.load();
             let mut names: std::collections::HashMap<String, String> = configs
@@ -744,6 +797,7 @@ pub(super) async fn create_agent(
         deps.agent_id.clone(),
         deps.task_store.clone(),
         memory_search.clone(),
+        deps.memory_event_tx.clone(),
         conversation_logger,
         channel_store,
         run_logger,
@@ -752,6 +806,7 @@ pub(super) async fn create_agent(
         brave_search_key,
         runtime_config.workspace_dir.clone(),
         sandbox.clone(),
+        runtime_config.clone(),
     );
     let cortex_store = crate::agent::cortex_chat::CortexChatStore::new(db.sqlite.clone());
     let cortex_session = crate::agent::cortex_chat::CortexChatSession::new(
@@ -762,8 +817,7 @@ pub(super) async fn create_agent(
 
     let cortex_logger = crate::agent::cortex::CortexLogger::new(db.sqlite.clone());
     let _warmup_loop = crate::agent::cortex::spawn_warmup_loop(deps.clone(), cortex_logger.clone());
-    let _bulletin_loop =
-        crate::agent::cortex::spawn_bulletin_loop(deps.clone(), cortex_logger.clone());
+    let _cortex_loop = crate::agent::cortex::spawn_cortex_loop(deps.clone(), cortex_logger.clone());
     let _association_loop =
         crate::agent::cortex::spawn_association_loop(deps.clone(), cortex_logger);
     crate::agent::cortex::spawn_ready_task_loop(
@@ -799,8 +853,14 @@ pub(super) async fn create_agent(
         state.memory_searches.store(std::sync::Arc::new(searches));
 
         let mut task_stores = (**state.task_stores.load()).clone();
-        task_stores.insert(agent_id.clone(), task_store);
+        task_stores.insert(agent_id.clone(), task_store.clone());
         state.task_stores.store(std::sync::Arc::new(task_stores));
+
+        let mut registry = (**state.task_store_registry.load()).clone();
+        registry.insert(agent_id.clone(), task_store);
+        state
+            .task_store_registry
+            .store(std::sync::Arc::new(registry));
 
         let mut workspaces = (**state.agent_workspaces.load()).clone();
         workspaces.insert(agent_id.clone(), agent_config.workspace.clone());
@@ -819,6 +879,12 @@ pub(super) async fn create_agent(
         let mut sandboxes = (**state.sandboxes.load()).clone();
         sandboxes.insert(agent_id.clone(), sandbox);
         state.sandboxes.store(std::sync::Arc::new(sandboxes));
+
+        let mut project_stores_map = (**state.project_stores.load()).clone();
+        project_stores_map.insert(agent_id.clone(), project_store);
+        state
+            .project_stores
+            .store(std::sync::Arc::new(project_stores_map));
 
         let mut agent_infos = (**state.agent_configs.load()).clone();
         agent_infos.push(AgentInfo {
@@ -1072,6 +1138,12 @@ pub(super) async fn delete_agent(
         state
             .cortex_chat_sessions
             .store(std::sync::Arc::new(sessions));
+
+        let mut project_stores_map = (**state.project_stores.load()).clone();
+        project_stores_map.remove(&agent_id);
+        state
+            .project_stores
+            .store(std::sync::Arc::new(project_stores_map));
     }
 
     // Signal the main event loop to remove the agent
@@ -1119,7 +1191,7 @@ pub(super) async fn agent_overview(
     let channel_count = channels.len();
 
     let cron_rows = sqlx::query(
-        "SELECT id, prompt, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled, run_once, timeout_secs FROM cron_jobs ORDER BY created_at ASC",
+        "SELECT id, prompt, cron_expr, interval_secs, delivery_target, active_start_hour, active_end_hour, enabled, run_once, timeout_secs FROM cron_jobs ORDER BY created_at ASC",
     )
     .fetch_all(pool)
     .await
@@ -1133,6 +1205,7 @@ pub(super) async fn agent_overview(
             CronJobInfo {
                 id: row.get("id"),
                 prompt: row.get("prompt"),
+                cron_expr: row.try_get::<Option<String>, _>("cron_expr").ok().flatten(),
                 interval_secs: row.get::<i64, _>("interval_secs") as u64,
                 delivery_target: row.get("delivery_target"),
                 enabled: row.get::<i64, _>("enabled") != 0,
@@ -1452,10 +1525,16 @@ mod tests {
         let (agent_tx, _agent_rx) = tokio::sync::mpsc::channel(1);
         let (agent_remove_tx, _agent_remove_rx) = tokio::sync::mpsc::channel(1);
 
+        let (injection_tx, _injection_rx) = tokio::sync::mpsc::channel(1);
+        let task_store_registry = Arc::new(arc_swap::ArcSwap::from_pointee(
+            std::collections::HashMap::new(),
+        ));
         Arc::new(ApiState::new_with_provider_sender(
             provider_setup_tx,
             agent_tx,
             agent_remove_tx,
+            injection_tx,
+            task_store_registry,
         ))
     }
 

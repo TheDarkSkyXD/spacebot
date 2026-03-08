@@ -1,10 +1,20 @@
 //! Channel: User-facing conversation process.
 
-use crate::agent::branch::Branch;
+use crate::agent::channel_attachments;
+use crate::agent::channel_attachments::download_attachments;
+use crate::agent::channel_dispatch::spawn_memory_persistence_branch;
+use crate::agent::channel_history::{
+    apply_history_after_turn, event_is_for_channel, extract_message_id,
+    extract_reply_from_tool_syntax, format_batched_user_message, format_user_message,
+    message_display_name, pop_retrigger_bridge_message,
+};
+use crate::agent::channel_prompt::{
+    MAX_RETRIGGERS_PER_TURN, RETRIGGER_DEBOUNCE_MS, RETRIGGER_MAX_TURNS, TemporalContext,
+};
 use crate::agent::compactor::Compactor;
+use crate::agent::process_control::ControlActionResult;
 use crate::agent::status::StatusBlock;
 use crate::agent::worker::Worker;
-use crate::config::ApiType;
 use crate::conversation::{ChannelStore, ConversationLogger, ProcessRunLogger};
 use crate::error::{AgentError, Result};
 use crate::hooks::SpacebotHook;
@@ -13,145 +23,16 @@ use crate::{
     AgentDeps, BranchId, ChannelId, InboundMessage, OutboundResponse, ProcessEvent, ProcessId,
     ProcessType, WorkerId,
 };
-use chrono::{DateTime, Local, Utc};
-use chrono_tz::Tz;
 use rig::agent::AgentBuilder;
-use rig::completion::{CompletionModel, Prompt};
-use rig::message::{ImageMediaType, MimeType, UserContent};
+use rig::completion::CompletionModel;
+use rig::message::UserContent;
 use rig::one_or_many::OneOrMany;
 use rig::tool::server::ToolServer;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
-use tracing::Instrument as _;
-
-/// Debounce window for retriggers: coalesce rapid branch/worker completions
-/// into a single retrigger instead of firing one per event.
-const RETRIGGER_DEBOUNCE_MS: u64 = 500;
-
-/// Maximum retriggers allowed since the last real user message. Prevents
-/// infinite retrigger cascades where each retrigger spawns more work.
-const MAX_RETRIGGERS_PER_TURN: usize = 3;
-
-#[derive(Debug, Clone)]
-enum TemporalTimezone {
-    Named { timezone_name: String, timezone: Tz },
-    SystemLocal,
-}
-
-#[derive(Debug, Clone)]
-struct TemporalContext {
-    now_utc: DateTime<Utc>,
-    timezone: TemporalTimezone,
-}
-
-impl TemporalContext {
-    fn from_runtime(runtime_config: &crate::config::RuntimeConfig) -> Self {
-        let now_utc = Utc::now();
-        let user_timezone = runtime_config.user_timezone.load().as_ref().clone();
-        let cron_timezone = runtime_config.cron_timezone.load().as_ref().clone();
-
-        Self {
-            now_utc,
-            timezone: Self::resolve_timezone_from_names(user_timezone, cron_timezone),
-        }
-    }
-
-    fn resolve_timezone_from_names(
-        user_timezone: Option<String>,
-        cron_timezone: Option<String>,
-    ) -> TemporalTimezone {
-        if let Some(timezone_name) = user_timezone {
-            match timezone_name.parse::<Tz>() {
-                Ok(timezone) => {
-                    return TemporalTimezone::Named {
-                        timezone_name,
-                        timezone,
-                    };
-                }
-                Err(_) => {
-                    let cron_timezone_candidate =
-                        cron_timezone.as_deref().unwrap_or("none configured");
-                    tracing::warn!(
-                        timezone = %timezone_name,
-                        cron_timezone = %cron_timezone_candidate,
-                        "invalid runtime timezone for channel temporal context, will try cron_timezone then fall back to system local"
-                    );
-                }
-            }
-        }
-
-        if let Some(timezone_name) = cron_timezone {
-            match timezone_name.parse::<Tz>() {
-                Ok(timezone) => {
-                    return TemporalTimezone::Named {
-                        timezone_name,
-                        timezone,
-                    };
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        timezone = %timezone_name,
-                        error = %error,
-                        "invalid cron_timezone for channel temporal context, falling back to system local"
-                    );
-                }
-            }
-        }
-
-        TemporalTimezone::SystemLocal
-    }
-
-    fn format_timestamp(&self, timestamp: DateTime<Utc>) -> String {
-        match &self.timezone {
-            TemporalTimezone::Named {
-                timezone_name,
-                timezone,
-            } => {
-                let local_timestamp = timestamp.with_timezone(timezone);
-                format!(
-                    "{} ({}, UTC{})",
-                    local_timestamp.format("%Y-%m-%d %H:%M:%S %Z"),
-                    timezone_name,
-                    local_timestamp.format("%:z")
-                )
-            }
-            TemporalTimezone::SystemLocal => {
-                let local_timestamp = timestamp.with_timezone(&Local);
-                format!(
-                    "{} (system local, UTC{})",
-                    local_timestamp.format("%Y-%m-%d %H:%M:%S %Z"),
-                    local_timestamp.format("%:z")
-                )
-            }
-        }
-    }
-
-    fn current_time_line(&self) -> String {
-        format!(
-            "{}; UTC {}",
-            self.format_timestamp(self.now_utc),
-            self.now_utc.format("%Y-%m-%d %H:%M:%S UTC")
-        )
-    }
-
-    fn worker_task_preamble(&self, prompt_engine: &crate::prompts::PromptEngine) -> Result<String> {
-        let local_time = self.format_timestamp(self.now_utc);
-        let utc_time = self.now_utc.format("%Y-%m-%d %H:%M:%S UTC").to_string();
-        prompt_engine.render_system_worker_time_context(&local_time, &utc_time)
-    }
-}
-
-fn build_worker_task_with_temporal_context(
-    task: &str,
-    temporal_context: &TemporalContext,
-    prompt_engine: &crate::prompts::PromptEngine,
-) -> Result<String> {
-    let preamble = temporal_context.worker_task_preamble(prompt_engine)?;
-    Ok(format!("{preamble}\n\n{task}"))
-}
 
 /// A background process result waiting to be relayed to the user via retrigger.
 ///
@@ -169,6 +50,29 @@ struct PendingResult {
     result: String,
     /// Whether the process completed successfully.
     success: bool,
+}
+
+const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
+
+async fn recv_channel_event(
+    event_rx: &mut broadcast::Receiver<ProcessEvent>,
+) -> crate::BroadcastRecvResult<ProcessEvent> {
+    crate::classify_broadcast_recv_result(event_rx.recv().await)
+}
+
+fn should_process_event_for_channel(event: &ProcessEvent, channel_id: &ChannelId) -> bool {
+    event_is_for_channel(event, channel_id)
+}
+
+fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
+    matches!(
+        event,
+        ProcessEvent::BranchStarted { .. }
+            | ProcessEvent::BranchResult { .. }
+            | ProcessEvent::WorkerStarted { .. }
+            | ProcessEvent::WorkerStatus { .. }
+            | ProcessEvent::WorkerComplete { .. }
+    )
 }
 
 /// Shared state that channel tools need to act on the channel.
@@ -191,7 +95,7 @@ pub struct ChannelState {
     pub conversation_logger: ConversationLogger,
     pub process_run_logger: ProcessRunLogger,
     /// Discord message ID to reply to for work spawned in the current turn.
-    pub reply_target_message_id: Arc<RwLock<Option<u64>>>,
+    pub reply_target_message_id: Arc<RwLock<Option<String>>>,
     pub channel_store: ChannelStore,
     pub screenshot_dir: std::path::PathBuf,
     pub logs_dir: std::path::PathBuf,
@@ -201,40 +105,192 @@ impl ChannelState {
     /// Cancel a running worker by aborting its tokio task and cleaning up state.
     /// Returns an error message if the worker is not found.
     pub async fn cancel_worker(&self, worker_id: WorkerId) -> std::result::Result<(), String> {
-        let handle = self.worker_handles.write().await.remove(&worker_id);
+        self.cancel_worker_with_reason(worker_id, "cancelled by channel")
+            .await
+    }
+
+    /// Cancel a running worker by aborting its tokio task and cleaning up state.
+    /// Emits a synthetic terminal event so downstream consumers converge.
+    pub async fn cancel_worker_with_reason(
+        &self,
+        worker_id: WorkerId,
+        reason: &str,
+    ) -> std::result::Result<(), String> {
         let removed = self
             .active_workers
             .write()
             .await
             .remove(&worker_id)
             .is_some();
-        self.worker_inputs.write().await.remove(&worker_id);
+        let handle = self.worker_handles.write().await.remove(&worker_id);
+        let removed_input = self
+            .worker_inputs
+            .write()
+            .await
+            .remove(&worker_id)
+            .is_some();
+        let removed_status = self.status_block.write().await.remove_worker(worker_id);
+        let should_emit = removed || handle.is_some();
+
+        if !should_emit {
+            if removed_input || removed_status {
+                return Ok(());
+            }
+            return Err(format!("Worker {worker_id} not found"));
+        }
 
         if let Some(handle) = handle {
             handle.abort();
-            // Mark the DB row as cancelled since the abort prevents WorkerComplete from firing
-            self.process_run_logger
-                .log_worker_completed(worker_id, "Worker cancelled", false);
-            Ok(())
-        } else if removed {
-            self.process_run_logger
-                .log_worker_completed(worker_id, "Worker cancelled", false);
-            Ok(())
-        } else {
-            Err(format!("Worker {worker_id} not found"))
         }
+
+        let reason = crate::summarize_first_non_empty_line(reason, crate::EVENT_SUMMARY_MAX_CHARS);
+        let result = if reason.is_empty() {
+            "Worker cancelled.".to_string()
+        } else {
+            format!("Worker cancelled: {reason}")
+        };
+
+        self.process_run_logger
+            .log_worker_completed(worker_id, &result, false);
+        if let Err(error) = self.deps.event_tx.send(ProcessEvent::WorkerComplete {
+            agent_id: self.deps.agent_id.clone(),
+            worker_id,
+            channel_id: Some(self.channel_id.clone()),
+            result,
+            notify: true,
+            success: false,
+        }) {
+            tracing::warn!(
+                %error,
+                agent_id = %self.deps.agent_id,
+                worker_id = %worker_id,
+                channel_id = %self.channel_id,
+                "failed to emit synthetic worker completion event"
+            );
+        }
+
+        Ok(())
     }
 
     /// Cancel a running branch by aborting its tokio task.
     /// Returns an error message if the branch is not found.
     pub async fn cancel_branch(&self, branch_id: BranchId) -> std::result::Result<(), String> {
+        self.cancel_branch_with_reason(branch_id, "cancelled by channel")
+            .await
+    }
+
+    /// Cancel a running branch by aborting its tokio task.
+    /// Emits a synthetic terminal result so channel state converges.
+    pub async fn cancel_branch_with_reason(
+        &self,
+        branch_id: BranchId,
+        reason: &str,
+    ) -> std::result::Result<(), String> {
         let handle = self.active_branches.write().await.remove(&branch_id);
-        if let Some(handle) = handle {
-            handle.abort();
-            Ok(())
+        let removed_status = self.status_block.write().await.remove_branch(branch_id);
+        let Some(handle) = handle else {
+            if removed_status {
+                return Ok(());
+            }
+            return Err(format!("Branch {branch_id} not found"));
+        };
+
+        handle.abort();
+        let reason = crate::summarize_first_non_empty_line(reason, crate::EVENT_SUMMARY_MAX_CHARS);
+        let conclusion = if reason.is_empty() {
+            "Branch cancelled.".to_string()
         } else {
-            Err(format!("Branch {branch_id} not found"))
+            format!("Branch cancelled: {reason}")
+        };
+        self.process_run_logger
+            .log_branch_completed(branch_id, &conclusion);
+        if let Err(error) = self.deps.event_tx.send(ProcessEvent::BranchResult {
+            agent_id: self.deps.agent_id.clone(),
+            branch_id,
+            channel_id: self.channel_id.clone(),
+            conclusion,
+        }) {
+            tracing::warn!(
+                %error,
+                agent_id = %self.deps.agent_id,
+                branch_id = %branch_id,
+                channel_id = %self.channel_id,
+                "failed to emit synthetic branch result event"
+            );
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ChannelControlHandle {
+    inner: Arc<ChannelControlState>,
+}
+
+struct ChannelControlState {
+    state: ChannelState,
+}
+
+#[derive(Clone)]
+pub struct WeakChannelControlHandle {
+    inner: Weak<ChannelControlState>,
+}
+
+impl ChannelControlHandle {
+    pub fn new(state: ChannelState) -> Self {
+        Self {
+            inner: Arc::new(ChannelControlState { state }),
+        }
+    }
+
+    pub fn downgrade(&self) -> WeakChannelControlHandle {
+        WeakChannelControlHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub async fn cancel_worker_with_reason(
+        &self,
+        worker_id: WorkerId,
+        reason: &str,
+    ) -> ControlActionResult {
+        match self
+            .inner
+            .state
+            .cancel_worker_with_reason(worker_id, reason)
+            .await
+        {
+            Ok(()) => ControlActionResult::Cancelled,
+            Err(_) => ControlActionResult::NotFound,
+        }
+    }
+
+    pub async fn cancel_branch_with_reason(
+        &self,
+        branch_id: BranchId,
+        reason: &str,
+    ) -> ControlActionResult {
+        match self
+            .inner
+            .state
+            .cancel_branch_with_reason(branch_id, reason)
+            .await
+        {
+            Ok(()) => ControlActionResult::Cancelled,
+            Err(_) => ControlActionResult::NotFound,
+        }
+    }
+}
+
+impl WeakChannelControlHandle {
+    pub fn dangling() -> Self {
+        Self { inner: Weak::new() }
+    }
+
+    pub fn upgrade(&self) -> Option<ChannelControlHandle> {
+        self.inner
+            .upgrade()
+            .map(|inner| ChannelControlHandle { inner })
     }
 }
 
@@ -276,7 +332,7 @@ pub struct Channel {
     /// Branch IDs for silent memory persistence branches (results not injected into history).
     memory_persistence_branches: HashSet<BranchId>,
     /// Optional Discord reply target captured when each branch was started.
-    branch_reply_targets: HashMap<BranchId, u64>,
+    branch_reply_targets: HashMap<BranchId, String>,
     /// Buffer for coalescing rapid-fire messages.
     coalesce_buffer: Vec<InboundMessage>,
     /// Deadline for flushing the coalesce buffer.
@@ -294,6 +350,13 @@ pub struct Channel {
     pending_results: Vec<PendingResult>,
     /// Optional send_agent_message tool (only when agent has active links).
     send_agent_message_tool: Option<crate::tools::SendAgentMessageTool>,
+    /// Channel-local reply mode toggle.
+    /// When true, suppress unsolicited replies unless explicitly invoked.
+    listen_only_mode: bool,
+    /// Session-scoped override used when persistence is unavailable/failed.
+    listen_only_session_override: Option<bool>,
+    /// Handle exposed to the supervision control plane.
+    control_handle: ChannelControlHandle,
 }
 
 impl Channel {
@@ -360,6 +423,8 @@ impl Channel {
                     deps.agent_id.clone(),
                     deps.links.clone(),
                     deps.agent_names.clone(),
+                    deps.task_store_registry.clone(),
+                    ConversationLogger::new(deps.sqlite_pool.clone()),
                 ))
             } else {
                 None
@@ -367,6 +432,8 @@ impl Channel {
         };
 
         let self_tx = message_tx.clone();
+        let resolved_listen_only_mode = deps.runtime_config.channel_config.load().listen_only_mode;
+        let control_handle = ChannelControlHandle::new(state.clone());
         let channel = Self {
             id: id.clone(),
             title: None,
@@ -393,6 +460,9 @@ impl Channel {
             retrigger_deadline: None,
             pending_results: Vec::new(),
             send_agent_message_tool,
+            listen_only_mode: resolved_listen_only_mode,
+            listen_only_session_override: None,
+            control_handle,
         };
 
         (channel, message_tx)
@@ -418,13 +488,367 @@ impl Channel {
             .filter(|adapter| !adapter.is_empty())
     }
 
+    fn sync_listen_only_mode_from_runtime(&mut self) {
+        if let Some(override_mode) = self.listen_only_session_override {
+            self.listen_only_mode = override_mode;
+            return;
+        }
+        let runtime_default = self
+            .deps
+            .runtime_config
+            .channel_config
+            .load()
+            .listen_only_mode;
+        let explicit_listen_only = **self.deps.runtime_config.channel_listen_only_explicit.load();
+        let settings_store = self
+            .deps
+            .runtime_config
+            .settings
+            .load()
+            .as_ref()
+            .as_ref()
+            .cloned();
+        self.listen_only_mode = if explicit_listen_only.is_some() {
+            runtime_default
+        } else if let Some(settings_store) = settings_store {
+            match settings_store.channel_listen_only_mode_for(self.id.as_ref()) {
+                Ok(Some(enabled)) => enabled,
+                Ok(None) => runtime_default,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        channel_id = %self.id,
+                        "failed to sync channel-scoped listen_only_mode setting"
+                    );
+                    runtime_default
+                }
+            }
+        } else {
+            runtime_default
+        };
+    }
+
+    fn set_listen_only_mode(&mut self, enabled: bool) -> bool {
+        let mut persisted = false;
+        let settings_store = self
+            .deps
+            .runtime_config
+            .settings
+            .load()
+            .as_ref()
+            .as_ref()
+            .cloned();
+        if let Some(settings_store) = settings_store {
+            match settings_store.set_channel_listen_only_mode_for(self.id.as_ref(), enabled) {
+                Ok(()) => persisted = true,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        channel_id = %self.id,
+                        listen_only_mode = enabled,
+                        "failed to persist listen_only_mode setting"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                channel_id = %self.id,
+                listen_only_mode = enabled,
+                "settings store unavailable; listen_only_mode is session-scoped"
+            );
+        }
+
+        self.listen_only_mode = enabled;
+        self.listen_only_session_override = if persisted { None } else { Some(enabled) };
+        persisted
+    }
+
+    fn persist_inbound_user_message(
+        &self,
+        message: &InboundMessage,
+        raw_text: &str,
+        saved_attachments: Option<&[channel_attachments::SavedAttachmentMeta]>,
+    ) {
+        if message.source == "system" {
+            return;
+        }
+        let sender_name = message
+            .metadata
+            .get("sender_display_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&message.sender_id);
+
+        // If attachments were saved, enrich the metadata with their info
+        let metadata = if let Some(saved) = saved_attachments {
+            let mut enriched = message.metadata.clone();
+            if let Ok(attachments_json) = serde_json::to_value(saved) {
+                enriched.insert("attachments".to_string(), attachments_json);
+            }
+            enriched
+        } else {
+            message.metadata.clone()
+        };
+
+        self.state.conversation_logger.log_user_message(
+            &self.state.channel_id,
+            sender_name,
+            &message.sender_id,
+            raw_text,
+            &metadata,
+        );
+        self.state
+            .channel_store
+            .upsert(&message.conversation_id, &metadata);
+    }
+
     fn suppress_plaintext_fallback(&self) -> bool {
         matches!(self.current_adapter(), Some("email"))
+    }
+
+    /// Return a handle that allows external supervision to cancel this channel's
+    /// workers and branches without direct access to Channel internals.
+    pub fn control_handle(&self) -> ChannelControlHandle {
+        self.control_handle.clone()
+    }
+
+    fn rewrite_tool_routed_command_prompt(&self, raw_text: &str) -> Option<String> {
+        match raw_text.trim() {
+            "/tasks" => Some(
+                "use channel tools to fetch my ready tasks (limit 10) and reply exactly with:\n\
+                 - header: tasks (ready):\n\
+                 - each line: - #<task_number> [<priority>] <title>\n\
+                 if no tasks are ready, reply exactly: tasks (ready): none"
+                    .to_string(),
+            ),
+            "/today" => Some(
+                "use channel tools to build a local tasks snapshot and reply exactly in this format:\n\
+                 - first line: today (local tasks snapshot):\n\
+                 - section 1: in-progress tasks (up to 5), each line:   #<task_number> [<priority>] <title>\n\
+                 - section 2: up next ready tasks (up to 5), each line:   #<task_number> [<priority>] <title>\n\
+                 if a section is empty use:\n\
+                 - in progress: none\n\
+                 - up next (ready): none"
+                    .to_string(),
+            ),
+            "/digest" => Some(
+                "using available tools and channel context, generate a concise day digest from local 00:00 to now with exactly this order:\n\
+                 1) top decisions\n\
+                 2) key convo themes\n\
+                 3) open loops\n\
+                 keep it practical and concise; if there are no meaningful updates, reply exactly: no material updates today."
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn compute_listen_mode_invocation(
+        &self,
+        message: &InboundMessage,
+        raw_text: &str,
+    ) -> (bool, bool, bool) {
+        let text = raw_text.trim();
+        let invoked_by_command = text.starts_with('/');
+        let invoked_by_mention = match message.source.as_str() {
+            "telegram" => {
+                let text_lower = text.to_lowercase();
+                message
+                    .metadata
+                    .get("telegram_bot_username")
+                    .and_then(|v| v.as_str())
+                    .map(|username| {
+                        let mention = format!("@{}", username.to_lowercase());
+                        text_lower.match_indices(&mention).any(|(start, _)| {
+                            let end = start + mention.len();
+                            let before_ok = start == 0
+                                || text_lower[..start].chars().next_back().is_none_or(
+                                    |character| {
+                                        !(character.is_ascii_alphanumeric() || character == '_')
+                                    },
+                                );
+                            let after_ok = end == text_lower.len()
+                                || text_lower[end..].chars().next().is_none_or(|character| {
+                                    !(character.is_ascii_alphanumeric() || character == '_')
+                                });
+                            before_ok && after_ok
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            "discord" => message
+                .metadata
+                .get("discord_mentioned_bot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "slack" => message
+                .metadata
+                .get("slack_mentions_or_replies_to_bot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "twitch" => message
+                .metadata
+                .get("twitch_mentions_or_replies_to_bot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            _ => false,
+        };
+        let invoked_by_reply = match message.source.as_str() {
+            // Use bot-specific reply metadata; generic reply_to_is_bot can
+            // match unrelated bots and cause false invokes.
+            "discord" => message
+                .metadata
+                .get("discord_reply_to_bot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "telegram" => {
+                let reply_to_is_bot = message
+                    .metadata
+                    .get("reply_to_is_bot")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let bot_username = message
+                    .metadata
+                    .get("telegram_bot_username")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_lowercase);
+                let reply_username = message
+                    .metadata
+                    .get("reply_to_username")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_lowercase);
+                reply_to_is_bot
+                    && reply_username
+                        .zip(bot_username)
+                        .is_some_and(|(reply, bot)| bot == reply)
+            }
+            _ => message
+                .metadata
+                .get("reply_to_is_bot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        };
+
+        (invoked_by_command, invoked_by_mention, invoked_by_reply)
+    }
+
+    async fn send_builtin_text(&mut self, text: String, log_label: &str) {
+        if let Err(error) = self
+            .response_tx
+            .send(OutboundResponse::Text(text.clone()))
+            .await
+        {
+            tracing::error!(%error, channel_id = %self.id, %log_label, "failed to send built-in reply");
+            return;
+        }
+        self.state.conversation_logger.log_bot_message_with_name(
+            &self.state.channel_id,
+            &text,
+            Some(self.agent_display_name()),
+        );
+    }
+
+    async fn try_handle_builtin_ops_commands(
+        &mut self,
+        raw_text: &str,
+        message: &InboundMessage,
+    ) -> Result<bool> {
+        if message.source == "system" {
+            return Ok(false);
+        }
+        let supported_source = matches!(
+            message.source.as_str(),
+            "telegram" | "discord" | "slack" | "twitch"
+        );
+        if !supported_source {
+            return Ok(false);
+        }
+
+        let text = raw_text.trim();
+        if !text.starts_with('/') {
+            return Ok(false);
+        }
+
+        let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
+        let now_line = temporal_context.current_time_line();
+
+        match text {
+            "/status" => {
+                let routing = self.deps.runtime_config.routing.load();
+                let channel_model = routing.resolve(ProcessType::Channel, None).to_string();
+                let branch_model = routing.resolve(ProcessType::Branch, None).to_string();
+                let mode = if self.listen_only_mode {
+                    "quiet"
+                } else {
+                    "active"
+                };
+                let adapter = self.current_adapter().unwrap_or("unknown");
+                let body = format!(
+                    "status\n\
+                     - agent: {}\n\
+                     - channel: {}\n\
+                     - adapter: {}\n\
+                     - mode: {} (quiet => only command/@mention/reply-to-bot)\n\
+                     - channel model: {}\n\
+                     - branch model: {}\n\
+                     - time: {}",
+                    self.deps.agent_id,
+                    self.id,
+                    adapter,
+                    mode,
+                    channel_model,
+                    branch_model,
+                    now_line
+                );
+                self.send_builtin_text(body, "status").await;
+                return Ok(true);
+            }
+            "/quiet" => {
+                let persisted = self.set_listen_only_mode(true);
+                let body = if persisted {
+                    "quiet mode enabled. i'll only reply to commands, @mentions, or replies to my message."
+                        .to_string()
+                } else {
+                    "quiet mode enabled for this session, but persistence failed; it may revert after restart.".to_string()
+                };
+                self.send_builtin_text(body, "quiet").await;
+                return Ok(true);
+            }
+            "/active" => {
+                let persisted = self.set_listen_only_mode(false);
+                let body = if persisted {
+                    "active mode enabled. i'll respond normally in this chat.".to_string()
+                } else {
+                    "active mode enabled for this session, but persistence failed; it may revert after restart.".to_string()
+                };
+                self.send_builtin_text(body, "active").await;
+                return Ok(true);
+            }
+            "/help" => {
+                let lines = [
+                    "commands:".to_string(),
+                    "- /status: current mode, models, binding snapshot".to_string(),
+                    "- /today: in-progress + ready task snapshot".to_string(),
+                    "- /tasks: ready task list".to_string(),
+                    "- /digest: one-shot day digest (00:00 -> now)".to_string(),
+                    "- /quiet: listen-only mode".to_string(),
+                    "- /active: normal reply mode".to_string(),
+                    "- /agent-id: runtime agent id".to_string(),
+                ];
+                let body = lines.join("\n");
+                self.send_builtin_text(body, "help").await;
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        Ok(false)
     }
 
     /// Run the channel event loop.
     pub async fn run(mut self) -> Result<()> {
         tracing::info!(channel_id = %self.id, "channel started");
+        let mut lagged_events_since_warning: u64 = 0;
+        let mut last_lag_warning: Option<std::time::Instant> = None;
 
         loop {
             // Compute next deadline from coalesce and retrigger timers
@@ -461,13 +885,52 @@ impl Channel {
                         }
                     }
                 }
-                Ok(event) = self.event_rx.recv() => {
-                    // Events bypass coalescing - flush buffer first if needed
-                    if let Err(error) = self.flush_coalesce_buffer().await {
-                        tracing::error!(%error, channel_id = %self.id, "error flushing coalesce buffer");
-                    }
-                    if let Err(error) = self.handle_event(event).await {
-                        tracing::error!(%error, channel_id = %self.id, "error handling event");
+                event = recv_channel_event(&mut self.event_rx) => {
+                    match event {
+                        crate::BroadcastRecvResult::Event(event) => {
+                            if !should_process_event_for_channel(&event, &self.id) {
+                                continue;
+                            }
+                            // Worker/branch lifecycle events bypass coalescing.
+                            if should_flush_coalesce_buffer_for_event(&event)
+                                && let Err(error) = self.flush_coalesce_buffer().await
+                            {
+                                tracing::error!(
+                                    %error,
+                                    channel_id = %self.id,
+                                    "error flushing coalesce buffer"
+                                );
+                            }
+                            if let Err(error) = self.handle_event(event).await {
+                                tracing::error!(%error, channel_id = %self.id, "error handling event");
+                            }
+                        }
+                        crate::BroadcastRecvResult::Lagged(skipped) => {
+                            #[cfg(feature = "metrics")]
+                            crate::telemetry::Metrics::global()
+                                .event_receiver_lagged_events_total
+                                .with_label_values(&[&*self.deps.agent_id, "channel_control"])
+                                .inc_by(skipped);
+
+                            if let Some(skipped) = crate::drain_lag_warning_count(
+                                &mut lagged_events_since_warning,
+                                &mut last_lag_warning,
+                                skipped,
+                                std::time::Duration::from_secs(
+                                    EVENT_LAG_WARNING_INTERVAL_SECS,
+                                ),
+                            ) {
+                                tracing::warn!(
+                                    channel_id = %self.id,
+                                    skipped,
+                                    "channel event receiver lagged, dropping old events"
+                                );
+                            }
+                        }
+                        crate::BroadcastRecvResult::Closed => {
+                            tracing::info!(channel_id = %self.id, "channel event bus closed, stopping channel");
+                            break;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(sleep_duration), if next_deadline.is_some() => {
@@ -514,6 +977,17 @@ impl Channel {
             return false;
         }
         if config.multi_user_only && self.is_dm() {
+            return false;
+        }
+        // Built-in slash commands should execute immediately and never be batched.
+        let looks_like_command = match &message.content {
+            crate::MessageContent::Text(text) => text.trim_start().starts_with('/'),
+            crate::MessageContent::Media { text, .. } => text
+                .as_deref()
+                .is_some_and(|value| value.trim_start().starts_with('/')),
+            crate::MessageContent::Interaction { .. } => false,
+        };
+        if looks_like_command {
             return false;
         }
         true
@@ -600,6 +1074,9 @@ impl Channel {
     /// with a coalesce hint telling the LLM this is a fast-moving conversation.
     #[tracing::instrument(skip(self, messages), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_count = messages.len()))]
     async fn handle_message_batch(&mut self, messages: Vec<InboundMessage>) -> Result<()> {
+        // Apply runtime-config updates immediately without requiring a restart.
+        self.sync_listen_only_mode_from_runtime();
+
         let message_count = messages.len();
         let batch_start_timestamp = messages
             .iter()
@@ -647,24 +1124,12 @@ impl Channel {
             let prompt_engine = self.deps.runtime_config.prompts.load();
             let server_name = first
                 .metadata
-                .get("discord_guild_name")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    first
-                        .metadata
-                        .get("telegram_chat_title")
-                        .and_then(|v| v.as_str())
-                });
+                .get(crate::metadata_keys::SERVER_NAME)
+                .and_then(|v| v.as_str());
             let channel_name = first
                 .metadata
-                .get("discord_channel_name")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    first
-                        .metadata
-                        .get("telegram_chat_type")
-                        .and_then(|v| v.as_str())
-                });
+                .get(crate::metadata_keys::CHANNEL_NAME)
+                .and_then(|v| v.as_str());
             self.conversation_context = Some(prompt_engine.render_conversation_context(
                 &first.source,
                 server_name,
@@ -673,9 +1138,23 @@ impl Channel {
         }
 
         // Persist each message to conversation log (individual audit trail)
-        let mut user_contents: Vec<UserContent> = Vec::new();
+        let save_attachments_enabled = self
+            .deps
+            .runtime_config
+            .channel_config
+            .load()
+            .save_attachments;
+        let saved_dir = self.deps.runtime_config.saved_dir();
+
+        // Entries: (formatted_text, attachments, optional saved bytes per attachment)
+        let mut pending_batch_entries: Vec<(
+            String,
+            Vec<crate::Attachment>,
+            Option<Vec<channel_attachments::SavedAttachmentWithBytes>>,
+        )> = Vec::new();
         let mut conversation_id = String::new();
         let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
+        let mut batch_has_invoke = false;
 
         for message in &messages {
             if message.source != "system" {
@@ -696,16 +1175,51 @@ impl Channel {
                     }
                 };
 
+                if self.listen_only_mode {
+                    let (invoked_by_command, invoked_by_mention, invoked_by_reply) =
+                        self.compute_listen_mode_invocation(message, &raw_text);
+                    batch_has_invoke |=
+                        invoked_by_command || invoked_by_mention || invoked_by_reply;
+                }
+
+                // Save attachments to disk when enabled
+                let saved_data = if save_attachments_enabled && !attachments.is_empty() {
+                    Some(
+                        channel_attachments::save_channel_attachments(
+                            &self.deps.sqlite_pool,
+                            self.deps.llm_manager.http_client(),
+                            self.state.channel_id.as_ref(),
+                            &saved_dir,
+                            &attachments,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+
+                // Enrich metadata with saved attachment info
+                let metadata = if let Some(ref data) = saved_data {
+                    let metas: Vec<_> = data.iter().map(|(meta, _)| meta.clone()).collect();
+                    let mut enriched = message.metadata.clone();
+                    if let Ok(json) = serde_json::to_value(&metas) {
+                        enriched.insert("attachments".to_string(), json);
+                    }
+                    enriched
+                } else {
+                    message.metadata.clone()
+                };
+
                 self.state.conversation_logger.log_user_message(
                     &self.state.channel_id,
                     sender_name,
                     &message.sender_id,
                     &raw_text,
-                    &message.metadata,
+                    &metadata,
                 );
                 self.state
                     .channel_store
-                    .upsert(&message.conversation_id, &message.metadata);
+                    .upsert(&message.conversation_id, &metadata);
 
                 conversation_id = message.conversation_id.clone();
 
@@ -732,17 +1246,55 @@ impl Channel {
                     &raw_text,
                 );
 
-                // Download attachments for this message
-                if !attachments.is_empty() {
-                    let attachment_content = download_attachments(&self.deps, &attachments).await;
-                    for content in attachment_content {
-                        user_contents.push(content);
-                    }
-                }
-
-                user_contents.push(UserContent::text(formatted_text));
+                pending_batch_entries.push((formatted_text, attachments, saved_data));
             }
         }
+
+        if self.listen_only_mode && !batch_has_invoke {
+            tracing::debug!(
+                channel_id = %self.id,
+                message_count,
+                "listen-first mode: suppressing unsolicited coalesced batch"
+            );
+            // Keep passive memory capture behavior aligned with single-message flow.
+            self.message_count += message_count;
+            self.check_memory_persistence().await;
+            return Ok(());
+        }
+
+        let mut user_contents: Vec<UserContent> = Vec::new();
+        for (formatted_text, attachments, saved_data) in pending_batch_entries {
+            if !attachments.is_empty() {
+                let attachment_content = if let Some(ref saved) = saved_data {
+                    let mut content = Vec::new();
+                    let mut unsaved = Vec::new();
+                    for (index, attachment) in attachments.iter().enumerate() {
+                        if let Some((_, bytes)) = saved.get(index) {
+                            if attachment.mime_type.starts_with("audio/") {
+                                unsaved.push(attachment.clone());
+                            } else {
+                                content.push(channel_attachments::content_from_bytes(
+                                    bytes, attachment,
+                                ));
+                            }
+                        } else {
+                            unsaved.push(attachment.clone());
+                        }
+                    }
+                    if !unsaved.is_empty() {
+                        content.extend(download_attachments(&self.deps, &unsaved).await);
+                    }
+                    content
+                } else {
+                    download_attachments(&self.deps, &attachments).await
+                };
+                for content in attachment_content {
+                    user_contents.push(content);
+                }
+            }
+            user_contents.push(UserContent::text(formatted_text));
+        }
+
         // Separate text and non-text (image/audio) content
         let mut text_parts = Vec::new();
         let mut attachment_parts = Vec::new();
@@ -766,11 +1318,11 @@ impl Channel {
 
         {
             let mut reply_target = self.state.reply_target_message_id.write().await;
-            *reply_target = messages.iter().rev().find_map(extract_discord_message_id);
+            *reply_target = messages.iter().rev().find_map(extract_message_id);
         }
 
         // Run agent turn with any image/audio attachments preserved
-        let (result, skip_flag, replied_flag) = self
+        let (result, skip_flag, replied_flag, _) = self
             .run_agent_turn(
                 &combined_text,
                 &system_prompt,
@@ -812,6 +1364,7 @@ impl Channel {
         let browser_enabled = rc.browser_config.load().enabled;
         let web_search_enabled = rc.brave_search_key.load().is_some();
         let opencode_enabled = rc.opencode.load().enabled;
+        let sandbox_enabled = self.deps.sandbox.containment_active();
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
@@ -841,6 +1394,8 @@ impl Channel {
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
 
+        let project_context = self.build_project_context(&prompt_engine).await;
+
         prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
             empty_to_none(memory_bulletin.to_string()),
@@ -850,8 +1405,10 @@ impl Channel {
             empty_to_none(status_text),
             coalesce_hint,
             available_channels,
+            sandbox_enabled,
             org_context,
             adapter_prompt,
+            project_context,
         )
     }
 
@@ -862,6 +1419,9 @@ impl Channel {
     /// memory_save. The tools act on the channel's shared state directly.
     #[tracing::instrument(skip(self, message), fields(channel_id = %self.id, agent_id = %self.deps.agent_id, message_id = %message.id))]
     async fn handle_message(&mut self, message: InboundMessage) -> Result<()> {
+        // Apply runtime-config updates immediately without requiring a restart.
+        self.sync_listen_only_mode_from_runtime();
+
         tracing::info!(
             channel_id = %self.id,
             message_id = %message.id,
@@ -886,33 +1446,79 @@ impl Channel {
             crate::MessageContent::Interaction { .. } => (message.content.to_string(), Vec::new()),
         };
 
-        let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
-        let message_timestamp = temporal_context.format_timestamp(message.timestamp);
-        let user_text = format_user_message(&raw_text, &message, &message_timestamp);
-
-        let attachment_content = if !attachments.is_empty() {
-            download_attachments(&self.deps, &attachments).await
+        // Save attachments to disk when enabled, capturing bytes for LLM reuse
+        let save_attachments_enabled = self
+            .deps
+            .runtime_config
+            .channel_config
+            .load()
+            .save_attachments;
+        let saved_attachment_data = if save_attachments_enabled && !attachments.is_empty() {
+            let saved_dir = self.deps.runtime_config.saved_dir();
+            Some(
+                channel_attachments::save_channel_attachments(
+                    &self.deps.sqlite_pool,
+                    self.deps.llm_manager.http_client(),
+                    self.state.channel_id.as_ref(),
+                    &saved_dir,
+                    &attachments,
+                )
+                .await,
+            )
         } else {
-            Vec::new()
+            None
         };
 
-        // Persist user messages (skip system re-triggers)
-        if message.source != "system" {
-            let sender_name = message
-                .metadata
-                .get("sender_display_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&message.sender_id);
-            self.state.conversation_logger.log_user_message(
-                &self.state.channel_id,
-                sender_name,
-                &message.sender_id,
-                &raw_text,
-                &message.metadata,
-            );
-            self.state
-                .channel_store
-                .upsert(&message.conversation_id, &message.metadata);
+        let saved_metas: Option<Vec<_>> = saved_attachment_data
+            .as_ref()
+            .map(|data| data.iter().map(|(meta, _)| meta.clone()).collect());
+
+        self.persist_inbound_user_message(&message, &raw_text, saved_metas.as_deref());
+
+        // Deterministic built-in command: bypass model output drift for agent identity checks.
+        if message.source != "system" && raw_text.trim() == "/agent-id" {
+            self.send_builtin_text(self.deps.agent_id.to_string(), "agent-id")
+                .await;
+            return Ok(());
+        }
+
+        // Deterministic liveness ping for Telegram mentions.
+        // This avoids model/provider flakiness for simple "you there?" style checks.
+        if message.source == "telegram" {
+            let text = raw_text.trim().to_lowercase();
+            let (_, has_mention, _) = self.compute_listen_mode_invocation(&message, &raw_text);
+            let looks_like_ping = text.contains("you here")
+                || text.contains("ping")
+                || text.ends_with(" yo")
+                || text == "yo"
+                || text.contains("alive")
+                || text.contains("there?");
+
+            if has_mention && looks_like_ping {
+                self.send_builtin_text("yeah i'm here".to_string(), "telegram-ping")
+                    .await;
+                return Ok(());
+            }
+        }
+
+        // Deterministic ping ack for Discord quiet-mode mentions/replies to avoid
+        // flaky model behavior (e.g. skipping or over-formatting simple liveness checks).
+        if message.source == "discord" && self.listen_only_mode {
+            let text = raw_text.trim().to_lowercase();
+            let (_, invoked_by_mention, invoked_by_reply) =
+                self.compute_listen_mode_invocation(&message, &raw_text);
+            let directed = invoked_by_mention || invoked_by_reply;
+            let looks_like_ping = text.contains("you here")
+                || text.contains("ping")
+                || text.ends_with(" yo")
+                || text == "yo"
+                || text.contains("alive")
+                || text.contains("there?");
+            if directed && looks_like_ping {
+                self.send_builtin_text("yeah i'm here".to_string(), "discord-ping")
+                    .await;
+                return Ok(());
+            }
         }
 
         // Capture conversation context from the first message (platform, channel, server)
@@ -920,24 +1526,12 @@ impl Channel {
             let prompt_engine = self.deps.runtime_config.prompts.load();
             let server_name = message
                 .metadata
-                .get("discord_guild_name")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    message
-                        .metadata
-                        .get("telegram_chat_title")
-                        .and_then(|v| v.as_str())
-                });
+                .get(crate::metadata_keys::SERVER_NAME)
+                .and_then(|v| v.as_str());
             let channel_name = message
                 .metadata
-                .get("discord_channel_name")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    message
-                        .metadata
-                        .get("telegram_chat_type")
-                        .and_then(|v| v.as_str())
-                });
+                .get(crate::metadata_keys::CHANNEL_NAME)
+                .and_then(|v| v.as_str());
             self.conversation_context = Some(prompt_engine.render_conversation_context(
                 &message.source,
                 server_name,
@@ -945,16 +1539,92 @@ impl Channel {
             )?);
         }
 
+        if self
+            .try_handle_builtin_ops_commands(&raw_text, &message)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let rewritten_text = if message.source == "system" {
+            raw_text.clone()
+        } else {
+            self.rewrite_tool_routed_command_prompt(&raw_text)
+                .unwrap_or_else(|| raw_text.clone())
+        };
+
+        let temporal_context = TemporalContext::from_runtime(self.deps.runtime_config.as_ref());
+        let message_timestamp = temporal_context.format_timestamp(message.timestamp);
+        let user_text = format_user_message(&rewritten_text, &message, &message_timestamp);
+
+        let mut invoked_by_command = false;
+        let mut invoked_by_mention = false;
+        let mut invoked_by_reply = false;
+
+        // Listen-first guardrail:
+        // ingest all messages, but only reply when explicitly invoked.
+        if self.listen_only_mode && message.source != "system" {
+            (invoked_by_command, invoked_by_mention, invoked_by_reply) =
+                self.compute_listen_mode_invocation(&message, &raw_text);
+
+            if !invoked_by_command && !invoked_by_mention && !invoked_by_reply {
+                tracing::debug!(
+                    channel_id = %self.id,
+                    source = %message.source,
+                    "listen-first mode: suppressing unsolicited reply"
+                );
+                // In quiet/listen-first mode we still want passive memory capture.
+                // Count suppressed user messages so auto memory persistence branches
+                // continue to run on interval without requiring explicit invokes.
+                self.message_count += 1;
+                self.check_memory_persistence().await;
+                return Ok(());
+            }
+        }
+
         let system_prompt = self.build_system_prompt().await?;
 
         {
             let mut reply_target = self.state.reply_target_message_id.write().await;
-            *reply_target = extract_discord_message_id(&message);
+            *reply_target = extract_message_id(&message);
         }
 
         let is_retrigger = message.source == "system";
+        let attachment_content = if !attachments.is_empty() {
+            if let Some(ref saved_data) = saved_attachment_data {
+                // Reuse already-downloaded bytes for images/text; audio still
+                // needs transcription via the normal path so we fall through.
+                let mut content = Vec::new();
+                let mut unsaved_attachments = Vec::new();
 
-        let (result, skip_flag, replied_flag) = self
+                for (index, attachment) in attachments.iter().enumerate() {
+                    if let Some((_, bytes)) = saved_data.get(index) {
+                        // Audio attachments need transcription, not just bytes
+                        if attachment.mime_type.starts_with("audio/") {
+                            unsaved_attachments.push(attachment.clone());
+                        } else {
+                            content
+                                .push(channel_attachments::content_from_bytes(bytes, attachment));
+                        }
+                    } else {
+                        unsaved_attachments.push(attachment.clone());
+                    }
+                }
+
+                // Process any attachments that weren't saved (or need transcription)
+                if !unsaved_attachments.is_empty() {
+                    let extra = download_attachments(&self.deps, &unsaved_attachments).await;
+                    content.extend(extra);
+                }
+                content
+            } else {
+                download_attachments(&self.deps, &attachments).await
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (result, skip_flag, replied_flag, retrigger_reply_preserved) = self
             .run_agent_turn(
                 &user_text,
                 &system_prompt,
@@ -967,26 +1637,99 @@ impl Channel {
         self.handle_agent_result(result, &skip_flag, &replied_flag, is_retrigger)
             .await;
 
-        // After a successful retrigger relay, inject a compact record into
-        // history so the conversation has context about what was relayed.
-        // The retrigger turn itself is rolled back by apply_history_after_turn
-        // (PromptCancelled leaves dangling tool calls), so without this the
-        // LLM would have no memory of the background result on subsequent turns.
-        if is_retrigger && replied_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            // Extract the result summaries from the metadata we attached in
-            // flush_pending_retrigger, so we record only the substance (not
-            // the retrigger instructions/template scaffolding).
-            let summary = message
-                .metadata
-                .get("retrigger_result_summary")
-                .and_then(|v| v.as_str())
-                .unwrap_or("[background work completed and result relayed to user]");
+        // Safety-net: in quiet mode, explicit mention/reply should never be dropped silently.
+        if self.listen_only_mode
+            && !is_retrigger
+            && !invoked_by_command
+            && (invoked_by_mention || invoked_by_reply)
+            && skip_flag.load(std::sync::atomic::Ordering::Relaxed)
+            && !replied_flag.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(
+                message.source.as_str(),
+                "discord" | "telegram" | "slack" | "twitch"
+            )
+        {
+            self.send_builtin_text(
+                "yeah i'm here — tell me what you need.".to_string(),
+                "quiet-mode-fallback",
+            )
+            .await;
+        }
 
-            let mut history = self.state.history.write().await;
-            history.push(rig::message::Message::Assistant {
-                id: None,
-                content: OneOrMany::one(rig::message::AssistantContent::text(summary)),
-            });
+        // After retrigger turns, persist a fallback summary only when we don't
+        // already have the LLM's actual relay text in history.
+        //
+        // PromptCancelled + reply tool is now handled in apply_history_after_turn:
+        // it extracts the reply content from tool args and records that exact
+        // assistant message (while dropping scaffolding). In that common success
+        // path, we skip summary injection to avoid replacing user-visible wording
+        // with raw worker output.
+        //
+        // If relay failed (replied=false), or if we couldn't extract a clean
+        // reply content payload, this fallback preserves a compact background
+        // result record for the next user turn.
+        if is_retrigger {
+            let replied = replied_flag.load(std::sync::atomic::Ordering::Relaxed);
+            if replied && retrigger_reply_preserved {
+                tracing::debug!(
+                    channel_id = %self.id,
+                    "skipping retrigger summary injection; relay reply already preserved"
+                );
+            } else {
+                // Extract the result summaries from the metadata we attached in
+                // flush_pending_retrigger, so we record only the substance (not
+                // the retrigger instructions/template scaffolding).
+                let summary = message
+                    .metadata
+                    .get("retrigger_result_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[background work completed]");
+
+                let record = if replied {
+                    summary.to_string()
+                } else {
+                    tracing::warn!(
+                        channel_id = %self.id,
+                        "retrigger relay failed, preserving result in history for next turn"
+                    );
+                    format!(
+                        "[background work completed but relay to user failed — include this in your next response]\n{summary}"
+                    )
+                };
+
+                let mut history = self.state.history.write().await;
+                // Replace the synthetic bridge message (if present) with the summary
+                // to avoid consecutive assistant messages in history.
+                let replaced = pop_retrigger_bridge_message(&mut history);
+                tracing::debug!(
+                    channel_id = %self.id,
+                    replaced_bridge = replaced,
+                    replied,
+                    "injecting retrigger summary into history"
+                );
+                history.push(rig::message::Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(rig::message::AssistantContent::text(record)),
+                });
+            }
+
+            // Mark the completed items as relayed in the status block so their
+            // full result summaries stop appearing on subsequent turns. This
+            // prevents the LLM from re-summarising stale worker/branch results.
+            if replied
+                && let Some(ids) = message
+                    .metadata
+                    .get("retrigger_process_ids")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+            {
+                let mut status = self.state.status_block.write().await;
+                status.mark_relayed(&ids);
+                tracing::debug!(
+                    channel_id = %self.id,
+                    count = ids.len(),
+                    "marked retrigger results as relayed in status block"
+                );
+            }
         }
 
         // Check context size and trigger compaction if needed
@@ -1101,6 +1844,104 @@ impl Channel {
         prompt_engine.render_org_context(org_context).ok()
     }
 
+    /// Build pre-rendered project context for prompt injection.
+    ///
+    /// Fetches all active projects with their repos and worktrees, converts them
+    /// to prompt-friendly structs, and renders via the projects_context template.
+    /// Returns `None` if no projects exist or if rendering fails.
+    async fn build_project_context(
+        &self,
+        prompt_engine: &crate::prompts::engine::PromptEngine,
+    ) -> Option<String> {
+        use crate::prompts::engine::{ProjectContext, ProjectRepoContext, ProjectWorktreeContext};
+
+        let store = &self.deps.project_store;
+        let projects = match store
+            .list_projects(
+                &self.deps.agent_id,
+                Some(crate::projects::ProjectStatus::Active),
+            )
+            .await
+        {
+            Ok(projects) => projects,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load projects for prompt injection");
+                return None;
+            }
+        };
+
+        if projects.is_empty() {
+            return None;
+        }
+
+        let mut contexts = Vec::with_capacity(projects.len());
+        for project in &projects {
+            let repos = match store.list_repos(&project.id).await {
+                Ok(repos) => repos,
+                Err(error) => {
+                    tracing::warn!(%error, project_id = %project.id, "failed to load repos for project");
+                    Vec::new()
+                }
+            };
+
+            let worktrees = match store.list_worktrees_with_repos(&project.id).await {
+                Ok(worktrees) => worktrees,
+                Err(error) => {
+                    tracing::warn!(%error, project_id = %project.id, "failed to load worktrees for project");
+                    Vec::new()
+                }
+            };
+
+            contexts.push(ProjectContext {
+                name: project.name.clone(),
+                root_path: project.root_path.clone(),
+                description: if project.description.is_empty() {
+                    None
+                } else {
+                    Some(project.description.clone())
+                },
+                tags: project.tags.clone(),
+                repos: repos
+                    .into_iter()
+                    .map(|repo| ProjectRepoContext {
+                        name: repo.name.clone(),
+                        path: repo.path.clone(),
+                        default_branch: repo.default_branch.clone(),
+                        remote_url: if repo.remote_url.is_empty() {
+                            None
+                        } else {
+                            Some(repo.remote_url.clone())
+                        },
+                    })
+                    .collect(),
+                worktrees: worktrees
+                    .into_iter()
+                    .map(|worktree_with_repo| ProjectWorktreeContext {
+                        name: worktree_with_repo.worktree.name.clone(),
+                        path: worktree_with_repo.worktree.path.clone(),
+                        branch: worktree_with_repo.worktree.branch.clone(),
+                        repo_name: worktree_with_repo.repo_name.clone(),
+                    })
+                    .collect(),
+            });
+        }
+
+        match prompt_engine.render_projects_context(contexts) {
+            Ok(rendered) => {
+                let rendered = rendered.trim().to_string();
+                if rendered.is_empty() {
+                    None
+                } else {
+                    Some(rendered)
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to render projects context");
+                None
+            }
+        }
+    }
+
     /// Assemble the full system prompt using the PromptEngine.
     async fn build_system_prompt(&self) -> crate::error::Result<String> {
         let rc = &self.deps.runtime_config;
@@ -1114,6 +1955,7 @@ impl Channel {
         let browser_enabled = rc.browser_config.load().enabled;
         let web_search_enabled = rc.brave_search_key.load().is_some();
         let opencode_enabled = rc.opencode.load().enabled;
+        let sandbox_enabled = self.deps.sandbox.containment_active();
         let worker_capabilities = prompt_engine.render_worker_capabilities(
             browser_enabled,
             web_search_enabled,
@@ -1135,6 +1977,8 @@ impl Channel {
             .current_adapter()
             .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter));
 
+        let project_context = self.build_project_context(&prompt_engine).await;
+
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
 
         prompt_engine.render_channel_prompt_with_links(
@@ -1146,14 +1990,16 @@ impl Channel {
             empty_to_none(status_text),
             None, // coalesce_hint - only set for batched messages
             available_channels,
+            sandbox_enabled,
             org_context,
             adapter_prompt,
+            project_context,
         )
     }
 
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
     ///
-    /// Returns the prompt result and skip flag for the caller to dispatch.
+    /// Returns the prompt result and per-turn flags for the caller to dispatch.
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip(self, user_text, system_prompt, attachment_content), fields(channel_id = %self.id, agent_id = %self.deps.agent_id))]
     async fn run_agent_turn(
@@ -1167,10 +2013,18 @@ impl Channel {
         std::result::Result<String, rig::completion::PromptError>,
         crate::tools::SkipFlag,
         crate::tools::RepliedFlag,
+        bool,
     )> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
         let allow_direct_reply = !self.suppress_plaintext_fallback();
+
+        // Set the originating channel on the delegation tool so task completion
+        // notifications route back to this conversation.
+        let send_agent_message_tool = self
+            .send_agent_message_tool
+            .clone()
+            .map(|tool| tool.with_originating_channel(conversation_id.to_string()));
 
         if let Err(error) = crate::tools::add_channel_tools(
             &self.tool_server,
@@ -1180,7 +2034,7 @@ impl Channel {
             skip_flag.clone(),
             replied_flag.clone(),
             self.deps.cron_tool.clone(),
-            self.send_agent_message_tool.clone(),
+            send_agent_message_tool,
             allow_direct_reply,
         )
         .await
@@ -1191,7 +2045,11 @@ impl Channel {
 
         let rc = &self.deps.runtime_config;
         let routing = rc.routing.load();
-        let max_turns = **rc.max_turns.load();
+        let max_turns = if is_retrigger {
+            RETRIGGER_MAX_TURNS
+        } else {
+            **rc.max_turns.load()
+        };
         let model_name = routing.resolve(ProcessType::Channel, None);
         let model = SpacebotModel::make(&self.deps.llm_manager, model_name)
             .with_context(&*self.deps.agent_id, "channel")
@@ -1218,6 +2076,29 @@ impl Channel {
             drop(history);
         }
 
+        // For retrigger turns, inject a synthetic assistant acknowledgment so the
+        // LLM sees proper user/assistant role alternation. Without this, the API
+        // receives back-to-back user messages (the original user prompt preserved
+        // from the prior turn + the retrigger system message), which causes some
+        // models to return empty responses or get confused about whose turn it is.
+        if is_retrigger {
+            let mut history = self.state.history.write().await;
+            // Only inject if the last message is a user message (avoid double-stacking
+            // if history already ends with an assistant message).
+            let needs_bridge = history
+                .last()
+                .is_some_and(|m| matches!(m, rig::message::Message::User { .. }));
+            if needs_bridge {
+                history.push(rig::message::Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(rig::message::AssistantContent::text(
+                        "[acknowledged — working on it in background]",
+                    )),
+                });
+            }
+            drop(history);
+        }
+
         // Clone history out so the write lock is released before the agentic loop.
         // The branch tool needs a read lock on history to clone it for the branch,
         // and holding a write lock across the entire agentic loop would deadlock.
@@ -1227,11 +2108,7 @@ impl Channel {
         };
         let history_len_before = history.len();
 
-        let mut result = agent
-            .prompt(user_text)
-            .with_history(&mut history)
-            .with_hook(self.hook.clone())
-            .await;
+        let mut result = self.hook.prompt_once(&agent, &mut history, user_text).await;
 
         // If the LLM responded with text that looks like tool call syntax, it failed
         // to use the tool calling API. Inject a correction and retry a couple
@@ -1254,14 +2131,13 @@ impl Channel {
 
             let prompt_engine = self.deps.runtime_config.prompts.load();
             let correction = prompt_engine.render_system_tool_syntax_correction()?;
-            result = agent
-                .prompt(&correction)
-                .with_history(&mut history)
-                .with_hook(self.hook.clone())
+            result = self
+                .hook
+                .prompt_once(&agent, &mut history, &correction)
                 .await;
         }
 
-        {
+        let retrigger_reply_preserved = {
             let mut guard = self.state.history.write().await;
             apply_history_after_turn(
                 &result,
@@ -1270,8 +2146,8 @@ impl Channel {
                 history_len_before,
                 &self.id,
                 is_retrigger,
-            );
-        }
+            )
+        };
 
         if let Err(error) =
             crate::tools::remove_channel_tools(&self.tool_server, allow_direct_reply).await
@@ -1279,7 +2155,7 @@ impl Channel {
             tracing::warn!(%error, "failed to remove channel tools");
         }
 
-        Ok((result, skip_flag, replied_flag))
+        Ok((result, skip_flag, replied_flag, retrigger_reply_preserved))
     }
 
     /// Dispatch the LLM result: send fallback text, log errors, clean up typing.
@@ -1314,6 +2190,12 @@ impl Channel {
                             tracing::warn!(
                                 channel_id = %self.id,
                                 "blocked retrigger fallback output containing structured or tool syntax"
+                            );
+                        } else if let Some(leak) = crate::secrets::scrub::scan_for_leaks(text) {
+                            tracing::warn!(
+                                channel_id = %self.id,
+                                leak_prefix = %&leak[..leak.len().min(8)],
+                                "blocked retrigger fallback output matching secret pattern"
                             );
                         } else if suppress_plaintext_fallback {
                             tracing::info!(
@@ -1374,6 +2256,12 @@ impl Channel {
                                 channel_id = %self.id,
                                 "blocked retrigger output containing structured or tool syntax"
                             );
+                        } else if let Some(leak) = crate::secrets::scrub::scan_for_leaks(text) {
+                            tracing::warn!(
+                                channel_id = %self.id,
+                                leak_prefix = %&leak[..leak.len().min(8)],
+                                "blocked retrigger output matching secret pattern"
+                            );
                         } else if suppress_plaintext_fallback {
                             tracing::info!(
                                 channel_id = %self.id,
@@ -1425,6 +2313,12 @@ impl Channel {
                         tracing::warn!(
                             channel_id = %self.id,
                             "blocked fallback output containing structured or tool syntax"
+                        );
+                    } else if let Some(leak) = crate::secrets::scrub::scan_for_leaks(text) {
+                        tracing::warn!(
+                            channel_id = %self.id,
+                            leak_prefix = %&leak[..leak.len().min(8)],
+                            "blocked fallback output matching secret pattern"
                         );
                     } else if suppress_plaintext_fallback {
                         tracing::info!(
@@ -1489,11 +2383,13 @@ impl Channel {
 
     /// Handle a process event (branch results, worker completions, status updates).
     async fn handle_event(&mut self, event: ProcessEvent) -> Result<()> {
+        // Keep mode aligned with live settings updates while this worker runs.
+        self.sync_listen_only_mode_from_runtime();
+
         // Only process events targeted at this channel
         if !event_is_for_channel(&event, &self.id) {
             return Ok(());
         }
-
         // Update status block
         {
             let mut status = self.state.status_block.write().await;
@@ -1514,7 +2410,8 @@ impl Channel {
             } => {
                 run_logger.log_branch_started(channel_id, *branch_id, description);
                 if let Some(message_id) = reply_to_message_id {
-                    self.branch_reply_targets.insert(*branch_id, *message_id);
+                    self.branch_reply_targets
+                        .insert(*branch_id, message_id.clone());
                 }
             }
             ProcessEvent::BranchResult {
@@ -1522,11 +2419,27 @@ impl Channel {
                 conclusion,
                 ..
             } => {
-                run_logger.log_branch_completed(*branch_id, conclusion);
+                let reply_target_message_id = self.branch_reply_targets.get(branch_id).cloned();
+                let was_active = self
+                    .state
+                    .active_branches
+                    .write()
+                    .await
+                    .remove(branch_id)
+                    .is_some();
+                let was_memory_persistence = self.memory_persistence_branches.remove(branch_id);
+                if !was_active {
+                    if was_memory_persistence {
+                        tracing::info!(
+                            branch_id = %branch_id,
+                            "stale memory-persistence branch completion ignored"
+                        );
+                    }
+                    self.branch_reply_targets.remove(branch_id);
+                    return Ok(());
+                }
 
-                // Remove from active branches
-                let mut branches = self.state.active_branches.write().await;
-                branches.remove(branch_id);
+                run_logger.log_branch_completed(*branch_id, conclusion);
 
                 #[cfg(feature = "metrics")]
                 crate::telemetry::Metrics::global()
@@ -1537,8 +2450,7 @@ impl Channel {
                 // Memory persistence branches complete silently — no history
                 // injection, no re-trigger. The work (memory saves) already
                 // happened inside the branch via tool calls.
-                if self.memory_persistence_branches.remove(branch_id) {
-                    self.branch_reply_targets.remove(branch_id);
+                if was_memory_persistence {
                     tracing::info!(branch_id = %branch_id, "memory persistence branch completed");
                 } else {
                     // Regular branch: accumulate result for the next retrigger.
@@ -1552,21 +2464,24 @@ impl Channel {
                     });
                     should_retrigger = true;
 
-                    if let Some(message_id) = self.branch_reply_targets.remove(branch_id) {
+                    if let Some(message_id) = reply_target_message_id {
                         retrigger_metadata.insert(
-                            "discord_reply_to_message_id".to_string(),
+                            crate::metadata_keys::REPLY_TO_MESSAGE_ID.to_string(),
                             serde_json::Value::from(message_id),
                         );
                     }
 
                     tracing::info!(branch_id = %branch_id, "branch result queued for retrigger");
                 }
+                self.branch_reply_targets.remove(branch_id);
             }
             ProcessEvent::WorkerStarted {
                 worker_id,
                 channel_id,
                 task,
                 worker_type,
+                interactive,
+                directory,
                 ..
             } => {
                 run_logger.log_worker_started(
@@ -1575,12 +2490,17 @@ impl Channel {
                     task,
                     worker_type,
                     &self.deps.agent_id,
+                    *interactive,
+                    directory.as_deref().map(std::path::Path::new),
                 );
             }
             ProcessEvent::WorkerStatus {
                 worker_id, status, ..
             } => {
                 run_logger.log_worker_status(*worker_id, status);
+            }
+            ProcessEvent::WorkerIdle { worker_id, .. } => {
+                run_logger.log_worker_idle(*worker_id);
             }
             ProcessEvent::WorkerComplete {
                 worker_id,
@@ -1589,13 +2509,22 @@ impl Channel {
                 success,
                 ..
             } => {
+                // Use worker_handles as the source of truth for active workers.
+                // (active_workers is never populated because Worker is consumed by .run())
+                if self
+                    .state
+                    .worker_handles
+                    .write()
+                    .await
+                    .remove(worker_id)
+                    .is_none()
+                {
+                    return Ok(());
+                }
+
                 run_logger.log_worker_completed(*worker_id, result, *success);
 
-                let mut workers = self.state.active_workers.write().await;
-                workers.remove(worker_id);
-                drop(workers);
-
-                self.state.worker_handles.write().await.remove(worker_id);
+                self.state.active_workers.write().await.remove(worker_id);
                 self.state.worker_inputs.write().await.remove(worker_id);
 
                 if *notify {
@@ -1611,6 +2540,32 @@ impl Channel {
                 }
 
                 tracing::info!(worker_id = %worker_id, "worker completed, result queued for retrigger");
+            }
+            ProcessEvent::OpenCodeSessionCreated {
+                worker_id,
+                session_id,
+                port,
+                ..
+            } => {
+                run_logger.log_opencode_metadata(*worker_id, session_id, *port);
+            }
+            ProcessEvent::WorkerInitialResult {
+                worker_id, result, ..
+            } => {
+                // Interactive worker completed a task (initial or follow-up)
+                // but stays alive for more input. Deliver the result to the
+                // channel without removing the worker from the active set.
+                self.pending_results.push(PendingResult {
+                    process_type: "worker",
+                    process_id: worker_id.to_string(),
+                    result: result.clone(),
+                    success: true,
+                });
+                should_retrigger = true;
+                tracing::info!(
+                    worker_id = %worker_id,
+                    "interactive worker result queued for retrigger"
+                );
             }
             _ => {}
         }
@@ -1762,10 +2717,22 @@ impl Channel {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Collect the process IDs so we can mark them as relayed in the
+        // status block after the retrigger turn completes successfully.
+        let retrigger_process_ids: Vec<String> = self
+            .pending_results
+            .iter()
+            .map(|r| r.process_id.clone())
+            .collect();
+
         let mut metadata = self.pending_retrigger_metadata.clone();
         metadata.insert(
             "retrigger_result_summary".to_string(),
             serde_json::Value::String(result_summary),
+        );
+        metadata.insert(
+            "retrigger_process_ids".to_string(),
+            serde_json::json!(retrigger_process_ids),
         );
 
         let synthetic = InboundMessage {
@@ -1861,1757 +2828,150 @@ impl Channel {
     }
 }
 
-/// Spawn a branch from a ChannelState. Used by the BranchTool.
-pub async fn spawn_branch_from_state(
-    state: &ChannelState,
-    description: impl Into<String>,
-) -> std::result::Result<BranchId, AgentError> {
-    let description = description.into();
-    let rc = &state.deps.runtime_config;
-    let prompt_engine = rc.prompts.load();
-    let system_prompt = prompt_engine
-        .render_branch_prompt(
-            &rc.instance_dir.display().to_string(),
-            &rc.workspace_dir.display().to_string(),
-        )
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
-
-    spawn_branch(
-        state,
-        &description,
-        &description,
-        &system_prompt,
-        &description,
-        "branch",
-    )
-    .await
-}
-
-/// Spawn a silent memory persistence branch.
-///
-/// Uses the same branching infrastructure as regular branches but with a
-/// dedicated prompt focused on memory recall + save. The result is not injected
-/// into channel history — the channel handles these branch IDs specially.
-async fn spawn_memory_persistence_branch(
-    state: &ChannelState,
-    deps: &AgentDeps,
-) -> std::result::Result<BranchId, AgentError> {
-    let prompt_engine = deps.runtime_config.prompts.load();
-    let system_prompt = prompt_engine
-        .render_static("memory_persistence")
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
-    let prompt = prompt_engine
-        .render_system_memory_persistence()
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
-
-    spawn_branch(
-        state,
-        "memory persistence",
-        &prompt,
-        &system_prompt,
-        "persisting memories...",
-        "memory_persistence_branch",
-    )
-    .await
-}
-
-fn ensure_dispatch_readiness(state: &ChannelState, dispatch_type: &'static str) {
-    let readiness = state.deps.runtime_config.work_readiness();
-    if readiness.ready {
-        return;
-    }
-
-    let reason = readiness
-        .reason
-        .map(|value| value.as_str())
-        .unwrap_or("unknown");
-    tracing::warn!(
-        agent_id = %state.deps.agent_id,
-        channel_id = %state.channel_id,
-        dispatch_type,
-        reason,
-        warmup_state = ?readiness.warmup_state,
-        embedding_ready = readiness.embedding_ready,
-        bulletin_age_secs = ?readiness.bulletin_age_secs,
-        stale_after_secs = readiness.stale_after_secs,
-        "dispatch requested before readiness contract was satisfied"
-    );
-
-    #[cfg(feature = "metrics")]
-    crate::telemetry::Metrics::global()
-        .dispatch_while_cold_count
-        .with_label_values(&[&*state.deps.agent_id, dispatch_type, reason])
-        .inc();
-
-    let warmup_config = **state.deps.runtime_config.warmup.load();
-    let should_trigger = readiness.warmup_state != crate::config::WarmupState::Warming
-        && (readiness.reason != Some(crate::config::WorkReadinessReason::EmbeddingNotReady)
-            || warmup_config.eager_embedding_load);
-
-    if should_trigger {
-        crate::agent::cortex::trigger_forced_warmup(state.deps.clone(), dispatch_type);
-    }
-}
-
-/// Shared branch spawning logic.
-///
-/// Checks the branch limit, clones history, creates a Branch, spawns it as
-/// a tokio task, and registers it in the channel's active branches and status block.
-async fn spawn_branch(
-    state: &ChannelState,
-    description: &str,
-    prompt: &str,
-    system_prompt: &str,
-    status_label: &str,
-    dispatch_type: &'static str,
-) -> std::result::Result<BranchId, AgentError> {
-    let max_branches = **state.deps.runtime_config.max_concurrent_branches.load();
-    {
-        let branches = state.active_branches.read().await;
-        if branches.len() >= max_branches {
-            return Err(AgentError::BranchLimitReached {
-                channel_id: state.channel_id.to_string(),
-                max: max_branches,
-            });
-        }
-    }
-    ensure_dispatch_readiness(state, dispatch_type);
-
-    let history = {
-        let h = state.history.read().await;
-        h.clone()
-    };
-
-    let tool_server = crate::tools::create_branch_tool_server(
-        Some(state.clone()),
-        state.deps.agent_id.clone(),
-        state.deps.task_store.clone(),
-        state.deps.memory_search.clone(),
-        state.deps.runtime_config.clone(),
-        state.conversation_logger.clone(),
-        state.channel_store.clone(),
-        crate::conversation::ProcessRunLogger::new(state.deps.sqlite_pool.clone()),
-    );
-    let branch_max_turns = **state.deps.runtime_config.branch_max_turns.load();
-
-    let branch = Branch::new(
-        state.channel_id.clone(),
-        description,
-        state.deps.clone(),
-        system_prompt,
-        history,
-        tool_server,
-        branch_max_turns,
-    );
-
-    let branch_id = branch.id;
-    let prompt = prompt.to_owned();
-
-    let branch_span = tracing::info_span!(
-        "branch.run",
-        branch_id = %branch_id,
-        channel_id = %state.channel_id,
-        description = %description,
-    );
-    let handle = tokio::spawn(
-        async move {
-            if let Err(error) = branch.run(&prompt).await {
-                tracing::error!(branch_id = %branch_id, %error, "branch failed");
-            }
-        }
-        .instrument(branch_span),
-    );
-
-    {
-        let mut branches = state.active_branches.write().await;
-        branches.insert(branch_id, handle);
-    }
-
-    {
-        let mut status = state.status_block.write().await;
-        status.add_branch(branch_id, status_label);
-    }
-
-    #[cfg(feature = "metrics")]
-    crate::telemetry::Metrics::global()
-        .active_branches
-        .with_label_values(&[&*state.deps.agent_id])
-        .inc();
-
-    state
-        .deps
-        .event_tx
-        .send(crate::ProcessEvent::BranchStarted {
-            agent_id: state.deps.agent_id.clone(),
-            branch_id,
-            channel_id: state.channel_id.clone(),
-            description: status_label.to_string(),
-            reply_to_message_id: *state.reply_target_message_id.read().await,
-        })
-        .ok();
-
-    tracing::info!(branch_id = %branch_id, description = %status_label, "branch spawned");
-
-    Ok(branch_id)
-}
-
-/// Check whether the channel has capacity for another worker.
-async fn check_worker_limit(state: &ChannelState) -> std::result::Result<(), AgentError> {
-    let max_workers = **state.deps.runtime_config.max_concurrent_workers.load();
-    let workers = state.active_workers.read().await;
-    if workers.len() >= max_workers {
-        return Err(AgentError::WorkerLimitReached {
-            channel_id: state.channel_id.to_string(),
-            max: max_workers,
-        });
-    }
-    Ok(())
-}
-
-/// Spawn a worker from a ChannelState. Used by the SpawnWorkerTool.
-pub async fn spawn_worker_from_state(
-    state: &ChannelState,
-    task: impl Into<String>,
-    interactive: bool,
-    suggested_skills: &[&str],
-) -> std::result::Result<WorkerId, AgentError> {
-    check_worker_limit(state).await?;
-    ensure_dispatch_readiness(state, "worker");
-    let task = task.into();
-
-    let rc = &state.deps.runtime_config;
-    let prompt_engine = rc.prompts.load();
-    let temporal_context = TemporalContext::from_runtime(rc.as_ref());
-    let worker_task =
-        build_worker_task_with_temporal_context(&task, &temporal_context, &prompt_engine)
-            .map_err(|error| AgentError::Other(anyhow::anyhow!("{error}")))?;
-    let worker_system_prompt = prompt_engine
-        .render_worker_prompt(
-            &rc.instance_dir.display().to_string(),
-            &rc.workspace_dir.display().to_string(),
-        )
-        .map_err(|e| AgentError::Other(anyhow::anyhow!("{e}")))?;
-    let skills = rc.skills.load();
-    let browser_config = (**rc.browser_config.load()).clone();
-    let brave_search_key = (**rc.brave_search_key.load()).clone();
-
-    // Append skills listing to worker system prompt. Suggested skills are
-    // flagged so the worker knows the channel's intent, but it can read any
-    // skill it decides is relevant via the read_skill tool.
-    let system_prompt = match skills.render_worker_skills(suggested_skills, &prompt_engine) {
-        Ok(skills_prompt) if !skills_prompt.is_empty() => {
-            format!("{worker_system_prompt}\n\n{skills_prompt}")
-        }
-        Ok(_) => worker_system_prompt,
-        Err(error) => {
-            tracing::warn!(%error, "failed to render worker skills listing, spawning without skills context");
-            worker_system_prompt
-        }
-    };
-
-    let worker = if interactive {
-        let (worker, input_tx) = Worker::new_interactive(
-            Some(state.channel_id.clone()),
-            &worker_task,
-            &system_prompt,
-            state.deps.clone(),
-            browser_config.clone(),
-            state.screenshot_dir.clone(),
-            brave_search_key.clone(),
-            state.logs_dir.clone(),
-        );
-        let worker_id = worker.id;
-        state
-            .worker_inputs
-            .write()
-            .await
-            .insert(worker_id, input_tx);
-        worker
-    } else {
-        Worker::new(
-            Some(state.channel_id.clone()),
-            &worker_task,
-            &system_prompt,
-            state.deps.clone(),
-            browser_config,
-            state.screenshot_dir.clone(),
-            brave_search_key,
-            state.logs_dir.clone(),
-        )
-    };
-
-    let worker_id = worker.id;
-
-    let worker_span = tracing::info_span!(
-        "worker.run",
-        worker_id = %worker_id,
-        channel_id = %state.channel_id,
-        task = %task,
-    );
-    let handle = spawn_worker_task(
-        worker_id,
-        state.deps.event_tx.clone(),
-        state.deps.agent_id.clone(),
-        Some(state.channel_id.clone()),
-        worker.run().instrument(worker_span),
-    );
-
-    state.worker_handles.write().await.insert(worker_id, handle);
-
-    {
-        let mut status = state.status_block.write().await;
-        status.add_worker(worker_id, &task, false);
-    }
-
-    state
-        .deps
-        .event_tx
-        .send(crate::ProcessEvent::WorkerStarted {
-            agent_id: state.deps.agent_id.clone(),
-            worker_id,
-            channel_id: Some(state.channel_id.clone()),
-            task: task.clone(),
-            worker_type: "builtin".into(),
-        })
-        .ok();
-
-    tracing::info!(worker_id = %worker_id, task = %task, "worker spawned");
-
-    Ok(worker_id)
-}
-
-/// Spawn an OpenCode-backed worker for coding tasks.
-///
-/// Instead of a Rig agent loop, this spawns an OpenCode subprocess that has its
-/// own codebase exploration, context management, and tool suite. The worker
-/// communicates with OpenCode via HTTP + SSE.
-pub async fn spawn_opencode_worker_from_state(
-    state: &ChannelState,
-    task: impl Into<String>,
-    directory: &str,
-    interactive: bool,
-) -> std::result::Result<crate::WorkerId, AgentError> {
-    check_worker_limit(state).await?;
-    ensure_dispatch_readiness(state, "opencode_worker");
-    let task = task.into();
-    let directory = std::path::PathBuf::from(directory);
-
-    let rc = &state.deps.runtime_config;
-    let prompt_engine = rc.prompts.load();
-    let temporal_context = TemporalContext::from_runtime(rc.as_ref());
-    let worker_task =
-        build_worker_task_with_temporal_context(&task, &temporal_context, &prompt_engine)
-            .map_err(|error| AgentError::Other(anyhow::anyhow!("{error}")))?;
-    let opencode_config = rc.opencode.load();
-
-    if !opencode_config.enabled {
-        return Err(AgentError::Other(anyhow::anyhow!(
-            "OpenCode workers are not enabled in config"
-        )));
-    }
-
-    let server_pool = rc.opencode_server_pool.clone();
-
-    let worker = if interactive {
-        let (worker, input_tx) = crate::opencode::OpenCodeWorker::new_interactive(
-            Some(state.channel_id.clone()),
-            state.deps.agent_id.clone(),
-            &worker_task,
-            directory,
-            server_pool,
-            state.deps.event_tx.clone(),
-        );
-        let worker_id = worker.id;
-        state
-            .worker_inputs
-            .write()
-            .await
-            .insert(worker_id, input_tx);
-        worker
-    } else {
-        crate::opencode::OpenCodeWorker::new(
-            Some(state.channel_id.clone()),
-            state.deps.agent_id.clone(),
-            &worker_task,
-            directory,
-            server_pool,
-            state.deps.event_tx.clone(),
-        )
-    };
-
-    let worker_id = worker.id;
-
-    let worker_span = tracing::info_span!(
-        "worker.run",
-        worker_id = %worker_id,
-        channel_id = %state.channel_id,
-        task = %task,
-        worker_type = "opencode",
-    );
-    let handle = spawn_worker_task(
-        worker_id,
-        state.deps.event_tx.clone(),
-        state.deps.agent_id.clone(),
-        Some(state.channel_id.clone()),
-        async move {
-            let result = worker.run().await?;
-            Ok::<String, anyhow::Error>(result.result_text)
-        }
-        .instrument(worker_span),
-    );
-
-    state.worker_handles.write().await.insert(worker_id, handle);
-
-    let opencode_task = format!("[opencode] {task}");
-    {
-        let mut status = state.status_block.write().await;
-        status.add_worker(worker_id, &opencode_task, false);
-    }
-
-    state
-        .deps
-        .event_tx
-        .send(crate::ProcessEvent::WorkerStarted {
-            agent_id: state.deps.agent_id.clone(),
-            worker_id,
-            channel_id: Some(state.channel_id.clone()),
-            task: opencode_task,
-            worker_type: "opencode".into(),
-        })
-        .ok();
-
-    tracing::info!(worker_id = %worker_id, task = %task, "OpenCode worker spawned");
-
-    Ok(worker_id)
-}
-
-/// Spawn a future as a tokio task that sends a `WorkerComplete` event on completion.
-///
-/// Handles both success and error cases, logging failures and sending the
-/// appropriate event. Used by both builtin workers and OpenCode workers.
-/// Returns the JoinHandle so the caller can store it for cancellation.
-fn spawn_worker_task<F, E>(
-    worker_id: WorkerId,
-    event_tx: broadcast::Sender<ProcessEvent>,
-    agent_id: crate::AgentId,
-    channel_id: Option<ChannelId>,
-    future: F,
-) -> tokio::task::JoinHandle<()>
-where
-    F: std::future::Future<Output = std::result::Result<String, E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-{
-    tokio::spawn(async move {
-        #[cfg(feature = "metrics")]
-        let worker_start = std::time::Instant::now();
-
-        #[cfg(feature = "metrics")]
-        crate::telemetry::Metrics::global()
-            .active_workers
-            .with_label_values(&[&*agent_id])
-            .inc();
-
-        let (result_text, notify, success) = match future.await {
-            Ok(text) => (text, true, true),
-            Err(error) => {
-                tracing::error!(worker_id = %worker_id, %error, "worker failed");
-                (format!("Worker failed: {error}"), true, false)
-            }
-        };
-        #[cfg(feature = "metrics")]
-        {
-            let metrics = crate::telemetry::Metrics::global();
-            metrics
-                .active_workers
-                .with_label_values(&[&*agent_id])
-                .dec();
-            metrics
-                .worker_duration_seconds
-                .with_label_values(&[&*agent_id, "builtin"])
-                .observe(worker_start.elapsed().as_secs_f64());
-        }
-
-        let _ = event_tx.send(ProcessEvent::WorkerComplete {
-            agent_id,
-            worker_id,
-            channel_id,
-            result: result_text,
-            notify,
-            success,
-        });
-    })
-}
-
-/// Some models emit tool call syntax as plain text instead of making actual tool calls.
-/// When the text starts with a tool-like prefix (e.g. `[reply]`, `(reply)`), try to
-/// extract the reply content so we can send it cleanly instead of showing raw JSON.
-/// Returns `None` if the text doesn't match or can't be parsed — the caller falls
-/// back to sending the original text as-is.
-fn extract_reply_from_tool_syntax(text: &str) -> Option<String> {
-    // Match patterns like "[reply]\n{...}" or "(reply)\n{...}" (with optional whitespace)
-    let tool_prefixes = [
-        "[reply]",
-        "(reply)",
-        "[react]",
-        "(react)",
-        "[skip]",
-        "(skip)",
-        "[branch]",
-        "(branch)",
-        "[spawn_worker]",
-        "(spawn_worker)",
-        "[route]",
-        "(route)",
-        "[cancel]",
-        "(cancel)",
-    ];
-
-    let lower = text.to_lowercase();
-    let matched_prefix = tool_prefixes.iter().find(|p| lower.starts_with(*p))?;
-    let is_reply = matched_prefix.contains("reply");
-    let is_skip = matched_prefix.contains("skip");
-
-    // For skip, just return empty — the user shouldn't see anything
-    if is_skip {
-        return Some(String::new());
-    }
-
-    // For non-reply tools (react, branch, etc.), suppress entirely
-    if !is_reply {
-        return Some(String::new());
-    }
-
-    // Try to extract "content" from the JSON payload after the prefix
-    let rest = text[matched_prefix.len()..].trim();
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(rest)
-        && let Some(content) = parsed.get("content").and_then(|v| v.as_str())
-    {
-        return Some(content.to_string());
-    }
-
-    // If we can't parse JSON, the rest might just be the message itself (no JSON wrapper)
-    if !rest.is_empty() && !rest.starts_with('{') {
-        return Some(rest.to_string());
-    }
-
-    None
-}
-
-/// Format a user message with sender attribution from message metadata.
-///
-/// In multi-user channels, this lets the LLM distinguish who said what.
-/// System-generated messages (re-triggers) are passed through as-is.
-fn message_display_name(message: &InboundMessage) -> &str {
-    message
-        .formatted_author
-        .as_deref()
-        .or_else(|| {
-            message
-                .metadata
-                .get("sender_display_name")
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or(&message.sender_id)
-}
-
-fn format_user_message(raw_text: &str, message: &InboundMessage, timestamp_text: &str) -> String {
-    if message.source == "system" {
-        // System messages should never be empty, but guard against it
-        return if raw_text.trim().is_empty() {
-            "[system event]".to_string()
-        } else {
-            raw_text.to_string()
-        };
-    }
-
-    let display_name = message_display_name(message);
-
-    let bot_tag = if message
-        .metadata
-        .get("sender_is_bot")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        " (bot)"
-    } else {
-        ""
-    };
-
-    let reply_context = message
-        .metadata
-        .get("reply_to_author")
-        .and_then(|v| v.as_str())
-        .map(|author| {
-            let content_preview = message
-                .metadata
-                .get("reply_to_text")
-                .or_else(|| message.metadata.get("reply_to_content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if content_preview.is_empty() {
-                format!(" (replying to {author})")
-            } else {
-                format!(" (replying to {author}: \"{content_preview}\")")
-            }
-        })
-        .unwrap_or_default();
-
-    // If raw_text is empty or just whitespace, use a placeholder to avoid
-    // sending empty text content blocks to the LLM API.
-    let text_content = if raw_text.trim().is_empty() {
-        "[attachment or empty message]"
-    } else {
-        raw_text
-    };
-
-    format!("{display_name}{bot_tag}{reply_context} [{timestamp_text}]: {text_content}")
-}
-
-fn format_batched_user_message(
-    display_name: &str,
-    absolute_timestamp: &str,
-    relative_text: &str,
-    raw_text: &str,
-) -> String {
-    let text_content = if raw_text.trim().is_empty() {
-        "[attachment or empty message]"
-    } else {
-        raw_text
-    };
-    format!("[{display_name}] ({absolute_timestamp}; {relative_text}): {text_content}")
-}
-
-fn extract_discord_message_id(message: &InboundMessage) -> Option<u64> {
-    if message.source != "discord" {
-        return None;
-    }
-
-    message
-        .metadata
-        .get("discord_message_id")
-        .and_then(|value| value.as_u64())
-}
-
-/// Check if a ProcessEvent is targeted at a specific channel.
-///
-/// Events from branches and workers carry a channel_id. We only process events
-/// that originated from this channel — otherwise broadcast events from one
-/// channel's workers would leak into sibling channels (e.g. threads).
-fn event_is_for_channel(event: &ProcessEvent, channel_id: &ChannelId) -> bool {
-    match event {
-        ProcessEvent::BranchResult {
-            channel_id: event_channel,
-            ..
-        } => event_channel == channel_id,
-        ProcessEvent::WorkerComplete {
-            channel_id: event_channel,
-            ..
-        } => event_channel.as_ref() == Some(channel_id),
-        ProcessEvent::WorkerStatus {
-            channel_id: event_channel,
-            ..
-        } => event_channel.as_ref() == Some(channel_id),
-        // Status block updates, tool events, etc. — match on agent_id which
-        // is already filtered by the event bus subscription. Let them through.
-        _ => true,
-    }
-}
-
-/// Image MIME types we support for vision.
-const IMAGE_MIME_PREFIXES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
-
-/// Text-based MIME types where we inline the content.
-const TEXT_MIME_PREFIXES: &[&str] = &[
-    "text/",
-    "application/json",
-    "application/xml",
-    "application/javascript",
-    "application/typescript",
-    "application/toml",
-    "application/yaml",
-];
-
-/// Download attachments and convert them to LLM-ready UserContent parts.
-///
-/// Images become `UserContent::Image` (base64). Text files get inlined.
-/// Other file types get a metadata-only description.
-async fn download_attachments(
-    deps: &AgentDeps,
-    attachments: &[crate::Attachment],
-) -> Vec<UserContent> {
-    let http = deps.llm_manager.http_client();
-    let mut parts = Vec::new();
-
-    for attachment in attachments {
-        let is_image = IMAGE_MIME_PREFIXES
-            .iter()
-            .any(|p| attachment.mime_type.starts_with(p));
-        let is_text = TEXT_MIME_PREFIXES
-            .iter()
-            .any(|p| attachment.mime_type.starts_with(p));
-
-        let content = if is_image {
-            download_image_attachment(http, attachment).await
-        } else if is_text {
-            download_text_attachment(http, attachment).await
-        } else if attachment.mime_type.starts_with("audio/") {
-            transcribe_audio_attachment(deps, http, attachment).await
-        } else {
-            let size_str = attachment
-                .size_bytes
-                .map(|s| format!("{:.1} KB", s as f64 / 1024.0))
-                .unwrap_or_else(|| "unknown size".into());
-            UserContent::text(format!(
-                "[Attachment: {} ({}, {})]",
-                attachment.filename, attachment.mime_type, size_str
-            ))
-        };
-
-        parts.push(content);
-    }
-
-    parts
-}
-
-/// Download raw bytes from an attachment URL, including auth if present.
-///
-/// When `auth_header` is set (Slack), uses a no-redirect client and manually
-/// follows redirects so the `Authorization` header isn't silently stripped on
-/// cross-origin redirects. For public URLs (Discord/Telegram), uses a plain GET.
-async fn download_attachment_bytes(
-    http: &reqwest::Client,
-    attachment: &crate::Attachment,
-) -> std::result::Result<Vec<u8>, String> {
-    if attachment.auth_header.is_some() {
-        download_attachment_bytes_with_auth(attachment).await
-    } else {
-        let response = http
-            .get(&attachment.url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("HTTP {}", response.status()));
-        }
-        response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// Slack-specific download: manually follows redirects, only forwarding the
-/// Authorization header when the redirect target shares the same host as the
-/// original URL. This prevents credential leakage on cross-origin redirects.
-async fn download_attachment_bytes_with_auth(
-    attachment: &crate::Attachment,
-) -> std::result::Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
-
-    let auth = attachment.auth_header.as_deref().unwrap_or_default();
-    let original_url =
-        reqwest::Url::parse(&attachment.url).map_err(|e| format!("invalid attachment URL: {e}"))?;
-    let original_host = original_url.host_str().unwrap_or_default().to_owned();
-    let mut current_url = original_url;
-
-    for hop in 0..5 {
-        let same_host = current_url.host_str().unwrap_or_default() == original_host;
-
-        let mut request = client.get(current_url.clone());
-        if same_host {
-            request = request.header(reqwest::header::AUTHORIZATION, auth);
-        }
-
-        tracing::debug!(hop, url = %current_url, same_host, "following attachment redirect");
-
-        let response = request.send().await.map_err(|e| e.to_string())?;
-        let status = response.status();
-
-        if status.is_redirection() {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .ok_or_else(|| format!("redirect without Location header ({status})"))?;
-            let location_str = location
-                .to_str()
-                .map_err(|e| format!("invalid Location header: {e}"))?;
-            current_url = current_url
-                .join(location_str)
-                .map_err(|e| format!("invalid redirect URL: {e}"))?;
-            continue;
-        }
-
-        if !status.is_success() {
-            return Err(format!("HTTP {}", status));
-        }
-
-        return response
-            .bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| e.to_string());
-    }
-
-    Err("too many redirects".into())
-}
-
-/// Download an image attachment and encode it as base64 for the LLM.
-async fn download_image_attachment(
-    http: &reqwest::Client,
-    attachment: &crate::Attachment,
-) -> UserContent {
-    let bytes = match download_attachment_bytes(http, attachment).await {
-        Ok(b) => b,
-        Err(error) => {
-            tracing::warn!(%error, filename = %attachment.filename, "failed to download image");
-            return UserContent::text(format!(
-                "[Failed to download image: {}]",
-                attachment.filename
-            ));
-        }
-    };
-
-    use base64::Engine as _;
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let media_type = ImageMediaType::from_mime_type(&attachment.mime_type);
-
-    tracing::info!(
-        filename = %attachment.filename,
-        mime = %attachment.mime_type,
-        size = bytes.len(),
-        "downloaded image attachment"
-    );
-
-    UserContent::image_base64(base64_data, media_type, None)
-}
-
-/// Download an audio attachment and transcribe it with the configured voice model.
-async fn transcribe_audio_attachment(
-    deps: &AgentDeps,
-    http: &reqwest::Client,
-    attachment: &crate::Attachment,
-) -> UserContent {
-    let bytes = match download_attachment_bytes(http, attachment).await {
-        Ok(b) => b,
-        Err(error) => {
-            tracing::warn!(%error, filename = %attachment.filename, "failed to download audio");
-            return UserContent::text(format!(
-                "[Failed to download audio: {}]",
-                attachment.filename
-            ));
-        }
-    };
-
-    tracing::info!(
-        filename = %attachment.filename,
-        mime = %attachment.mime_type,
-        size = bytes.len(),
-        "downloaded audio attachment"
-    );
-
-    let routing = deps.runtime_config.routing.load();
-    let voice_model = routing.voice.trim();
-    if voice_model.is_empty() {
-        return UserContent::text(format!(
-            "[Audio attachment received but no voice model is configured in routing.voice: {}]",
-            attachment.filename
-        ));
-    }
-
-    let (provider_id, model_name) = match deps.llm_manager.resolve_model(voice_model) {
-        Ok(parts) => parts,
-        Err(error) => {
-            tracing::warn!(%error, model = %voice_model, "invalid voice model route");
-            return UserContent::text(format!(
-                "[Audio transcription failed for {}: invalid voice model '{}']",
-                attachment.filename, voice_model
-            ));
-        }
-    };
-
-    let provider = match deps.llm_manager.get_provider(&provider_id) {
-        Ok(provider) => provider,
-        Err(error) => {
-            tracing::warn!(%error, provider = %provider_id, "voice provider not configured");
-            return UserContent::text(format!(
-                "[Audio transcription failed for {}: provider '{}' is not configured]",
-                attachment.filename, provider_id
-            ));
-        }
-    };
-
-    if provider.api_type == ApiType::Anthropic {
-        return UserContent::text(format!(
-            "[Audio transcription failed for {}: provider '{}' does not support input_audio on this endpoint]",
-            attachment.filename, provider_id
-        ));
-    }
-
-    let format = audio_format_for_attachment(attachment);
-    use base64::Engine as _;
-    let base64_audio = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-    let endpoint = format!(
-        "{}/v1/chat/completions",
-        provider.base_url.trim_end_matches('/')
-    );
-    let body = serde_json::json!({
-        "model": model_name,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Transcribe this audio verbatim. Return only the transcription text."
-                },
-                {
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": base64_audio,
-                        "format": format,
-                    }
-                }
-            ]
-        }],
-        "temperature": 0
-    });
-
-    let response = match deps
-        .llm_manager
-        .http_client()
-        .post(&endpoint)
-        .header("authorization", format!("Bearer {}", provider.api_key))
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::warn!(%error, model = %voice_model, "voice transcription request failed");
-            return UserContent::text(format!(
-                "[Audio transcription failed for {}]",
-                attachment.filename
-            ));
-        }
-    };
-
-    let status = response.status();
-    let response_body = match response.json::<serde_json::Value>().await {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::warn!(%error, model = %voice_model, "invalid transcription response");
-            return UserContent::text(format!(
-                "[Audio transcription failed for {}]",
-                attachment.filename
-            ));
-        }
-    };
-
-    if !status.is_success() {
-        let message = response_body["error"]["message"]
-            .as_str()
-            .unwrap_or("unknown error");
-        tracing::warn!(
-            status = %status,
-            model = %voice_model,
-            error = %message,
-            "voice transcription provider returned error"
-        );
-        return UserContent::text(format!(
-            "[Audio transcription failed for {}: {}]",
-            attachment.filename, message
-        ));
-    }
-
-    let transcript = extract_transcript_text(&response_body);
-    if transcript.is_empty() {
-        tracing::warn!(model = %voice_model, "empty transcription returned");
-        return UserContent::text(format!(
-            "[Audio transcription returned empty text for {}]",
-            attachment.filename
-        ));
-    }
-
-    UserContent::text(format!(
-        "<voice_transcript name=\"{}\" mime=\"{}\">\n{}\n</voice_transcript>",
-        attachment.filename, attachment.mime_type, transcript
-    ))
-}
-
-fn audio_format_for_attachment(attachment: &crate::Attachment) -> &'static str {
-    let mime = attachment.mime_type.to_lowercase();
-    if mime.contains("mpeg") || mime.contains("mp3") {
-        return "mp3";
-    }
-    if mime.contains("wav") {
-        return "wav";
-    }
-    if mime.contains("flac") {
-        return "flac";
-    }
-    if mime.contains("aac") {
-        return "aac";
-    }
-    if mime.contains("ogg") {
-        return "ogg";
-    }
-    if mime.contains("mp4") || mime.contains("m4a") {
-        return "m4a";
-    }
-
-    match attachment
-        .filename
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
-        "mp3" => "mp3",
-        "wav" => "wav",
-        "flac" => "flac",
-        "aac" => "aac",
-        "m4a" | "mp4" => "m4a",
-        "oga" | "ogg" => "ogg",
-        _ => "ogg",
-    }
-}
-
-fn extract_transcript_text(body: &serde_json::Value) -> String {
-    if let Some(text) = body["choices"][0]["message"]["content"].as_str() {
-        return text.trim().to_string();
-    }
-
-    let Some(parts) = body["choices"][0]["message"]["content"].as_array() else {
-        return String::new();
-    };
-
-    parts
-        .iter()
-        .filter_map(|part| {
-            if part["type"].as_str() == Some("text") {
-                part["text"].as_str().map(str::trim)
-            } else {
-                None
-            }
-        })
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Download a text attachment and inline its content for the LLM.
-async fn download_text_attachment(
-    http: &reqwest::Client,
-    attachment: &crate::Attachment,
-) -> UserContent {
-    let bytes = match download_attachment_bytes(http, attachment).await {
-        Ok(b) => b,
-        Err(error) => {
-            tracing::warn!(%error, filename = %attachment.filename, "failed to download text file");
-            return UserContent::text(format!(
-                "[Failed to download file: {}]",
-                attachment.filename
-            ));
-        }
-    };
-
-    let content = String::from_utf8_lossy(&bytes).into_owned();
-
-    // Truncate very large files to avoid blowing up context
-    let truncated = if content.len() > 50_000 {
-        format!(
-            "{}...\n[truncated — {} bytes total]",
-            &content[..50_000],
-            content.len()
-        )
-    } else {
-        content
-    };
-
-    tracing::info!(
-        filename = %attachment.filename,
-        mime = %attachment.mime_type,
-        "downloaded text attachment"
-    );
-
-    UserContent::text(format!(
-        "<file name=\"{}\" mime=\"{}\">\n{}\n</file>",
-        attachment.filename, attachment.mime_type, truncated
-    ))
-}
-
-/// Write history back after the agentic loop completes.
-///
-/// On success or `MaxTurnsError`, the history Rig built is consistent and safe
-/// to keep.
-///
-/// On `PromptCancelled` (e.g. reply tool fired), Rig's carried history has
-/// the user prompt + the assistant's tool-call message but no tool results.
-/// Writing it back wholesale would leave a dangling tool-call that poisons
-/// every subsequent turn. Instead, we preserve only the **first user text
-/// message** Rig appended (the real user prompt), while discarding assistant
-/// tool-call messages and tool-result user messages.
-///
-/// On hard errors, we truncate to the pre-turn snapshot since the history
-/// state is unpredictable.
-///
-/// `MaxTurnsError` is safe — Rig pushes all tool results into a `User` message
-/// before raising it, so history is consistent.
-fn apply_history_after_turn(
-    result: &std::result::Result<String, rig::completion::PromptError>,
-    guard: &mut Vec<rig::message::Message>,
-    history: Vec<rig::message::Message>,
-    history_len_before: usize,
-    channel_id: &str,
-    is_retrigger: bool,
-) {
-    match result {
-        Ok(_) | Err(rig::completion::PromptError::MaxTurnsError { .. }) => {
-            *guard = history;
-        }
-        Err(rig::completion::PromptError::PromptCancelled { .. }) => {
-            // Rig appended the user prompt and possibly an assistant tool-call
-            // message to history before cancellation. We keep only the first
-            // user text message (the actual user prompt) and discard everything else
-            // (assistant tool-calls without results, tool-result user messages).
-            //
-            // Exception: retrigger turns. The "user prompt" Rig pushed is actually
-            // the synthetic system retrigger message (internal template scaffolding),
-            // not a real user message. We inject a proper summary record separately
-            // in handle_message, so don't preserve anything from retrigger turns.
-            if is_retrigger {
-                tracing::debug!(
-                    channel_id = %channel_id,
-                    rolled_back = history.len().saturating_sub(history_len_before),
-                    "discarding retrigger turn history (summary injected separately)"
-                );
-                return;
-            }
-            let new_messages = &history[history_len_before..];
-            let mut preserved = 0usize;
-            if let Some(message) = new_messages.iter().find(|m| is_user_text_message(m)) {
-                guard.push(message.clone());
-                preserved = 1;
-            }
-            // Skip: Assistant messages (contain tool calls without results),
-            // user ToolResult messages, and internal correction prompts.
-            tracing::debug!(
-                channel_id = %channel_id,
-                total_new = new_messages.len(),
-                preserved,
-                discarded = new_messages.len() - preserved,
-                "selectively preserved first user message after PromptCancelled"
-            );
-        }
-        Err(_) => {
-            // Hard errors: history state is unpredictable, truncate to snapshot.
-            tracing::debug!(
-                channel_id = %channel_id,
-                rolled_back = history.len().saturating_sub(history_len_before),
-                "rolling back history after failed turn"
-            );
-            guard.truncate(history_len_before);
-        }
-    }
-}
-
-/// Returns true if a message is a User message containing only text content
-/// (i.e., an actual user prompt, not a tool result).
-fn is_user_text_message(message: &rig::message::Message) -> bool {
-    match message {
-        rig::message::Message::User { content } => content
-            .iter()
-            .all(|c| matches!(c, rig::message::UserContent::Text(_))),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::apply_history_after_turn;
-    use rig::completion::{CompletionError, PromptError};
-    use rig::message::Message;
-    use rig::tool::ToolSetError;
+    use super::{recv_channel_event, should_process_event_for_channel};
+    use crate::memory::MemoryType;
+    use crate::{AgentId, ChannelId, ProcessEvent, ProcessId};
+    use std::sync::Arc;
 
-    fn user_msg(text: &str) -> Message {
-        Message::User {
-            content: rig::OneOrMany::one(rig::message::UserContent::text(text)),
+    #[tokio::test]
+    async fn channel_event_loop_continues_after_lagged_broadcast() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<ProcessEvent>(2);
+        let agent_id: AgentId = Arc::from("agent");
+        let channel_id: ChannelId = Arc::from("channel");
+        let process_id = ProcessId::Channel(channel_id);
+
+        for status in ["one", "two", "three"] {
+            event_tx
+                .send(ProcessEvent::StatusUpdate {
+                    agent_id: agent_id.clone(),
+                    process_id: process_id.clone(),
+                    status: status.to_string(),
+                })
+                .ok();
         }
-    }
 
-    fn assistant_msg(text: &str) -> Message {
-        Message::Assistant {
-            id: None,
-            content: rig::OneOrMany::one(rig::message::AssistantContent::text(text)),
-        }
-    }
-
-    fn make_history(msgs: &[&str]) -> Vec<Message> {
-        msgs.iter()
-            .enumerate()
-            .map(|(i, text)| {
-                if i % 2 == 0 {
-                    user_msg(text)
-                } else {
-                    assistant_msg(text)
-                }
-            })
-            .collect()
-    }
-
-    /// On success, the full post-turn history is written back.
-    #[test]
-    fn ok_writes_history_back() {
-        let mut guard = make_history(&["hello"]);
-        let history = make_history(&["hello", "hi there", "how are you?"]);
-        let len_before = 1;
-
-        apply_history_after_turn(
-            &Ok("hi there".to_string()),
-            &mut guard,
-            history.clone(),
-            len_before,
-            "test",
-            false,
-        );
-
-        assert_eq!(guard, history);
-    }
-
-    /// MaxTurnsError carries consistent history (tool results included) — write it back.
-    #[test]
-    fn max_turns_writes_history_back() {
-        let mut guard = make_history(&["hello"]);
-        let history = make_history(&["hello", "hi there", "how are you?"]);
-        let len_before = 1;
-
-        let err = Err(PromptError::MaxTurnsError {
-            max_turns: 5,
-            chat_history: Box::new(history.clone()),
-            prompt: Box::new(user_msg("prompt")),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history.clone(), len_before, "test", false);
-
-        assert_eq!(guard, history);
-    }
-
-    /// PromptCancelled preserves user text messages but discards assistant
-    /// tool-call messages (which have no matching tool results).
-    #[test]
-    fn prompt_cancelled_preserves_user_prompt() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        // Simulate what Rig does: push user prompt + assistant tool-call
-        let mut history = initial.clone();
-        history.push(user_msg("new user prompt")); // should be preserved
-        history.push(assistant_msg("tool call without result")); // should be discarded
-        let len_before = initial.len();
-
-        let err = Err(PromptError::PromptCancelled {
-            chat_history: Box::new(history.clone()),
-            reason: "reply delivered".to_string(),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
-        // User prompt should be preserved, assistant tool-call discarded
-        let mut expected = initial;
-        expected.push(user_msg("new user prompt"));
-        assert_eq!(
-            guard, expected,
-            "user text messages should be preserved, assistant messages discarded"
-        );
-    }
-
-    /// PromptCancelled discards tool-result User messages (ToolResult content).
-    #[test]
-    fn prompt_cancelled_discards_tool_results() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        let mut history = initial.clone();
-        history.push(user_msg("new user prompt")); // preserved
-        // Simulate an assistant tool-call followed by a tool-result user message
-        history.push(Message::Assistant {
-            id: None,
-            content: rig::OneOrMany::one(rig::message::AssistantContent::tool_call(
-                "call_1",
-                "reply",
-                serde_json::json!({"content": "hello"}),
-            )),
-        });
-        // A tool-result message is a User message with ToolResult content —
-        // is_user_text_message returns false for these, so they get discarded.
-        history.push(Message::User {
-            content: rig::OneOrMany::one(rig::message::UserContent::ToolResult(
-                rig::message::ToolResult {
-                    id: "call_1".to_string(),
-                    call_id: None,
-                    content: rig::OneOrMany::one(rig::message::ToolResultContent::text("ok")),
-                },
-            )),
-        });
-        let len_before = initial.len();
-
-        let err = Err(PromptError::PromptCancelled {
-            chat_history: Box::new(history.clone()),
-            reason: "reply delivered".to_string(),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
-        let mut expected = initial;
-        expected.push(user_msg("new user prompt"));
-        assert_eq!(
-            guard, expected,
-            "tool-call and tool-result messages should be discarded"
-        );
-    }
-
-    /// PromptCancelled preserves only the first user prompt and drops any
-    /// internal correction prompts that may have been appended on retry.
-    #[test]
-    fn prompt_cancelled_preserves_only_first_user_prompt() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        let mut history = initial.clone();
-        history.push(user_msg("real user prompt")); // preserved
-        history.push(assistant_msg("bad tool syntax"));
-        history.push(user_msg("Please proceed and use the available tools.")); // dropped
-        history.push(assistant_msg("tool call without result"));
-        let len_before = initial.len();
-
-        let err = Err(PromptError::PromptCancelled {
-            chat_history: Box::new(history.clone()),
-            reason: "reply delivered".to_string(),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
-        let mut expected = initial;
-        expected.push(user_msg("real user prompt"));
-        assert_eq!(
-            guard, expected,
-            "only the first user prompt should be preserved"
-        );
-    }
-
-    /// PromptCancelled on retrigger turns discards everything — the synthetic
-    /// system message is internal scaffolding, not a real user message.
-    /// A summary record is injected separately in handle_message.
-    #[test]
-    fn prompt_cancelled_retrigger_discards_all() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        let mut history = initial.clone();
-        history.push(user_msg("[System: 1 background process completed...]"));
-        history.push(assistant_msg("relaying result..."));
-        let len_before = initial.len();
-
-        let err = Err(PromptError::PromptCancelled {
-            chat_history: Box::new(history.clone()),
-            reason: "reply delivered".to_string(),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", true);
-
-        assert_eq!(
-            guard, initial,
-            "retrigger turns should discard all new messages"
-        );
-    }
-
-    /// Hard completion errors also roll back to prevent dangling tool-calls.
-    #[test]
-    fn completion_error_rolls_back() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        let mut history = initial.clone();
-        history.push(user_msg("[dangling tool-call]"));
-        let len_before = initial.len();
-
-        let err = Err(PromptError::CompletionError(
-            CompletionError::ResponseError("API error".to_string()),
-        ));
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
-        assert_eq!(
-            guard, initial,
-            "history should be rolled back after hard error"
-        );
-    }
-
-    /// ToolError (tool not found) rolls back — same catch-all arm as hard errors.
-    #[test]
-    fn tool_error_rolls_back() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        let mut history = initial.clone();
-        history.push(user_msg("[dangling tool-call]"));
-        let len_before = initial.len();
-
-        let err = Err(PromptError::ToolError(ToolSetError::ToolNotFoundError(
-            "nonexistent_tool".to_string(),
-        )));
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
-        assert_eq!(
-            guard, initial,
-            "history should be rolled back after tool error"
-        );
-    }
-
-    /// Rollback on empty history is a no-op and must not panic.
-    #[test]
-    fn rollback_on_empty_history_is_noop() {
-        let mut guard: Vec<Message> = vec![];
-        let history: Vec<Message> = vec![];
-        let len_before = 0;
-
-        let err = Err(PromptError::PromptCancelled {
-            chat_history: Box::new(history.clone()),
-            reason: "reply delivered".to_string(),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
+        let first = recv_channel_event(&mut event_rx).await;
         assert!(
-            guard.is_empty(),
-            "empty history should stay empty after rollback"
-        );
-    }
-
-    /// Rollback when nothing was appended is also a no-op (len unchanged).
-    #[test]
-    fn rollback_when_nothing_appended_is_noop() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        // history has same length as before — Rig cancelled before appending anything
-        let history = initial.clone();
-        let len_before = initial.len();
-
-        let err = Err(PromptError::PromptCancelled {
-            chat_history: Box::new(history.clone()),
-            reason: "skip delivered".to_string(),
-        });
-
-        apply_history_after_turn(&err, &mut guard, history, len_before, "test", false);
-
-        assert_eq!(
-            guard, initial,
-            "history should be unchanged when nothing was appended"
-        );
-    }
-
-    /// After PromptCancelled, the next turn starts clean with user messages
-    /// preserved but no dangling assistant tool-calls.
-    #[test]
-    fn next_turn_is_clean_after_prompt_cancelled() {
-        let initial = make_history(&["hello", "thinking..."]);
-        let mut guard = initial.clone();
-        let mut poisoned_history = initial.clone();
-        // Rig appends: user prompt + assistant tool-call (dangling, no result)
-        poisoned_history.push(user_msg("what's up"));
-        poisoned_history.push(Message::Assistant {
-            id: None,
-            content: rig::OneOrMany::one(rig::message::AssistantContent::tool_call(
-                "call_1",
-                "reply",
-                serde_json::json!({"content": "hey!"}),
-            )),
-        });
-        let len_before = initial.len();
-
-        // First turn: cancelled (reply tool fired) — not a retrigger
-        apply_history_after_turn(
-            &Err(PromptError::PromptCancelled {
-                chat_history: Box::new(poisoned_history.clone()),
-                reason: "reply delivered".to_string(),
-            }),
-            &mut guard,
-            poisoned_history,
-            len_before,
-            "test",
-            false,
+            matches!(first, crate::BroadcastRecvResult::Lagged(skipped) if skipped > 0),
+            "expected lagged receive, got {first:?}"
         );
 
-        // User prompt preserved, assistant tool-call discarded
-        assert_eq!(
-            guard.len(),
-            initial.len() + 1,
-            "user prompt should be preserved"
-        );
+        let second = recv_channel_event(&mut event_rx).await;
         assert!(
-            matches!(&guard[guard.len() - 1], Message::User { .. }),
-            "last message should be the preserved user prompt"
-        );
-
-        // Second turn: new user message appended, successful response
-        guard.push(user_msg("follow-up question"));
-        let len_before2 = guard.len();
-        let mut history2 = guard.clone();
-        history2.push(assistant_msg("clean response"));
-
-        apply_history_after_turn(
-            &Ok("clean response".to_string()),
-            &mut guard,
-            history2.clone(),
-            len_before2,
-            "test",
-            false,
-        );
-
-        assert_eq!(
-            guard, history2,
-            "second turn should succeed with clean history"
-        );
-        // No dangling tool-call assistant messages in history
-        let has_dangling = guard.iter().any(|m| {
-            if let Message::Assistant { content, .. } = m {
-                content
-                    .iter()
-                    .any(|c| matches!(c, rig::message::AssistantContent::ToolCall(_)))
-            } else {
-                false
-            }
-        });
-        assert!(
-            !has_dangling,
-            "no dangling tool-call messages in history after rollback"
+            matches!(
+                second,
+                crate::BroadcastRecvResult::Event(ProcessEvent::StatusUpdate { .. })
+            ),
+            "expected next event after lagged receive, got {second:?}"
         );
     }
 
-    #[test]
-    fn format_user_message_handles_empty_text() {
-        use super::format_user_message;
-        use crate::{Arc, InboundMessage};
-        use chrono::Utc;
-        use std::collections::HashMap;
+    #[tokio::test]
+    async fn channel_event_loop_stops_when_event_bus_closes() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<ProcessEvent>(2);
+        drop(event_tx);
 
-        // Test empty text with user message
-        let message = InboundMessage {
-            id: "test".to_string(),
-            agent_id: Some(Arc::from("test_agent")),
-            sender_id: "user123".to_string(),
-            conversation_id: "conv".to_string(),
-            content: crate::MessageContent::Text("".to_string()),
-            source: "discord".to_string(),
-            adapter: Some("discord".to_string()),
-            metadata: HashMap::new(),
-            formatted_author: Some("TestUser".to_string()),
-            timestamp: Utc::now(),
+        let event = recv_channel_event(&mut event_rx).await;
+        assert!(matches!(event, crate::BroadcastRecvResult::Closed));
+    }
+
+    #[test]
+    fn channel_coalesce_ignores_unrelated_memory_saved_events() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::MemorySaved {
+            agent_id: Arc::from("agent"),
+            memory_id: "memory-1".to_string(),
+            channel_id: Some(Arc::from("channel-b")),
+            memory_type: MemoryType::Fact,
+            importance: 0.8,
+            content_summary: "saved memory".to_string(),
         };
 
-        let formatted = format_user_message("", &message, "2026-02-26 12:00:00 UTC");
-        assert!(
-            !formatted.trim().is_empty(),
-            "formatted message should not be empty"
-        );
-        assert!(
-            formatted.contains("[attachment or empty message]"),
-            "should use placeholder for empty text"
-        );
-
-        // Test whitespace-only text
-        let formatted_ws = format_user_message("   ", &message, "2026-02-26 12:00:00 UTC");
-        assert!(
-            formatted_ws.contains("[attachment or empty message]"),
-            "should use placeholder for whitespace-only text"
-        );
-
-        // Test empty system message
-        let system_message = InboundMessage {
-            id: "test".to_string(),
-            agent_id: Some(Arc::from("test_agent")),
-            sender_id: "system".to_string(),
-            conversation_id: "conv".to_string(),
-            content: crate::MessageContent::Text("".to_string()),
-            source: "system".to_string(),
-            adapter: None,
-            metadata: HashMap::new(),
-            formatted_author: None,
-            timestamp: Utc::now(),
-        };
-
-        let formatted_sys = format_user_message("", &system_message, "2026-02-26 12:00:00 UTC");
-        assert_eq!(
-            formatted_sys, "[system event]",
-            "system messages should use [system event] placeholder"
-        );
-
-        // Test normal message with text
-        let formatted_normal = format_user_message("hello", &message, "2026-02-26 12:00:00 UTC");
-        assert!(
-            formatted_normal.contains("hello"),
-            "normal messages should preserve text"
-        );
-        assert!(
-            formatted_normal.contains("[2026-02-26 12:00:00 UTC]"),
-            "normal messages should include absolute timestamp context"
-        );
-        assert!(
-            !formatted_normal.contains("[attachment or empty message]"),
-            "normal messages should not use placeholder"
-        );
+        assert!(!should_process_event_for_channel(&event, &channel_id));
     }
 
     #[test]
-    fn message_display_name_uses_consistent_fallback_order() {
-        use super::message_display_name;
-        use crate::{Arc, InboundMessage};
-        use chrono::Utc;
-        use std::collections::HashMap;
-
-        let mut metadata_only = HashMap::new();
-        metadata_only.insert(
-            "sender_display_name".to_string(),
-            serde_json::Value::String("Metadata User".to_string()),
-        );
-        let metadata_message = InboundMessage {
-            id: "metadata".to_string(),
-            agent_id: Some(Arc::from("test_agent")),
-            sender_id: "sender123".to_string(),
-            conversation_id: "conv".to_string(),
-            content: crate::MessageContent::Text("hello".to_string()),
-            source: "discord".to_string(),
-            adapter: Some("discord".to_string()),
-            metadata: metadata_only,
-            formatted_author: None,
-            timestamp: Utc::now(),
+    fn channel_coalesce_ignores_unrelated_compaction_events() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::CompactionTriggered {
+            agent_id: Arc::from("agent"),
+            channel_id: Arc::from("channel-b"),
+            threshold_reached: 0.85,
         };
-        assert_eq!(message_display_name(&metadata_message), "Metadata User");
 
-        let mut both_metadata = HashMap::new();
-        both_metadata.insert(
-            "sender_display_name".to_string(),
-            serde_json::Value::String("Metadata User".to_string()),
-        );
-        let formatted_author_message = InboundMessage {
-            id: "formatted".to_string(),
-            agent_id: Some(Arc::from("test_agent")),
-            sender_id: "sender123".to_string(),
-            conversation_id: "conv".to_string(),
-            content: crate::MessageContent::Text("hello".to_string()),
-            source: "discord".to_string(),
-            adapter: Some("discord".to_string()),
-            metadata: both_metadata,
-            formatted_author: Some("Formatted Author".to_string()),
-            timestamp: Utc::now(),
-        };
-        assert_eq!(
-            message_display_name(&formatted_author_message),
-            "Formatted Author"
-        );
-
-        let sender_fallback_message = InboundMessage {
-            id: "fallback".to_string(),
-            agent_id: Some(Arc::from("test_agent")),
-            sender_id: "sender123".to_string(),
-            conversation_id: "conv".to_string(),
-            content: crate::MessageContent::Text("hello".to_string()),
-            source: "discord".to_string(),
-            adapter: Some("discord".to_string()),
-            metadata: HashMap::new(),
-            formatted_author: None,
-            timestamp: Utc::now(),
-        };
-        assert_eq!(message_display_name(&sender_fallback_message), "sender123");
+        assert!(!should_process_event_for_channel(&event, &channel_id));
     }
 
     #[test]
-    fn worker_task_temporal_context_preamble_includes_absolute_dates() {
-        let prompt_engine =
-            crate::prompts::PromptEngine::new("en").expect("prompt engine should initialize");
-        let temporal_context = super::TemporalContext {
-            now_utc: chrono::DateTime::parse_from_rfc3339("2026-02-26T20:30:00Z")
-                .expect("valid RFC3339 timestamp")
-                .with_timezone(&chrono::Utc),
-            timezone: super::TemporalTimezone::Named {
-                timezone_name: "America/New_York".to_string(),
-                timezone: "America/New_York"
-                    .parse()
-                    .expect("valid timezone identifier"),
-            },
+    fn channel_coalesce_processes_related_worker_events() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::WorkerStatus {
+            agent_id: Arc::from("agent"),
+            worker_id: uuid::Uuid::new_v4(),
+            channel_id: Some(channel_id.clone()),
+            status: "running".to_string(),
         };
 
-        let worker_task = super::build_worker_task_with_temporal_context(
-            "Run the migration checks",
-            &temporal_context,
-            &prompt_engine,
-        )
-        .expect("worker task preamble should render");
-        assert!(
-            worker_task.contains("Current local date/time:"),
-            "worker task should include local time context"
-        );
-        assert!(
-            worker_task.contains("Current UTC date/time:"),
-            "worker task should include UTC time context"
-        );
-        assert!(
-            worker_task.contains("Run the migration checks"),
-            "worker task should preserve the original task body"
-        );
+        assert!(should_process_event_for_channel(&event, &channel_id));
     }
 
     #[test]
-    fn temporal_context_uses_cron_timezone_when_user_timezone_is_invalid() {
-        let resolved = super::TemporalContext::resolve_timezone_from_names(
-            Some("Not/A-Real-Tz".to_string()),
-            Some("America/Los_Angeles".to_string()),
-        );
-        match resolved {
-            super::TemporalTimezone::Named { timezone_name, .. } => {
-                assert_eq!(timezone_name, "America/Los_Angeles");
-            }
-            super::TemporalTimezone::SystemLocal => {
-                panic!("expected cron timezone fallback, got system local")
-            }
-        }
+    fn channel_coalesce_processes_related_branch_events() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::BranchResult {
+            agent_id: Arc::from("agent"),
+            branch_id: uuid::Uuid::new_v4(),
+            channel_id: channel_id.clone(),
+            conclusion: "done".to_string(),
+        };
+
+        assert!(should_process_event_for_channel(&event, &channel_id));
     }
 
     #[test]
-    fn format_batched_message_includes_absolute_and_relative_time() {
-        let formatted = super::format_batched_user_message(
-            "alice",
-            "2026-02-26 15:04:05 PST (America/Los_Angeles, UTC-08:00)",
-            "12s ago",
-            "ship it",
-        );
-        assert!(
-            formatted.contains("2026-02-26 15:04:05 PST"),
-            "batched formatting should include absolute timestamp"
-        );
-        assert!(
-            formatted.contains("12s ago"),
-            "batched formatting should include relative timestamp hint"
-        );
-        assert!(
-            formatted.contains("ship it"),
-            "batched formatting should include original message text"
-        );
+    fn worker_complete_event_matches_own_channel() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::WorkerComplete {
+            agent_id: Arc::from("agent"),
+            worker_id: uuid::Uuid::new_v4(),
+            channel_id: Some(channel_id.clone()),
+            result: "done".to_string(),
+            notify: true,
+            success: true,
+        };
+
+        assert!(should_process_event_for_channel(&event, &channel_id));
     }
 
     #[test]
-    fn format_batched_message_uses_placeholder_for_empty_text() {
-        let formatted = super::format_batched_user_message(
-            "alice",
-            "2026-02-26 15:04:05 PST (America/Los_Angeles, UTC-08:00)",
-            "just now",
-            "   ",
-        );
-        assert!(
-            formatted.contains("[attachment or empty message]"),
-            "batched formatting should use placeholder for empty/whitespace text"
-        );
+    fn worker_complete_event_ignored_for_other_channel() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::WorkerComplete {
+            agent_id: Arc::from("agent"),
+            worker_id: uuid::Uuid::new_v4(),
+            channel_id: Some(Arc::from("channel-b")),
+            result: "done".to_string(),
+            notify: true,
+            success: true,
+        };
+
+        assert!(!should_process_event_for_channel(&event, &channel_id));
+    }
+
+    #[test]
+    fn worker_complete_event_ignored_when_no_channel() {
+        let channel_id: ChannelId = Arc::from("channel-a");
+        let event = ProcessEvent::WorkerComplete {
+            agent_id: Arc::from("agent"),
+            worker_id: uuid::Uuid::new_v4(),
+            channel_id: None,
+            result: "done".to_string(),
+            notify: true,
+            success: true,
+        };
+
+        assert!(!should_process_event_for_channel(&event, &channel_id));
     }
 }

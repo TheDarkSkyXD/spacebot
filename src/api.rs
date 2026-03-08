@@ -16,7 +16,10 @@ mod mcp;
 mod memories;
 mod messaging;
 mod models;
+mod opencode_proxy;
+mod projects;
 mod providers;
+mod secrets;
 mod server;
 mod settings;
 mod skills;
@@ -24,6 +27,7 @@ mod ssh;
 mod state;
 mod system;
 mod tasks;
+mod tools;
 mod webchat;
 mod workers;
 

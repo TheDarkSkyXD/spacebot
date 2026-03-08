@@ -128,6 +128,10 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "fragments/coalesce_hint") => {
             include_str!("../../prompts/en/fragments/coalesce_hint.md.j2")
         }
+        // Projects Context
+        ("en", "fragments/projects_context") => {
+            include_str!("../../prompts/en/fragments/projects_context.md.j2")
+        }
 
         // Tool Descriptions
         ("en", "tools/reply") => include_str!("../../prompts/en/tools/reply_description.md.j2"),
@@ -143,8 +147,18 @@ fn lookup(lang: &str, key: &str) -> &'static str {
             include_str!("../../prompts/en/tools/set_status_description.md.j2")
         }
         ("en", "tools/shell") => include_str!("../../prompts/en/tools/shell_description.md.j2"),
-        ("en", "tools/file") => include_str!("../../prompts/en/tools/file_description.md.j2"),
-        ("en", "tools/exec") => include_str!("../../prompts/en/tools/exec_description.md.j2"),
+        ("en", "tools/file_read") => {
+            include_str!("../../prompts/en/tools/file_read_description.md.j2")
+        }
+        ("en", "tools/file_write") => {
+            include_str!("../../prompts/en/tools/file_write_description.md.j2")
+        }
+        ("en", "tools/file_edit") => {
+            include_str!("../../prompts/en/tools/file_edit_description.md.j2")
+        }
+        ("en", "tools/file_list") => {
+            include_str!("../../prompts/en/tools/file_list_description.md.j2")
+        }
         ("en", "tools/browser") => include_str!("../../prompts/en/tools/browser_description.md.j2"),
         ("en", "tools/web_search") => {
             include_str!("../../prompts/en/tools/web_search_description.md.j2")
@@ -174,6 +188,9 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         ("en", "tools/send_message_to_another_channel") => {
             include_str!("../../prompts/en/tools/send_message_description.md.j2")
         }
+        ("en", "tools/secret_set") => {
+            include_str!("../../prompts/en/tools/secret_set_description.md.j2")
+        }
         ("en", "tools/send_agent_message") => {
             include_str!("../../prompts/en/tools/send_agent_message_description.md.j2")
         }
@@ -185,6 +202,18 @@ fn lookup(lang: &str, key: &str) -> &'static str {
         }
         ("en", "tools/task_update") => {
             include_str!("../../prompts/en/tools/task_update_description.md.j2")
+        }
+        ("en", "tools/spacebot_docs") => {
+            include_str!("../../prompts/en/tools/spacebot_docs_description.md.j2")
+        }
+        ("en", "tools/config_inspect") => {
+            include_str!("../../prompts/en/tools/config_inspect_description.md.j2")
+        }
+        ("en", "tools/project_manage") => {
+            include_str!("../../prompts/en/tools/project_manage_description.md.j2")
+        }
+        ("en", "tools/attachment_recall") => {
+            include_str!("../../prompts/en/tools/attachment_recall_description.md.j2")
         }
 
         // Fallback: unknown language or key -> try English

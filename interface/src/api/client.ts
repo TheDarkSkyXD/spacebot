@@ -40,6 +40,14 @@ export interface OutboundMessageEvent {
 	text: string;
 }
 
+export interface OutboundMessageDeltaEvent {
+	type: "outbound_message_delta";
+	agent_id: string;
+	channel_id: string;
+	text_delta: string;
+	aggregated_text: string;
+}
+
 export interface TypingStateEvent {
 	type: "typing_state";
 	agent_id: string;
@@ -54,6 +62,7 @@ export interface WorkerStartedEvent {
 	worker_id: string;
 	task: string;
 	worker_type?: string;
+	interactive?: boolean;
 }
 
 export interface WorkerStatusEvent {
@@ -62,6 +71,13 @@ export interface WorkerStatusEvent {
 	channel_id: string | null;
 	worker_id: string;
 	status: string;
+}
+
+export interface WorkerIdleEvent {
+	type: "worker_idle";
+	agent_id: string;
+	channel_id: string | null;
+	worker_id: string;
 }
 
 export interface WorkerCompletedEvent {
@@ -109,17 +125,49 @@ export interface ToolCompletedEvent {
 	result: string;
 }
 
+// -- OpenCode live transcript part types --
+
+export type OpenCodeToolState =
+	| { status: "pending" }
+	| { status: "running"; title?: string; input?: string }
+	| { status: "completed"; title?: string; input?: string; output?: string }
+	| { status: "error"; error?: string };
+
+export type OpenCodePart =
+	| { type: "text"; id: string; text: string }
+	| { type: "tool"; id: string; tool: string } & OpenCodeToolState
+	| { type: "step_start"; id: string }
+	| { type: "step_finish"; id: string; reason?: string };
+
+export interface OpenCodePartUpdatedEvent {
+	type: "opencode_part_updated";
+	agent_id: string;
+	worker_id: string;
+	part: OpenCodePart;
+}
+
+export interface WorkerTextEvent {
+	type: "worker_text";
+	agent_id: string;
+	worker_id: string;
+	text: string;
+}
+
 export type ApiEvent =
 	| InboundMessageEvent
 	| OutboundMessageEvent
+	| OutboundMessageDeltaEvent
 	| TypingStateEvent
 	| WorkerStartedEvent
 	| WorkerStatusEvent
+	| WorkerIdleEvent
 	| WorkerCompletedEvent
 	| BranchStartedEvent
 	| BranchCompletedEvent
 	| ToolStartedEvent
-	| ToolCompletedEvent;
+	| ToolCompletedEvent
+	| OpenCodePartUpdatedEvent
+	| WorkerTextEvent;
 
 async function fetchJson<T>(path: string): Promise<T> {
 	const response = await fetch(`${API_BASE}${path}`);
@@ -172,6 +220,7 @@ export interface WorkerStatusInfo {
 	started_at: string;
 	notify_on_complete: boolean;
 	tool_calls: number;
+	interactive: boolean;
 }
 
 export interface BranchStatusInfo {
@@ -219,6 +268,8 @@ export interface WorkerRunInfo {
 	has_transcript: boolean;
 	live_status: string | null;
 	tool_calls: number;
+	opencode_port: number | null;
+	interactive: boolean;
 }
 
 export interface WorkerDetailResponse {
@@ -233,6 +284,10 @@ export interface WorkerDetailResponse {
 	completed_at: string | null;
 	transcript: TranscriptStep[] | null;
 	tool_calls: number;
+	opencode_session_id: string | null;
+	opencode_port: number | null;
+	interactive: boolean;
+	directory: string | null;
 }
 
 export interface WorkerListResponse {
@@ -258,6 +313,7 @@ export interface AgentsResponse {
 export interface CronJobInfo {
 	id: string;
 	prompt: string;
+	cron_expr: string | null;
 	interval_secs: number;
 	delivery_target: string;
 	enabled: boolean;
@@ -564,11 +620,26 @@ export interface BrowserSection {
 	enabled: boolean;
 	headless: boolean;
 	evaluate_enabled: boolean;
+	persist_session: boolean;
+	close_policy: "close_browser" | "close_tabs" | "detach";
+}
+
+export interface ChannelSection {
+	listen_only_mode: boolean;
 }
 
 export interface SandboxSection {
 	mode: "enabled" | "disabled";
 	writable_paths: string[];
+}
+
+export interface ProjectsSection {
+	use_worktrees: boolean;
+	worktree_name_template: string;
+	auto_create_worktrees: boolean;
+	auto_discover_repos: boolean;
+	auto_discover_worktrees: boolean;
+	disk_usage_warning_threshold: number;
 }
 
 export interface DiscordSection {
@@ -584,8 +655,10 @@ export interface AgentConfigResponse {
 	coalesce: CoalesceSection;
 	memory_persistence: MemoryPersistenceSection;
 	browser: BrowserSection;
+	channel: ChannelSection;
 	discord: DiscordSection;
 	sandbox: SandboxSection;
+	projects: ProjectsSection;
 }
 
 // Partial update types - all fields are optional
@@ -646,11 +719,26 @@ export interface BrowserUpdate {
 	enabled?: boolean;
 	headless?: boolean;
 	evaluate_enabled?: boolean;
+	persist_session?: boolean;
+	close_policy?: "close_browser" | "close_tabs" | "detach";
+}
+
+export interface ChannelUpdate {
+	listen_only_mode?: boolean;
 }
 
 export interface SandboxUpdate {
 	mode?: "enabled" | "disabled";
 	writable_paths?: string[];
+}
+
+export interface ProjectsUpdate {
+	use_worktrees?: boolean;
+	worktree_name_template?: string;
+	auto_create_worktrees?: boolean;
+	auto_discover_repos?: boolean;
+	auto_discover_worktrees?: boolean;
+	disk_usage_warning_threshold?: number;
 }
 
 export interface DiscordUpdate {
@@ -666,8 +754,10 @@ export interface AgentConfigUpdateRequest {
 	coalesce?: CoalesceUpdate;
 	memory_persistence?: MemoryPersistenceUpdate;
 	browser?: BrowserUpdate;
+	channel?: ChannelUpdate;
 	discord?: DiscordUpdate;
 	sandbox?: SandboxUpdate;
+	projects?: ProjectsUpdate;
 }
 
 // -- Cron Types --
@@ -675,11 +765,13 @@ export interface AgentConfigUpdateRequest {
 export interface CronJobWithStats {
 	id: string;
 	prompt: string;
+	cron_expr: string | null;
 	interval_secs: number;
 	delivery_target: string;
 	enabled: boolean;
 	run_once: boolean;
 	active_hours: [number, number] | null;
+	timeout_secs: number | null;
 	success_count: number;
 	failure_count: number;
 	last_executed_at: string | null;
@@ -694,6 +786,7 @@ export interface CronExecutionEntry {
 
 export interface CronListResponse {
 	jobs: CronJobWithStats[];
+	timezone: string;
 }
 
 export interface CronExecutionsResponse {
@@ -708,12 +801,14 @@ export interface CronActionResponse {
 export interface CreateCronRequest {
 	id: string;
 	prompt: string;
-	interval_secs: number;
+	cron_expr?: string;
+	interval_secs?: number;
 	delivery_target: string;
 	active_start_hour?: number;
 	active_end_hour?: number;
 	enabled: boolean;
 	run_once: boolean;
+	timeout_secs?: number;
 }
 
 export interface CronExecutionsParams {
@@ -1266,6 +1361,181 @@ export interface AgentMessageEvent {
 	channel_id: string;
 }
 
+// ── Projects ─────────────────────────────────────────────────────────────
+
+export type ProjectStatus = "active" | "archived";
+
+export interface Project {
+	id: string;
+	agent_id: string;
+	name: string;
+	description: string;
+	icon: string;
+	tags: string[];
+	root_path: string;
+	settings: Record<string, unknown>;
+	status: ProjectStatus;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ProjectRepo {
+	id: string;
+	project_id: string;
+	name: string;
+	path: string;
+	remote_url: string;
+	default_branch: string;
+	current_branch: string | null;
+	description: string;
+	disk_usage_bytes: number | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ProjectWorktree {
+	id: string;
+	project_id: string;
+	repo_id: string;
+	name: string;
+	path: string;
+	branch: string;
+	created_by: string;
+	disk_usage_bytes: number | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ProjectWorktreeWithRepo extends ProjectWorktree {
+	repo_name: string;
+}
+
+/** GET /agents/projects response */
+export interface ProjectListResponse {
+	projects: Project[];
+}
+
+/** GET /agents/projects/:id response — project fields are flattened */
+export interface ProjectWithRelations extends Project {
+	repos: ProjectRepo[];
+	worktrees: ProjectWorktreeWithRepo[];
+}
+
+export interface ProjectDetailResponse {
+	/** The flattened project + repos + worktrees (serde #[flatten]) */
+	[key: string]: unknown;
+}
+
+export interface ProjectActionResponse {
+	success: boolean;
+	message: string;
+}
+
+export interface DiskUsageEntry {
+	name: string;
+	bytes: number;
+	is_dir: boolean;
+}
+
+export interface DiskUsageResponse {
+	total_bytes: number;
+	entries: DiskUsageEntry[];
+}
+
+export interface CreateProjectRequest {
+	name: string;
+	description?: string;
+	icon?: string;
+	tags?: string[];
+	root_path: string;
+	settings?: Record<string, unknown>;
+	auto_discover?: boolean;
+}
+
+export interface UpdateProjectRequest {
+	name?: string;
+	description?: string;
+	icon?: string;
+	tags?: string[];
+	settings?: Record<string, unknown>;
+	status?: ProjectStatus;
+}
+
+export interface CreateRepoRequest {
+	name: string;
+	path: string;
+	remote_url?: string;
+	default_branch?: string;
+	description?: string;
+}
+
+export interface CreateWorktreeRequest {
+	repo_id: string;
+	branch: string;
+	worktree_name?: string;
+	start_point?: string;
+}
+
+// ── Secrets ──────────────────────────────────────────────────────────────
+
+export type SecretCategory = "system" | "tool";
+export type StoreState = "unencrypted" | "locked" | "unlocked";
+
+export interface SecretStoreStatus {
+	state: StoreState;
+	encrypted: boolean;
+	secret_count: number;
+	system_count: number;
+	tool_count: number;
+	platform_managed: boolean;
+}
+
+export interface SecretListItem {
+	name: string;
+	category: SecretCategory;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface SecretListResponse {
+	secrets: SecretListItem[];
+}
+
+export interface PutSecretResponse {
+	name: string;
+	category: SecretCategory;
+	reload_required: boolean;
+	message: string;
+}
+
+export interface DeleteSecretResponse {
+	deleted: string;
+	warning?: string;
+}
+
+export interface EncryptResponse {
+	master_key: string;
+	message: string;
+}
+
+export interface UnlockResponse {
+	state: string;
+	secret_count: number;
+	message: string;
+}
+
+export interface MigrationItem {
+	config_key: string;
+	secret_name: string;
+	category: SecretCategory;
+}
+
+export interface MigrateResponse {
+	migrated: MigrationItem[];
+	skipped: string[];
+	message: string;
+}
+
 export const api = {
 	status: () => fetchJson<StatusResponse>("/status"),
 	overview: () => fetchJson<InstanceOverviewResponse>("/overview"),
@@ -1713,6 +1983,12 @@ export const api = {
 		return response.json() as Promise<RawConfigUpdateResponse>;
 	},
 
+	// Changelog API
+	changelog: async (): Promise<string> => {
+		const data = await fetchJson<{ content: string }>("/changelog");
+		return data.content;
+	},
+
 	// Update API
 	updateCheck: () => fetchJson<UpdateStatus>("/update/check"),
 	updateCheckNow: async () => {
@@ -1951,6 +2227,169 @@ export const api = {
 		});
 		if (!response.ok) throw new Error(`API error: ${response.status}`);
 		return response.json() as Promise<TaskResponse>;
+	},
+
+	// Secrets API
+	secretsStatus: () => fetchJson<SecretStoreStatus>("/secrets/status"),
+	listSecrets: () => fetchJson<SecretListResponse>("/secrets"),
+	putSecret: async (name: string, value: string, category?: SecretCategory): Promise<PutSecretResponse> => {
+		const response = await fetch(`${API_BASE}/secrets/${encodeURIComponent(name)}`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ value, category }),
+		});
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json() as Promise<PutSecretResponse>;
+	},
+	deleteSecret: async (name: string): Promise<DeleteSecretResponse> => {
+		const response = await fetch(`${API_BASE}/secrets/${encodeURIComponent(name)}`, {
+			method: "DELETE",
+		});
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json() as Promise<DeleteSecretResponse>;
+	},
+	enableEncryption: async (): Promise<EncryptResponse> => {
+		const response = await fetch(`${API_BASE}/secrets/encrypt`, { method: "POST" });
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json() as Promise<EncryptResponse>;
+	},
+	unlockSecrets: async (masterKey: string): Promise<UnlockResponse> => {
+		const response = await fetch(`${API_BASE}/secrets/unlock`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ master_key: masterKey }),
+		});
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json() as Promise<UnlockResponse>;
+	},
+	lockSecrets: async (): Promise<{ state: string; message: string }> => {
+		const response = await fetch(`${API_BASE}/secrets/lock`, { method: "POST" });
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json();
+	},
+	rotateKey: async (): Promise<{ master_key: string; message: string }> => {
+		const response = await fetch(`${API_BASE}/secrets/rotate`, { method: "POST" });
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json();
+	},
+	migrateSecrets: async (): Promise<MigrateResponse> => {
+		const response = await fetch(`${API_BASE}/secrets/migrate`, { method: "POST" });
+		if (!response.ok) {
+			const body = await response.json().catch(() => ({}));
+			throw new Error(body.error || `API error: ${response.status}`);
+		}
+		return response.json() as Promise<MigrateResponse>;
+	},
+
+	// Projects API
+	listProjects: (agentId: string, status?: ProjectStatus) => {
+		const search = new URLSearchParams({ agent_id: agentId });
+		if (status) search.set("status", status);
+		return fetchJson<ProjectListResponse>(`/agents/projects?${search}`);
+	},
+
+	getProject: (agentId: string, projectId: string) =>
+		fetchJson<ProjectWithRelations>(
+			`/agents/projects/${encodeURIComponent(projectId)}?agent_id=${encodeURIComponent(agentId)}`,
+		),
+
+	createProject: async (agentId: string, request: CreateProjectRequest): Promise<ProjectWithRelations> => {
+		const response = await fetch(`${API_BASE}/agents/projects`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...request, agent_id: agentId }),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ProjectWithRelations>;
+	},
+
+	updateProject: async (agentId: string, projectId: string, request: UpdateProjectRequest): Promise<ProjectWithRelations> => {
+		const response = await fetch(`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...request, agent_id: agentId }),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ProjectWithRelations>;
+	},
+
+	deleteProject: async (agentId: string, projectId: string): Promise<ProjectActionResponse> => {
+		const response = await fetch(
+			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "DELETE" },
+		);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ProjectActionResponse>;
+	},
+
+	scanProject: async (agentId: string, projectId: string): Promise<ProjectWithRelations> => {
+		const response = await fetch(
+			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/scan?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "POST" },
+		);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ProjectWithRelations>;
+	},
+
+	projectDiskUsage: (agentId: string, projectId: string) =>
+		fetchJson<DiskUsageResponse>(
+			`/agents/projects/${encodeURIComponent(projectId)}/disk-usage?agent_id=${encodeURIComponent(agentId)}`,
+		),
+
+	createProjectRepo: async (agentId: string, projectId: string, request: CreateRepoRequest): Promise<{ repo: ProjectRepo }> => {
+		const response = await fetch(`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/repos`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...request, agent_id: agentId }),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<{ repo: ProjectRepo }>;
+	},
+
+	deleteProjectRepo: async (agentId: string, projectId: string, repoId: string): Promise<ProjectActionResponse> => {
+		const response = await fetch(
+			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/repos/${encodeURIComponent(repoId)}?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "DELETE" },
+		);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ProjectActionResponse>;
+	},
+
+	createProjectWorktree: async (agentId: string, projectId: string, request: CreateWorktreeRequest): Promise<{ worktree: ProjectWorktree }> => {
+		const response = await fetch(`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/worktrees`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ ...request, agent_id: agentId }),
+		});
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<{ worktree: ProjectWorktree }>;
+	},
+
+	deleteProjectWorktree: async (agentId: string, projectId: string, worktreeId: string): Promise<ProjectActionResponse> => {
+		const response = await fetch(
+			`${API_BASE}/agents/projects/${encodeURIComponent(projectId)}/worktrees/${encodeURIComponent(worktreeId)}?agent_id=${encodeURIComponent(agentId)}`,
+			{ method: "DELETE" },
+		);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ProjectActionResponse>;
 	},
 
 	eventsUrl: `${API_BASE}/events`,

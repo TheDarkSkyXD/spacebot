@@ -3,7 +3,8 @@
 use super::state::ApiState;
 use super::{
     agents, bindings, channels, config, cortex, cron, ingest, links, mcp, memories, messaging,
-    models, providers, settings, skills, ssh, system, tasks, webchat, workers,
+    models, opencode_proxy, projects, providers, secrets, settings, skills, ssh, system, tasks,
+    tools, webchat, workers,
 };
 
 use axum::Json;
@@ -13,7 +14,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use rust_embed::Embed;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
@@ -86,10 +87,17 @@ pub async fn start_http_server(
             "/channels",
             get(channels::list_channels).delete(channels::delete_channel),
         )
+        .route("/channels/archive", put(channels::set_channel_archive))
         .route("/channels/messages", get(channels::channel_messages))
         .route("/channels/status", get(channels::channel_status))
         .route("/agents/workers", get(workers::list_workers))
         .route("/agents/workers/detail", get(workers::worker_detail))
+        .route(
+            "/opencode/{port}/{*path}",
+            any(opencode_proxy::opencode_proxy),
+        )
+        .route("/opencode/{port}", any(opencode_proxy::opencode_proxy))
+        .route("/opencode/{port}/", any(opencode_proxy::opencode_proxy))
         .route("/agents/memories", get(memories::list_memories))
         .route("/agents/memories/search", get(memories::search_memories))
         .route("/agents/memories/graph", get(memories::memory_graph))
@@ -130,6 +138,34 @@ pub async fn start_http_server(
         )
         .route("/agents/tasks/{number}/approve", post(tasks::approve_task))
         .route("/agents/tasks/{number}/execute", post(tasks::execute_task))
+        .route(
+            "/agents/projects",
+            get(projects::list_projects).post(projects::create_project),
+        )
+        .route(
+            "/agents/projects/{id}",
+            get(projects::get_project)
+                .put(projects::update_project)
+                .delete(projects::delete_project),
+        )
+        .route("/agents/projects/{id}/scan", post(projects::scan_project))
+        .route(
+            "/agents/projects/{id}/disk-usage",
+            get(projects::disk_usage),
+        )
+        .route("/agents/projects/{id}/repos", post(projects::create_repo))
+        .route(
+            "/agents/projects/{id}/repos/{repo_id}",
+            delete(projects::delete_repo),
+        )
+        .route(
+            "/agents/projects/{id}/worktrees",
+            post(projects::create_worktree),
+        )
+        .route(
+            "/agents/projects/{id}/worktrees/{wt_id}",
+            delete(projects::delete_worktree),
+        )
         .route("/channels/cancel", post(channels::cancel_process))
         .route(
             "/agents/ingest/files",
@@ -139,6 +175,22 @@ pub async fn start_http_server(
         .route("/agents/skills", get(skills::list_skills))
         .route("/agents/skills/install", post(skills::install_skill))
         .route("/agents/skills/remove", delete(skills::remove_skill))
+        .route("/agents/tools", get(tools::list_tools))
+        // Secret store management
+        .route("/secrets/status", get(secrets::secrets_status))
+        .route("/secrets", get(secrets::list_secrets))
+        .route(
+            "/secrets/{name}",
+            put(secrets::put_secret).delete(secrets::delete_secret),
+        )
+        .route("/secrets/{name}/info", get(secrets::secret_info))
+        .route("/secrets/migrate", post(secrets::migrate_secrets))
+        .route("/secrets/encrypt", post(secrets::enable_encryption))
+        .route("/secrets/unlock", post(secrets::unlock_secrets))
+        .route("/secrets/lock", post(secrets::lock_secrets))
+        .route("/secrets/rotate", post(secrets::rotate_key))
+        .route("/secrets/export", post(secrets::export_secrets))
+        .route("/secrets/import", post(secrets::import_secrets))
         .route("/skills/registry/browse", get(skills::registry_browse))
         .route("/skills/registry/search", get(skills::registry_search))
         .route(
@@ -187,6 +239,7 @@ pub async fn start_http_server(
             get(settings::update_check).post(settings::update_check_now),
         )
         .route("/update/apply", post(settings::update_apply))
+        .route("/changelog", get(settings::changelog))
         .route("/webchat/send", post(webchat::webchat_send))
         .route("/webchat/history", get(webchat::webchat_history))
         .route("/ssh/status", get(ssh::ssh_status))

@@ -46,6 +46,10 @@ pub(super) struct WorkerListItem {
     live_status: Option<String>,
     /// Total tool calls. From DB for completed workers, from StatusBlock for running.
     tool_calls: i64,
+    /// OpenCode server port (for workers with an embeddable web UI).
+    opencode_port: Option<i32>,
+    /// Whether this worker accepts follow-up input via route.
+    interactive: bool,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +71,14 @@ pub(super) struct WorkerDetailResponse {
     completed_at: Option<String>,
     transcript: Option<Vec<worker_transcript::TranscriptStep>>,
     tool_calls: i64,
+    /// OpenCode session ID (for workers with an embeddable web UI).
+    opencode_session_id: Option<String>,
+    /// OpenCode server port (for workers with an embeddable web UI).
+    opencode_port: Option<i32>,
+    /// Whether this worker accepts follow-up input via route.
+    interactive: bool,
+    /// Working directory for OpenCode workers.
+    directory: Option<String>,
 }
 
 /// List worker runs for an agent, with live status merged from StatusBlocks.
@@ -131,6 +143,8 @@ pub(super) async fn list_workers(
                 has_transcript: row.has_transcript,
                 live_status,
                 tool_calls,
+                opencode_port: row.opencode_port,
+                interactive: row.interactive,
             }
         })
         .collect();
@@ -156,13 +170,18 @@ pub(super) async fn worker_detail(
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let transcript = detail.transcript_blob.as_deref().and_then(|blob| {
-        worker_transcript::deserialize_transcript(blob)
+    let transcript = match detail.transcript_blob.as_deref() {
+        Some(blob) => worker_transcript::deserialize_transcript(blob)
             .map_err(|error| {
                 tracing::warn!(%error, worker_id = %query.worker_id, "failed to decompress transcript");
             })
-            .ok()
-    });
+            .ok(),
+        None => {
+            // No persisted transcript yet — check the live transcript cache
+            // so page refreshes can recover in-progress worker transcripts.
+            state.get_live_transcript(&query.worker_id).await
+        }
+    };
 
     Ok(Json(WorkerDetailResponse {
         id: detail.id,
@@ -176,5 +195,9 @@ pub(super) async fn worker_detail(
         completed_at: detail.completed_at,
         transcript,
         tool_calls: detail.tool_calls,
+        opencode_session_id: detail.opencode_session_id,
+        opencode_port: detail.opencode_port,
+        interactive: detail.interactive,
+        directory: detail.directory,
     }))
 }
