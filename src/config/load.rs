@@ -2133,6 +2133,9 @@ impl Config {
             auth_token: toml.api.auth_token.as_deref().and_then(resolve_env_value),
         };
 
+        if toml.ssh.enabled && toml.ssh.port == 0 {
+            anyhow::bail!("ssh.port must be between 1 and 65535");
+        }
         let ssh = SshConfig {
             enabled: toml.ssh.enabled,
             port: toml.ssh.port,

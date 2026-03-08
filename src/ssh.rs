@@ -158,12 +158,16 @@ impl SshManager {
         }
     }
 
-    /// Returns true if an authorized_keys file exists and is non-empty.
+    /// Returns true if the authorized_keys file contains at least one real key
+    /// (skipping blank lines and comments).
     pub fn has_authorized_key(&self) -> bool {
         let path = self.ssh_dir.join("authorized_keys");
-        path.exists()
-            && std::fs::metadata(&path)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
+        std::fs::read_to_string(&path)
+            .map(|content| {
+                content
+                    .lines()
+                    .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            })
+            .unwrap_or(false)
     }
 }

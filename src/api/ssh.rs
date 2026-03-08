@@ -72,30 +72,29 @@ pub(super) async fn set_authorized_key(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<SetAuthorizedKeyRequest>,
 ) -> Result<Json<SetAuthorizedKeyResponse>, StatusCode> {
-    let pubkey = request.public_key.trim();
-    if pubkey.contains('\n') || pubkey.contains('\r') {
+    let public_key = request.public_key.trim();
+    if public_key.contains('\n') || public_key.contains('\r') {
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,
             message: "public_key must be a single line".to_string(),
         }));
     }
-    if pubkey.is_empty() {
+    if public_key.is_empty() {
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,
             message: "public_key is required".to_string(),
         }));
     }
 
-    // Validate minimal SSH public key structure: "<type> <base64> [comment]"
-    let parts: Vec<&str> = pubkey.split_whitespace().collect();
+    // Validate minimal SSH public key structure: "<type> <base64> [comment...]"
+    let parts: Vec<&str> = public_key.split_whitespace().collect();
     let key_type = parts.first().copied().unwrap_or_default();
     let key_body = parts.get(1).copied().unwrap_or_default();
     let valid_type = key_type.starts_with("ssh-")
         || key_type.starts_with("ecdsa-")
         || key_type.starts_with("sk-ssh-")
         || key_type.starts_with("sk-ecdsa-");
-    let valid_field_count = parts.len() == 2 || parts.len() == 3;
-    if !valid_type || !valid_field_count || key_body.is_empty() {
+    if parts.len() < 2 || !valid_type || key_body.is_empty() {
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,
             message: "Invalid SSH public key format".to_string(),
@@ -103,7 +102,7 @@ pub(super) async fn set_authorized_key(
     }
 
     let manager = state.ssh_manager.lock().await;
-    if let Err(error) = manager.set_authorized_key(pubkey).await {
+    if let Err(error) = manager.set_authorized_key(public_key).await {
         tracing::error!(%error, "failed to set SSH authorized key");
         return Ok(Json(SetAuthorizedKeyResponse {
             success: false,

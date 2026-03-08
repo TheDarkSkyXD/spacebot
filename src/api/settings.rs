@@ -360,6 +360,16 @@ pub(super) async fn update_global_settings(
         }
     }
 
+    if let Some(port) = request.ssh_port {
+        if port == 0 {
+            return Ok(Json(GlobalSettingsUpdateResponse {
+                success: false,
+                message: "SSH port must be between 1 and 65535".to_string(),
+                requires_restart: false,
+            }));
+        }
+    }
+
     if request.ssh_enabled.is_some() || request.ssh_port.is_some() {
         if doc.get("ssh").is_none() {
             doc["ssh"] = toml_edit::Item::Table(toml_edit::Table::new());
