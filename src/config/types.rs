@@ -1674,55 +1674,69 @@ pub(super) fn is_named_adapter_platform(platform: &str) -> bool {
     )
 }
 
+/// Validate channel bindings against messaging config, returning only the
+/// resolvable bindings. Unresolvable bindings (missing messaging config,
+/// missing adapter, etc.) are logged as warnings and skipped instead of
+/// causing a hard startup failure.
 pub(super) fn validate_named_messaging_adapters(
     messaging: &MessagingConfig,
-    bindings: &[Binding],
-) -> Result<()> {
+    bindings: Vec<Binding>,
+) -> Result<Vec<Binding>> {
     let adapter_states = build_adapter_validation_states(messaging)?;
+
+    let mut valid_bindings = Vec::with_capacity(bindings.len());
 
     for binding in bindings {
         if !is_named_adapter_platform(binding.channel.as_str()) {
             if binding.adapter.is_some() {
-                return Err(ConfigError::Invalid(format!(
-                    "binding for channel '{}' can't set adapter: this platform does not support named adapters",
-                    binding.channel
-                ))
-                .into());
+                tracing::warn!(
+                    channel = %binding.channel,
+                    "skipping binding: this platform does not support named adapters"
+                );
+                continue;
             }
+            valid_bindings.push(binding);
             continue;
         }
 
-        let state = adapter_states.get(binding.channel.as_str()).ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "binding for channel '{}' can't be resolved: no messaging config exists for that platform",
-                binding.channel
-            ))
-        })?;
+        let state = match adapter_states.get(binding.channel.as_str()) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    channel = %binding.channel,
+                    "skipping binding: no messaging config exists for this platform"
+                );
+                continue;
+            }
+        };
 
         // adapter is already normalized at ingest time via normalize_adapter().
         match binding.adapter.as_deref() {
             Some(adapter_name) => {
                 if !state.named_instances.contains(adapter_name) {
-                    return Err(ConfigError::Invalid(format!(
-                        "binding for channel '{}' references missing adapter '{}'",
-                        binding.channel, adapter_name
-                    ))
-                    .into());
+                    tracing::warn!(
+                        channel = %binding.channel,
+                        adapter = %adapter_name,
+                        "skipping binding: references missing adapter"
+                    );
+                    continue;
                 }
             }
             None => {
                 if !state.default_present {
-                    return Err(ConfigError::Invalid(format!(
-                        "binding for channel '{}' requires the default adapter, but no default credentials are configured",
-                        binding.channel
-                    ))
-                    .into());
+                    tracing::warn!(
+                        channel = %binding.channel,
+                        "skipping binding: requires the default adapter, but no default credentials are configured"
+                    );
+                    continue;
                 }
             }
         }
+
+        valid_bindings.push(binding);
     }
 
-    Ok(())
+    Ok(valid_bindings)
 }
 
 pub(super) fn build_adapter_validation_states(

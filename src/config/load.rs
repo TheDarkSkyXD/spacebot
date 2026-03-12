@@ -2245,7 +2245,7 @@ impl Config {
             })
             .collect();
 
-        validate_named_messaging_adapters(&messaging, &bindings)?;
+        let bindings = validate_named_messaging_adapters(&messaging, bindings)?;
 
         let api = ApiConfig {
             enabled: toml.api.enabled,
