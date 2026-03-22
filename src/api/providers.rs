@@ -1193,7 +1193,7 @@ fn find_claude_binary() -> Option<String> {
 /// Start the Anthropic OAuth PKCE flow. Returns an authorization URL the
 /// frontend should open in a popup/tab so the user can authorize.
 pub(super) async fn start_anthropic_oauth(
-    State(state): State<Arc<ApiState>>,
+    State(_state): State<Arc<ApiState>>,
     Json(request): Json<AnthropicOAuthStartRequest>,
 ) -> Result<Json<AnthropicOAuthStartResponse>, StatusCode> {
     let model = request.model.trim().to_string();

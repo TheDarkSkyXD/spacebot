@@ -8,8 +8,19 @@ import { ModelSelect } from "@/components/ModelSelect";
 import { ProviderIcon } from "@/lib/providerIcons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faSearch } from "@fortawesome/free-solid-svg-icons";
+import { IS_TAURI } from "@/api/client";
 
 import { parse as parseToml } from "smol-toml";
+
+/** Open a URL in the system browser. In Tauri, uses the shell plugin; otherwise falls back to window.open. */
+async function openExternal(url: string) {
+	if (IS_TAURI) {
+		const { open } = await import("@tauri-apps/plugin-shell");
+		await open(url);
+	} else {
+		window.open(url, "_blank", "noopener,noreferrer");
+	}
+}
 import { useTheme, THEMES, type ThemeId } from "@/hooks/useTheme";
 import { Markdown } from "@/components/Markdown";
 
@@ -566,11 +577,7 @@ export function Settings() {
 
 	const handleOpenDeviceLogin = () => {
 		if (!deviceCodeInfo || !deviceCodeCopied) return;
-		window.open(
-			deviceCodeInfo.verificationUrl,
-			"spacebot-openai-device",
-			"popup=true,width=780,height=960,noopener,noreferrer",
-		);
+		openExternal(deviceCodeInfo.verificationUrl);
 	};
 
 	const handleStartAnthropicOAuth = async () => {
@@ -593,11 +600,7 @@ export function Settings() {
 				return;
 			}
 			setAnthropicOAuthState(result.state);
-			window.open(
-				result.authorize_url,
-				"spacebot-anthropic-oauth",
-				"popup=true,width=780,height=960,noopener,noreferrer",
-			);
+			openExternal(result.authorize_url);
 		} catch (error: any) {
 			setAnthropicOAuthMessage({ text: `Failed: ${error.message}`, type: "error" });
 		}
