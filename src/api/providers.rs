@@ -349,6 +349,7 @@ pub(super) async fn get_providers(
     let config_path = state.config_path.read().await.clone();
     let instance_dir = (**state.instance_dir.load()).clone();
     let secrets_store = state.secrets_store.load();
+    let anthropic_oauth_configured = crate::auth::credentials_path(&instance_dir).exists();
     let openai_oauth_configured = crate::openai_auth::credentials_path(&instance_dir).exists();
     let env_set = |name: &str| {
         std::env::var(name)
