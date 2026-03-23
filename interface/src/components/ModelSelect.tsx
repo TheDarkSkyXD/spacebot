@@ -95,7 +95,8 @@ export function ModelSelect({
       (m) =>
         m.id.toLowerCase().includes(query) ||
         m.name.toLowerCase().includes(query) ||
-        m.provider.toLowerCase().includes(query),
+        m.provider.toLowerCase().includes(query) ||
+        (PROVIDER_LABELS[m.provider] ?? "").toLowerCase().includes(query),
     );
   }, [models, filter]);
 
@@ -177,8 +178,6 @@ export function ModelSelect({
     setFilter(val);
     setHighlightIndex(-1);
     if (!open) setOpen(true);
-    // Allow free-form input for custom model IDs
-    onChange(val);
   };
 
   const handleFocus = () => {
@@ -217,8 +216,11 @@ export function ModelSelect({
       e.preventDefault();
       if (highlightIndex >= 0 && highlightIndex < flatList.length) {
         handleSelect(flatList[highlightIndex].id);
-        inputRef.current?.blur();
+      } else if (filter.trim()) {
+        // Commit raw model ID typed by the user
+        handleSelect(filter.trim());
       }
+      inputRef.current?.blur();
     }
   };
 

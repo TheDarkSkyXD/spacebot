@@ -423,7 +423,7 @@ pub(super) async fn get_providers(
         };
 
         (
-            has_value("anthropic_key", "ANTHROPIC_API_KEY"),
+            has_value("anthropic_key", "ANTHROPIC_API_KEY") || anthropic_oauth_configured,
             has_value("openai_key", "OPENAI_API_KEY"),
             openai_oauth_configured,
             has_value("openrouter_key", "OPENROUTER_API_KEY"),
@@ -449,7 +449,7 @@ pub(super) async fn get_providers(
         )
     } else {
         (
-            env_set("ANTHROPIC_API_KEY"),
+            env_set("ANTHROPIC_API_KEY") || anthropic_oauth_configured,
             env_set("OPENAI_API_KEY"),
             openai_oauth_configured,
             env_set("OPENROUTER_API_KEY"),
