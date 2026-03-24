@@ -114,7 +114,12 @@ BOOTSTRAP_TS="${APP_DIR}/src/context/global-sync/bootstrap.ts"
 perl -pi -e \
   's/sync\.data\.agent\.filter\(/(Array.isArray(sync.data.agent) ? sync.data.agent : []).filter(/g' \
   "${LOCAL_TSX}"
-echo "[opencode-embed] Patched local.tsx: Array.isArray guard on agent filter"
+if grep -q 'Array\.isArray(sync\.data\.agent)' "${LOCAL_TSX}"; then
+  echo "[opencode-embed] Patched local.tsx: Array.isArray guard on agent filter"
+else
+  echo "[opencode-embed] ERROR: local.tsx patch did not apply — upstream may have changed."
+  exit 1
+fi
 
 # Patch 2: bootstrap.ts — guard the setStore("agent", ...) call.
 # The original line:  input.setStore("agent", x.data ?? [])
@@ -122,7 +127,12 @@ echo "[opencode-embed] Patched local.tsx: Array.isArray guard on agent filter"
 perl -pi -e \
   's/input\.setStore\("agent",\s*x\.data\s*\?\?\s*\[\]\)/input.setStore("agent", Array.isArray(x.data) ? x.data : [])/g' \
   "${BOOTSTRAP_TS}"
-echo "[opencode-embed] Patched bootstrap.ts: Array.isArray guard on agent store"
+if grep -q 'Array\.isArray(x\.data)' "${BOOTSTRAP_TS}"; then
+  echo "[opencode-embed] Patched bootstrap.ts: Array.isArray guard on agent store"
+else
+  echo "[opencode-embed] ERROR: bootstrap.ts patch did not apply — upstream may have changed."
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Install dependencies
