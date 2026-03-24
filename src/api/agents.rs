@@ -526,6 +526,18 @@ pub async fn create_agent_internal(
     // Acquire the config write mutex to prevent concurrent read-modify-write races.
     let _config_guard = state.config_write_mutex.lock().await;
 
+    // Fail early if messaging manager is unavailable — before any config write,
+    // directory creation, or database init that would leave a half-created agent.
+    let messaging_manager = {
+        let guard = state.messaging_manager.read().await;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                "Messaging manager not initialized. Please ensure messaging adapters are configured before creating agents.".to_string()
+            })?
+    };
+
     let content = if config_path.exists() {
         tokio::fs::read_to_string(&config_path)
             .await
@@ -547,6 +559,19 @@ pub async fn create_agent_internal(
     let agents_array = doc["agents"]
         .as_array_of_tables_mut()
         .ok_or_else(|| "agents is not an array of tables in config.toml".to_string())?;
+
+    // Revalidate uniqueness under the lock — another request may have written the
+    // same agent_id to config.toml between our first check and mutex acquisition.
+    // Check against the parsed TOML document (agents_array) rather than the stale
+    // in-memory cache to ensure we catch concurrent writes.
+    if agents_array.iter().any(|t| {
+        t.get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| id == agent_id)
+            .unwrap_or(false)
+    }) {
+        return Err(format!("Agent '{agent_id}' already exists"));
+    }
 
     let mut new_table = toml_edit::Table::new();
     new_table["id"] = toml_edit::value(&agent_id);
@@ -787,10 +812,7 @@ pub async fn create_agent_internal(
         event_tx: event_tx.clone(),
         memory_event_tx: memory_event_tx.clone(),
         sqlite_pool: db.sqlite.clone(),
-        messaging_manager: {
-            let guard = state.messaging_manager.read().await;
-            guard.as_ref().cloned()
-        },
+        messaging_manager: Some(messaging_manager.clone()),
         sandbox: sandbox.clone(),
         links: Arc::new(arc_swap::ArcSwap::from_pointee(
             (**state.agent_links.load()).clone(),
@@ -841,19 +863,14 @@ pub async fn create_agent_internal(
         deps: deps.clone(),
         screenshot_dir: agent_config.screenshot_dir(),
         logs_dir: agent_config.logs_dir(),
-        messaging_manager: {
-            let guard = state.messaging_manager.read().await;
-            guard
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| std::sync::Arc::new(crate::messaging::MessagingManager::new()))
-        },
+        messaging_manager: messaging_manager.clone(),
         store: cron_store.clone(),
     };
     let scheduler = std::sync::Arc::new(crate::cron::Scheduler::new(cron_context));
     runtime_config.set_cron(cron_store.clone(), scheduler.clone());
 
-    let cron_tool = crate::tools::CronTool::new(cron_store.clone(), scheduler.clone());
+    let cron_tool =
+        crate::tools::CronTool::new(cron_store.clone(), scheduler.clone(), messaging_manager);
 
     let browser_config = (**runtime_config.browser_config.load()).clone();
     let brave_search_key = (**runtime_config.brave_search_key.load()).clone();

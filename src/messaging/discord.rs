@@ -1038,7 +1038,11 @@ fn build_embed(card: &crate::Card) -> CreateEmbed {
         embed = embed.url(url);
     }
     if let Some(footer) = &card.footer {
-        embed = embed.footer(CreateEmbedFooter::new(footer));
+        let mut discord_footer = CreateEmbedFooter::new(footer.text.clone());
+        if let Some(icon_url) = &footer.icon_url {
+            discord_footer = discord_footer.icon_url(icon_url);
+        }
+        embed = embed.footer(discord_footer);
     }
 
     for (i, field) in card.fields.iter().enumerate() {
