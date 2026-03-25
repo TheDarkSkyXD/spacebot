@@ -230,6 +230,7 @@ export function ModelSelect({
     }
     if (e.key === "Enter") {
       e.preventDefault();
+      suppressBlurCommitRef.current = true;
       if (highlightIndex >= 0 && highlightIndex < flatList.length) {
         handleSelect(flatList[highlightIndex].id);
       } else if (filter.trim()) {
@@ -268,6 +269,7 @@ export function ModelSelect({
               onMouseDown={(e) => {
                 e.preventDefault();
                 if (open) {
+                  suppressBlurCommitRef.current = true;
                   setOpen(false);
                   setFilter("");
                   setHighlightIndex(-1);
