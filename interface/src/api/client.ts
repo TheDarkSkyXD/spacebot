@@ -827,6 +827,28 @@ export interface OpenCodeSettingsUpdate {
 	permissions?: Partial<OpenCodePermissions>;
 }
 
+export interface ClaudeCliStatusResponse {
+	claude_folder_exists: boolean;
+	credentials_file_exists: boolean;
+	cli_installed: boolean;
+	cli_version: string | null;
+	authenticated: boolean;
+	email: string | null;
+	oauth_configured: boolean;
+}
+
+export interface AnthropicOAuthStartResponse {
+	success: boolean;
+	message: string;
+	authorize_url: string | null;
+	state: string | null;
+}
+
+export interface AnthropicOAuthExchangeResponse {
+	success: boolean;
+	message: string;
+}
+
 export interface GlobalSettingsUpdate {
 	brave_search_key?: string | null;
 	api_enabled?: boolean;
@@ -1616,6 +1638,29 @@ export const api = {
 			throw new Error(`API error: ${response.status}`);
 		}
 		return response.json() as Promise<Types.ProviderModelTestResponse>;
+	},
+	claudeCliStatus: () => fetchJson<ClaudeCliStatusResponse>("/providers/anthropic/oauth/cli-status"),
+	startAnthropicOAuth: async (params: { model: string; mode?: string }) => {
+		const response = await fetch(`${API_BASE}/providers/anthropic/oauth/start`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(params),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<AnthropicOAuthStartResponse>;
+	},
+	exchangeAnthropicOAuth: async (params: { code: string; state: string }) => {
+		const response = await fetch(`${API_BASE}/providers/anthropic/oauth/exchange`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(params),
+		});
+		if (!response.ok) {
+			throw new Error(`API error: ${response.status}`);
+		}
+		return response.json() as Promise<AnthropicOAuthExchangeResponse>;
 	},
 	startOpenAiOAuthBrowser: async (params: {model: string}) => {
 		const response = await fetch(`${getApiBase()}/providers/openai/oauth/browser/start`, {

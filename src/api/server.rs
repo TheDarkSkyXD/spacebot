@@ -273,6 +273,19 @@ pub async fn start_http_server(
         )
         .route("/api/opencode/{port}", any(opencode_proxy::opencode_proxy))
         .route("/api/opencode/{port}/", any(opencode_proxy::opencode_proxy))
+        // Anthropic OAuth routes (not yet in OpenAPI schema)
+        .route(
+            "/api/providers/anthropic/oauth/cli-status",
+            get(providers::claude_cli_status),
+        )
+        .route(
+            "/api/providers/anthropic/oauth/start",
+            post(providers::start_anthropic_oauth),
+        )
+        .route(
+            "/api/providers/anthropic/oauth/exchange",
+            post(providers::exchange_anthropic_oauth),
+        )
         // Apply auth middleware to all protected routes
         .layer(middleware::from_fn_with_state(
             state.clone(),
