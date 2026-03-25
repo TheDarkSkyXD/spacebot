@@ -2,7 +2,7 @@
 
 use super::state::ApiState;
 use super::{
-    agents, bindings, channels, config, cortex, cron, factory, ingest, links, mcp, memories,
+    agents, bindings, channels, config, cortex, cron, factory, fs, ingest, links, mcp, memories,
     messaging, models, opencode_proxy, projects, providers, secrets, settings, skills, ssh, system,
     tasks, tools, webchat, workers,
 };
@@ -262,6 +262,8 @@ pub async fn start_http_server(
     let protected_routes = Router::new()
         // API routes under /api
         .nest("/api", api_routes)
+        // Filesystem browsing (not yet in OpenAPI schema)
+        .route("/api/fs/list-dir", get(fs::list_dir))
         // Swagger UI and OpenAPI spec (protected)
         .merge(utoipa_swagger_ui::SwaggerUi::new("/api/docs").url("/api/openapi.json", api))
         // Opencode proxy routes (protected)

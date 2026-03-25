@@ -1213,6 +1213,18 @@ export interface DiskUsageResponse {
 	entries: DiskUsageEntry[];
 }
 
+export interface DirEntry {
+	name: string;
+	path: string;
+	is_dir: boolean;
+}
+
+export interface ListDirResponse {
+	path: string;
+	parent: string | null;
+	entries: DirEntry[];
+}
+
 export interface CreateProjectRequest {
 	name: string;
 	description?: string;
@@ -2273,4 +2285,12 @@ export const api = {
 	},
 
 	getEventsUrl: () => `${getApiBase()}/events`,
+
+	listDir: async (path?: string): Promise<ListDirResponse> => {
+		const params = new URLSearchParams();
+		if (path) params.set("path", path);
+		const response = await fetch(`${getApiBase()}/fs/list-dir?${params.toString()}`);
+		if (!response.ok) throw new Error(`API error: ${response.status}`);
+		return response.json() as Promise<ListDirResponse>;
+	},
 };
