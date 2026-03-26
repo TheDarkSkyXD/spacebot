@@ -1562,6 +1562,16 @@ async fn run(
 ) -> anyhow::Result<()> {
     let paths = spacebot::daemon::DaemonPaths::new(&config.instance_dir);
 
+    // On Windows, create a Job Object so that all child processes (OpenCode
+    // servers, etc.) are automatically killed when this process exits — even
+    // if the exit is not graceful (e.g. the Tauri desktop app is closed).
+    #[cfg(windows)]
+    {
+        if let Err(error) = setup_windows_job_object() {
+            tracing::warn!(%error, "failed to set up Windows job object for child process cleanup");
+        }
+    }
+
     tracing::info!("starting spacebot");
     tracing::info!(instance_dir = %config.instance_dir.display(), "configuration loaded");
 
@@ -2427,6 +2437,19 @@ async fn run(
     drop(cron_schedulers_for_shutdown);
 
     messaging_manager.shutdown().await;
+
+    // Shut down OpenCode server pools — kill all spawned coding-agent processes
+    // so they don't linger after spacebot exits.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for agent in agents.values() {
+            let pool = agent.deps.runtime_config.opencode_server_pool.load();
+            let ptr = std::sync::Arc::as_ptr(&pool) as usize;
+            if seen.insert(ptr) {
+                pool.shutdown_all().await;
+            }
+        }
+    }
 
     for (agent_id, agent) in agents {
         tracing::info!(%agent_id, "shutting down agent");
@@ -3570,6 +3593,59 @@ async fn initialize_agents(
     }
 
     Ok(())
+}
+
+/// Create a Windows Job Object configured to kill all child processes when this
+/// process exits. This ensures spawned OpenCode servers (and any other children)
+/// cannot outlive the spacebot process, even if it is terminated without a
+/// graceful shutdown (e.g. the Tauri desktop app is closed, or Task Manager
+/// kills the process).
+#[cfg(windows)]
+fn setup_windows_job_object() -> anyhow::Result<()> {
+    use std::mem;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
+    use winapi::um::processthreadsapi::GetCurrentProcess;
+    use winapi::um::winnt::{
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            anyhow::bail!("CreateJobObjectW failed");
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *mut _,
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if ok == 0 {
+            CloseHandle(job);
+            anyhow::bail!("SetInformationJobObject failed");
+        }
+
+        let ok = AssignProcessToJobObject(job, GetCurrentProcess());
+        if ok == 0 {
+            CloseHandle(job);
+            anyhow::bail!("AssignProcessToJobObject failed");
+        }
+
+        // Intentionally leak the handle — it must stay open for the lifetime
+        // of the process so the JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE flag
+        // takes effect when the last handle is closed (i.e. when we exit).
+        // Raw pointers are Copy so mem::forget is a no-op; just don't close it.
+        let _ = job;
+
+        tracing::info!("Windows job object created — child processes will be cleaned up on exit");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
