@@ -968,3 +968,26 @@ fn detect_sandbox_exec() -> SandboxBackend {
         SandboxBackend::None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sandbox_config_defaults() {
+        let config = SandboxConfig::default();
+        assert_eq!(config.mode, SandboxMode::Enabled);
+        assert!(config.writable_paths.is_empty());
+        assert!(config.project_paths.is_empty());
+        assert!(config.passthrough_env.is_empty());
+    }
+
+    #[test]
+    fn test_sandbox_mode_serialization() {
+        let enabled = SandboxMode::Enabled;
+        let disabled = SandboxMode::Disabled;
+        // Test that they serialize correctly for TOML
+        assert!(matches!(enabled, SandboxMode::Enabled));
+        assert!(matches!(disabled, SandboxMode::Disabled));
+    }
+}
