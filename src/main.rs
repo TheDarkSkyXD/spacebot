@@ -1930,25 +1930,44 @@ async fn run(
                         let channel_store = spacebot::conversation::ChannelSettingsStore::new(
                             agent.deps.sqlite_pool.clone(),
                         );
-                        if let Ok(Some(conv)) =
-                            portal_store.get(&agent_id_str, &conversation_id).await
-                        {
-                            spacebot::conversation::settings::ResolvedConversationSettings::resolve(
-                                conv.settings.as_ref(),
-                                None,
-                                None,
-                            )
-                        } else if let Ok(Some(settings)) =
-                            channel_store.get(&agent_id_str, &conversation_id).await
-                        {
-                            spacebot::conversation::settings::ResolvedConversationSettings::resolve(
-                                Some(&settings),
-                                None,
-                                None,
-                            )
-                        } else {
-                            spacebot::conversation::settings::ResolvedConversationSettings::default(
-                            )
+                        match portal_store.get(&agent_id_str, &conversation_id).await {
+                            Ok(Some(conv)) => {
+                                spacebot::conversation::settings::ResolvedConversationSettings::resolve(
+                                    conv.settings.as_ref(),
+                                    None,
+                                    None,
+                                )
+                            }
+                            Ok(None) => {
+                                match channel_store.get(&agent_id_str, &conversation_id).await {
+                                    Ok(Some(settings)) => {
+                                        spacebot::conversation::settings::ResolvedConversationSettings::resolve(
+                                            Some(&settings),
+                                            None,
+                                            None,
+                                        )
+                                    }
+                                    Ok(None) => {
+                                        spacebot::conversation::settings::ResolvedConversationSettings::default()
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            %conversation_id,
+                                            "idle worker resume: failed to load channel settings, using defaults"
+                                        );
+                                        spacebot::conversation::settings::ResolvedConversationSettings::default()
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    %conversation_id,
+                                    "idle worker resume: failed to load portal settings, using defaults"
+                                );
+                                spacebot::conversation::settings::ResolvedConversationSettings::default()
+                            }
                         }
                     };
 
@@ -2190,9 +2209,13 @@ async fn run(
                                 tracing::warn!(
                                     %error,
                                     %conversation_id,
-                                    "failed to load portal conversation settings, using defaults"
+                                    "failed to load portal conversation settings, falling back to binding defaults"
                                 );
-                                spacebot::conversation::settings::ResolvedConversationSettings::default()
+                                spacebot::conversation::settings::ResolvedConversationSettings::resolve(
+                                    None,
+                                    binding_settings.as_ref(),
+                                    None,
+                                )
                             }
                         }
                     } else {
@@ -2219,9 +2242,13 @@ async fn run(
                                 tracing::warn!(
                                     %error,
                                     %conversation_id,
-                                    "failed to load channel settings, using defaults"
+                                    "failed to load channel settings, falling back to binding defaults"
                                 );
-                                spacebot::conversation::settings::ResolvedConversationSettings::default()
+                                spacebot::conversation::settings::ResolvedConversationSettings::resolve(
+                                    None,
+                                    binding_settings.as_ref(),
+                                    None,
+                                )
                             }
                         }
                     };

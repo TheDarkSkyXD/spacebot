@@ -1093,13 +1093,21 @@ pub(super) async fn update_channel_settings(
     {
         let channel_states = state.channel_states.read().await;
         if let Some(channel_state) = channel_states.get(&channel_id) {
-            let _ = channel_state
-                .deps
-                .event_tx
-                .send(crate::ProcessEvent::SettingsUpdated {
-                    agent_id: channel_state.deps.agent_id.clone(),
-                    channel_id: channel_state.channel_id.clone(),
-                });
+            if let Err(error) =
+                channel_state
+                    .deps
+                    .event_tx
+                    .send(crate::ProcessEvent::SettingsUpdated {
+                        agent_id: channel_state.deps.agent_id.clone(),
+                        channel_id: channel_state.channel_id.clone(),
+                    })
+            {
+                tracing::warn!(
+                    %error,
+                    %channel_id,
+                    "failed to send SettingsUpdated event to channel"
+                );
+            }
         }
     }
 

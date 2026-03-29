@@ -193,12 +193,6 @@ export function WebChatPanel({agentId}: WebChatPanelProps) {
 	const [showSettings, setShowSettings] = useState(false);
 	const [settings, setSettings] = useState<ConversationSettings>({});
 
-	// Reset settings when switching conversations
-	useEffect(() => {
-		setSettings({});
-		setShowSettings(false);
-	}, [activeConversationId, agentId]);
-
 	// Fetch conversations list
 	const { data: conversationsData, isLoading: conversationsLoading } = useQuery({
 		queryKey: ["portal-conversations", agentId],
@@ -210,6 +204,15 @@ export function WebChatPanel({agentId}: WebChatPanelProps) {
 	});
 
 	const conversations = conversationsData?.conversations ?? [];
+
+	// Reset settings when switching conversations, hydrating from cached data if available
+	useEffect(() => {
+		const activeConv = conversations.find(
+			(c: any) => c.id === activeConversationId
+		);
+		setSettings(activeConv?.settings ?? {});
+		setShowSettings(false);
+	}, [activeConversationId, agentId, conversationsData]);
 
 	// Fetch conversation defaults
 	const {data: defaults, isLoading: defaultsLoading, error: defaultsError} = useQuery<ConversationDefaultsResponse>({

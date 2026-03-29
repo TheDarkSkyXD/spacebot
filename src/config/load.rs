@@ -2352,27 +2352,36 @@ impl Config {
                     // Only override enum fields when explicitly set in TOML,
                     // so omitted fields inherit from agent/system defaults.
                     if let Some(m) = s.memory.as_deref() {
-                        cs.memory = match m {
-                            "ambient" => MemoryMode::Ambient,
-                            "off" => MemoryMode::Off,
-                            "full" => MemoryMode::Full,
-                            _ => MemoryMode::Full,
-                        };
+                        match m {
+                            "ambient" => cs.memory = MemoryMode::Ambient,
+                            "off" => cs.memory = MemoryMode::Off,
+                            "full" => cs.memory = MemoryMode::Full,
+                            other => tracing::warn!(
+                                value = other,
+                                "unknown memory mode in binding settings, ignoring"
+                            ),
+                        }
                     }
                     if let Some(d) = s.delegation.as_deref() {
-                        cs.delegation = match d {
-                            "direct" => DelegationMode::Direct,
-                            "standard" => DelegationMode::Standard,
-                            _ => DelegationMode::Standard,
-                        };
+                        match d {
+                            "direct" => cs.delegation = DelegationMode::Direct,
+                            "standard" => cs.delegation = DelegationMode::Standard,
+                            other => tracing::warn!(
+                                value = other,
+                                "unknown delegation mode in binding settings, ignoring"
+                            ),
+                        }
                     }
                     if let Some(r) = s.response_mode.as_deref() {
-                        cs.response_mode = match r {
-                            "quiet" => ResponseMode::Quiet,
-                            "mention_only" => ResponseMode::MentionOnly,
-                            "active" => ResponseMode::Active,
-                            _ => ResponseMode::Active,
-                        };
+                        match r {
+                            "quiet" => cs.response_mode = ResponseMode::Quiet,
+                            "mention_only" => cs.response_mode = ResponseMode::MentionOnly,
+                            "active" => cs.response_mode = ResponseMode::Active,
+                            other => tracing::warn!(
+                                value = other,
+                                "unknown response_mode in binding settings, ignoring"
+                            ),
+                        }
                     }
                     cs
                 });

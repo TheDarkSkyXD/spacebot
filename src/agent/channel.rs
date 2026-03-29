@@ -649,14 +649,29 @@ impl Channel {
                 crate::conversation::PortalConversationStore::new(self.deps.sqlite_pool.clone());
             match store.get(&agent_id, channel_id).await {
                 Ok(Some(conv)) => conv.settings,
-                _ => None,
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        channel_id = %self.id,
+                        "failed to reload portal settings, preserving existing"
+                    );
+                    return;
+                }
             }
         } else {
             let store =
                 crate::conversation::ChannelSettingsStore::new(self.deps.sqlite_pool.clone());
             match store.get(&agent_id, channel_id).await {
                 Ok(settings) => settings,
-                Err(_) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        channel_id = %self.id,
+                        "failed to reload channel settings, preserving existing"
+                    );
+                    return;
+                }
             }
         };
 
@@ -688,23 +703,36 @@ impl Channel {
     async fn set_response_mode(&mut self, mode: ResponseMode) {
         self.resolved_settings.response_mode = mode;
 
-        // Persist to channel_settings table
-        let store = crate::conversation::ChannelSettingsStore::new(self.deps.sqlite_pool.clone());
-        let settings = crate::conversation::ConversationSettings {
-            response_mode: mode,
-            ..Default::default()
-        };
-        if let Err(error) = store
-            .upsert(&self.deps.agent_id, self.id.as_ref(), &settings)
-            .await
-        {
-            tracing::warn!(
-                %error,
-                channel_id = %self.id,
-                ?mode,
-                "failed to persist response_mode to channel_settings"
-            );
-        }
+        // Persist to channel_settings table — load existing settings first so we
+        // don't overwrite other fields, then spawn the DB write to avoid blocking.
+        let pool = self.deps.sqlite_pool.clone();
+        let agent_id = self.deps.agent_id.clone();
+        let channel_id: String = self.id.as_ref().to_owned();
+        tokio::spawn(async move {
+            let store = crate::conversation::ChannelSettingsStore::new(pool);
+            let mut settings = match store.get(&agent_id, &channel_id).await {
+                Ok(Some(existing)) => existing,
+                Ok(None) => crate::conversation::ConversationSettings::default(),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %channel_id,
+                        ?mode,
+                        "failed to load existing settings before persisting response_mode"
+                    );
+                    crate::conversation::ConversationSettings::default()
+                }
+            };
+            settings.response_mode = mode;
+            if let Err(error) = store.upsert(&agent_id, &channel_id, &settings).await {
+                tracing::warn!(
+                    %error,
+                    %channel_id,
+                    ?mode,
+                    "failed to persist response_mode to channel_settings"
+                );
+            }
+        });
     }
 
     fn persist_inbound_user_message(
@@ -947,7 +975,8 @@ impl Channel {
                     "- /today: in-progress + ready task snapshot".to_string(),
                     "- /tasks: ready task list".to_string(),
                     "- /digest: one-shot day digest (00:00 -> now)".to_string(),
-                    "- /quiet: listen-only mode".to_string(),
+                    "- /quiet: only reply to commands, @mentions, or replies".to_string(),
+                    "- /mention-only: only respond when @mentioned or replied to".to_string(),
                     "- /active: normal reply mode".to_string(),
                     "- /agent-id: runtime agent id".to_string(),
                 ];

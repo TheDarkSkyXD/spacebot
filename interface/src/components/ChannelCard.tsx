@@ -107,10 +107,10 @@ export function ChannelCard({
 	});
 
 	useEffect(() => {
-		if (channelSettingsData?.settings) {
-			setSettings(channelSettingsData.settings);
+		if (showSettings) {
+			setSettings(channelSettingsData?.settings ?? {});
 		}
-	}, [channelSettingsData]);
+	}, [channelSettingsData, showSettings]);
 
 	const deleteChannel = useMutation({
 		mutationFn: () => api.deleteChannel(channel.agent_id, channel.id),
@@ -124,6 +124,7 @@ export function ChannelCard({
 		},
 		onSuccess: () => {
 			queryClient.invalidateQueries({ queryKey: ["channel-settings", channel.id] });
+			queryClient.invalidateQueries({ queryKey: ["channels"] });
 			setShowSettings(false);
 		},
 	});
