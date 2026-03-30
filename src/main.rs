@@ -285,16 +285,9 @@ fn forward_sse_event(
                 .ok();
         }
         spacebot::OutboundResponse::RichMessage { text, cards, .. } => {
-            // Flatten card content into the text so the webchat frontend
-            // (which doesn't support rich embeds) shows the full response.
-            let card_text = spacebot::OutboundResponse::text_from_cards(cards);
-            let full_text = if card_text.is_empty() {
-                text.clone()
-            } else if text.trim().is_empty() {
-                card_text
-            } else {
-                format!("{}\n\n{}", text, card_text)
-            };
+            // Flatten card content so SSE consumers (dashboard and webchat),
+            // which don't render rich embeds, see the full response.
+            let full_text = spacebot::OutboundResponse::text_with_cards(text, cards);
             api_event_tx
                 .send(spacebot::api::ApiEvent::OutboundMessage {
                     agent_id: agent_id.to_string(),

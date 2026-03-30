@@ -473,18 +473,10 @@ impl Tool for ReplyTool {
             OutboundResponse::Text(converted_content.clone())
         };
 
-        // For the conversation log, include flattened card content so that
-        // the webchat history (which doesn't support rich embeds) shows the
-        // full response when messages are loaded from the database.
+        // For the conversation log, flatten card content so consumers of
+        // stored history (including webchat) see the full response.
         let logged_content = if let OutboundResponse::RichMessage { cards, .. } = &response {
-            let card_text = OutboundResponse::text_from_cards(cards);
-            if card_text.is_empty() {
-                converted_content.clone()
-            } else if converted_content.trim().is_empty() {
-                card_text
-            } else {
-                format!("{}\n\n{}", converted_content, card_text)
-            }
+            OutboundResponse::text_with_cards(&converted_content, cards)
         } else {
             converted_content.clone()
         };
