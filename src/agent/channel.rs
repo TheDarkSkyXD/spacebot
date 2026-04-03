@@ -64,6 +64,39 @@ struct PendingResult {
 }
 
 const EVENT_LAG_WARNING_INTERVAL_SECS: u64 = 30;
+const DECISION_MARKERS: &[&str] = &[
+    "we decided to ",
+    "i decided to ",
+    "decision:",
+    "the decision is ",
+    "approved: ",
+    "approved to ",
+    "moving forward with ",
+    "move forward with ",
+    "going with ",
+    "switching to ",
+    "we will use ",
+    "i will use ",
+    "we'll use ",
+    "i'll use ",
+    "we will switch to ",
+    "i will switch to ",
+    "we'll switch to ",
+    "i'll switch to ",
+    "we will proceed with ",
+    "i will proceed with ",
+    "we'll proceed with ",
+    "i'll proceed with ",
+];
+const CHANGE_COMPARISON_VERBS: &[&str] = &[
+    "use ",
+    "switch",
+    "adopt ",
+    "choose ",
+    "pick ",
+    "go with ",
+    "proceed with ",
+];
 
 async fn recv_channel_event(
     event_rx: &mut broadcast::Receiver<ProcessEvent>,
@@ -86,23 +119,15 @@ fn should_flush_coalesce_buffer_for_event(event: &ProcessEvent) -> bool {
     )
 }
 
-fn sentence_contains_decision_marker(sentence: &str, explicit_markers: &[&str]) -> bool {
+fn sentence_contains_decision_marker(sentence: &str) -> bool {
     let sentence_lower = sentence.to_ascii_lowercase();
-    explicit_markers
+    DECISION_MARKERS
         .iter()
         .any(|marker| sentence_lower.contains(marker))
         || (sentence_lower.contains(" instead of ")
-            && [
-                "use ",
-                "switch",
-                "adopt ",
-                "choose ",
-                "pick ",
-                "go with ",
-                "proceed with ",
-            ]
-            .iter()
-            .any(|marker| sentence_lower.contains(marker)))
+            && CHANGE_COMPARISON_VERBS
+                .iter()
+                .any(|marker| sentence_lower.contains(marker)))
 }
 
 fn extract_decision_summary_from_reply(reply_text: &str) -> Option<String> {
@@ -113,43 +138,11 @@ fn extract_decision_summary_from_reply(reply_text: &str) -> Option<String> {
     }
 
     let lower = trimmed.to_ascii_lowercase();
-    let explicit_markers = [
-        "we decided to ",
-        "i decided to ",
-        "decision:",
-        "the decision is ",
-        "approved: ",
-        "approved to ",
-        "moving forward with ",
-        "move forward with ",
-        "going with ",
-        "switching to ",
-        "we will use ",
-        "i will use ",
-        "we'll use ",
-        "i'll use ",
-        "we will switch to ",
-        "i will switch to ",
-        "we'll switch to ",
-        "i'll switch to ",
-        "we will proceed with ",
-        "i will proceed with ",
-        "we'll proceed with ",
-        "i'll proceed with ",
-    ];
-    let has_explicit_marker = explicit_markers.iter().any(|marker| lower.contains(marker));
+    let has_explicit_marker = DECISION_MARKERS.iter().any(|marker| lower.contains(marker));
     let has_change_comparison = lower.contains(" instead of ")
-        && [
-            "use ",
-            "switch",
-            "adopt ",
-            "choose ",
-            "pick ",
-            "go with ",
-            "proceed with ",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker));
+        && CHANGE_COMPARISON_VERBS
+            .iter()
+            .any(|marker| lower.contains(marker));
 
     if !has_explicit_marker && !has_change_comparison {
         return None;
@@ -164,7 +157,7 @@ fn extract_decision_summary_from_reply(reply_text: &str) -> Option<String> {
     let mut summary = sentences
         .iter()
         .copied()
-        .find(|sentence| sentence_contains_decision_marker(sentence, &explicit_markers))
+        .find(|sentence| sentence_contains_decision_marker(sentence))
         .or_else(|| sentences.first().copied())
         .unwrap_or(trimmed)
         .trim()
@@ -194,6 +187,14 @@ fn decision_user_id(
     }
 
     Some(participant_memory_key(humans, source, &message.sender_id))
+}
+
+struct AgentTurnResult {
+    result: std::result::Result<String, rig::completion::PromptError>,
+    skip_flag: crate::tools::SkipFlag,
+    replied_flag: crate::tools::RepliedFlag,
+    retrigger_reply_preserved: bool,
+    reply_text: Option<String>,
 }
 
 /// Shared state that channel tools need to act on the channel.
@@ -1668,7 +1669,7 @@ impl Channel {
         }
 
         // Run agent turn with any image/audio attachments preserved
-        let (result, skip_flag, replied_flag, _, reply_text) = self
+        let turn_result = self
             .run_agent_turn(
                 &combined_text,
                 &system_prompt,
@@ -1679,10 +1680,18 @@ impl Channel {
             )
             .await?;
 
-        self.handle_agent_result(result, &skip_flag, &replied_flag, false)
-            .await;
-        if replied_flag.load(std::sync::atomic::Ordering::Relaxed) {
-            self.record_decision_event(reply_text.as_deref(), None);
+        self.handle_agent_result(
+            turn_result.result,
+            &turn_result.skip_flag,
+            &turn_result.replied_flag,
+            false,
+        )
+        .await;
+        if turn_result
+            .replied_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.record_decision_event(turn_result.reply_text.as_deref(), None);
         }
         // Check compaction
         if let Err(error) = self.compactor.check_and_compact().await {
@@ -1745,6 +1754,7 @@ impl Channel {
             .and_then(|adapter| prompt_engine.render_channel_adapter_prompt(adapter));
 
         let empty_to_none = |s: String| if s.is_empty() { None } else { Some(s) };
+        let non_empty_option = |value: Option<String>| value.filter(|text| !text.is_empty());
 
         let project_context = self.build_project_context(&prompt_engine).await;
 
@@ -1762,8 +1772,8 @@ impl Channel {
 
         let system_prompt = prompt_engine.render_channel_prompt_with_links(
             empty_to_none(identity_context),
-            memory_bulletin_text,
-            knowledge_synthesis_text,
+            non_empty_option(memory_bulletin_text),
+            non_empty_option(knowledge_synthesis_text),
             empty_to_none(skills_prompt),
             worker_capabilities,
             self.conversation_context.clone(),
@@ -2043,7 +2053,7 @@ impl Channel {
             .adapter
             .as_deref()
             .or_else(|| self.current_adapter());
-        let (result, skip_flag, replied_flag, retrigger_reply_preserved, reply_text) = self
+        let turn_result = self
             .run_agent_turn(
                 &user_text,
                 &system_prompt,
@@ -2054,13 +2064,21 @@ impl Channel {
             )
             .await?;
 
-        self.handle_agent_result(result, &skip_flag, &replied_flag, is_retrigger)
-            .await;
+        self.handle_agent_result(
+            turn_result.result,
+            &turn_result.skip_flag,
+            &turn_result.replied_flag,
+            is_retrigger,
+        )
+        .await;
 
-        if replied_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        if turn_result
+            .replied_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let humans = self.deps.humans.load();
             let user_id = decision_user_id(humans.as_ref(), &message, is_retrigger);
-            self.record_decision_event(reply_text.as_deref(), user_id);
+            self.record_decision_event(turn_result.reply_text.as_deref(), user_id);
         }
 
         // Safety-net: in mention-only mode, explicit mention/reply should never be dropped silently.
@@ -2072,8 +2090,12 @@ impl Channel {
                 invoked_by_command,
                 invoked_by_mention,
                 invoked_by_reply,
-                skip_flag: skip_flag.load(std::sync::atomic::Ordering::Relaxed),
-                replied_flag: replied_flag.load(std::sync::atomic::Ordering::Relaxed),
+                skip_flag: turn_result
+                    .skip_flag
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                replied_flag: turn_result
+                    .replied_flag
+                    .load(std::sync::atomic::Ordering::Relaxed),
             },
         ) {
             self.send_builtin_text(
@@ -2096,8 +2118,10 @@ impl Channel {
         // reply content payload, this fallback preserves a compact background
         // result record for the next user turn.
         if is_retrigger {
-            let replied = replied_flag.load(std::sync::atomic::Ordering::Relaxed);
-            if replied && retrigger_reply_preserved {
+            let replied = turn_result
+                .replied_flag
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if replied && turn_result.retrigger_reply_preserved {
                 tracing::debug!(
                     channel_id = %self.id,
                     "skipping retrigger summary injection; relay reply already preserved"
@@ -2563,7 +2587,6 @@ impl Channel {
     /// Register per-turn tools, run the LLM agentic loop, and clean up.
     ///
     /// Returns the prompt result and per-turn flags for the caller to dispatch.
-    #[allow(clippy::type_complexity)]
     #[tracing::instrument(skip(self, user_text, system_prompt, attachment_content), fields(channel_id = %self.id, agent_id = %self.deps.agent_id))]
     async fn run_agent_turn(
         &self,
@@ -2573,13 +2596,7 @@ impl Channel {
         attachment_content: Vec<UserContent>,
         is_retrigger: bool,
         adapter: Option<&str>,
-    ) -> Result<(
-        std::result::Result<String, rig::completion::PromptError>,
-        crate::tools::SkipFlag,
-        crate::tools::RepliedFlag,
-        bool,
-        Option<String>,
-    )> {
+    ) -> Result<AgentTurnResult> {
         let skip_flag = crate::tools::new_skip_flag();
         let replied_flag = crate::tools::new_replied_flag();
         let allow_direct_reply = !self.suppress_plaintext_fallback();
@@ -2777,13 +2794,13 @@ impl Channel {
             tracing::warn!(%error, "failed to remove channel tools");
         }
 
-        Ok((
+        Ok(AgentTurnResult {
             result,
             skip_flag,
             replied_flag,
-            applied_history.retrigger_reply_preserved,
-            applied_history.reply_text,
-        ))
+            retrigger_reply_preserved: applied_history.retrigger_reply_preserved,
+            reply_text: applied_history.reply_text,
+        })
     }
 
     /// Send outbound text and record send metrics.

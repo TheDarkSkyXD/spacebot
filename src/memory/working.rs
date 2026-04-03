@@ -761,10 +761,6 @@ pub async fn render_participant_context(
     }
 
     let now = Utc::now();
-    if participants.is_empty() {
-        return Ok(String::new());
-    }
-
     let mut output = String::new();
     writeln!(output, "## Participants\n").ok();
 
