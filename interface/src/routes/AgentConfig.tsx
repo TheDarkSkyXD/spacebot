@@ -1221,12 +1221,7 @@ function ConfigSectionEditor({ sectionId, label, description, detail, config, on
 			case "channel":
 				return (
 					<div className="grid gap-4">
-						<ConfigToggleField
-							label="Listen-Only Mode"
-							description="Only respond when explicitly invoked (slash command, @mention, or reply-to-bot)."
-							value={localValues.listen_only_mode as boolean}
-							onChange={(v) => handleChange("listen_only_mode", v)}
-						/>
+						<p className="text-sm text-ink-faint">Channel behavior is now configured per-channel via response modes in Channel Settings.</p>
 					</div>
 				);
 			case "projects":

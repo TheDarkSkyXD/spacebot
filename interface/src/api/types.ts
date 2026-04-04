@@ -134,7 +134,7 @@ export type ConversationSettings = {
 	model_overrides?: ModelOverrides;
 	memory?: "full" | "ambient" | "off";
 	delegation?: "standard" | "direct";
-	response_mode?: "active" | "quiet" | "mention_only";
+	response_mode?: "active" | "observe" | "mention_only";
 	save_attachments?: boolean;
 	worker_context?: {
 		history?: "none" | "summary" | "recent" | "full";

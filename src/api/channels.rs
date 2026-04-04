@@ -144,7 +144,7 @@ pub(super) async fn list_channels(
                     let settings = &cs.model_overrides;
                     let mode = match settings.response_mode {
                         crate::conversation::ResponseMode::Active => None,
-                        crate::conversation::ResponseMode::Quiet => Some("quiet".to_string()),
+                        crate::conversation::ResponseMode::Observe => Some("observe".to_string()),
                         crate::conversation::ResponseMode::MentionOnly => {
                             Some("mention_only".to_string())
                         }

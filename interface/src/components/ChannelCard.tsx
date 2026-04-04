@@ -160,9 +160,9 @@ export function ChannelCard({
 						<span className="text-tiny text-ink-faint">
 							{formatTimeAgo(channel.last_activity_at)}
 						</span>
-						{channel.response_mode === "quiet" && (
+						{channel.response_mode === "observe" && (
 							<span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-tiny font-medium text-amber-400">
-								Quiet
+								Observe
 							</span>
 						)}
 						{channel.response_mode === "mention_only" && (

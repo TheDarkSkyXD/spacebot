@@ -22,7 +22,7 @@ Controls when the agent responds to messages.
 | Mode | Behavior |
 |------|----------|
 | **Active** (default) | Responds to all messages normally. |
-| **Quiet** | Observes and learns from the conversation (history + memory persistence), but only responds when @mentioned, replied to, or given a command. |
+| **Observe** | Learns from the conversation passively — never responds, even when mentioned. All messages are ingested into context and memory. Use this for channels the agent should monitor without participating. |
 | **Mention Only** | Messages are still visible to the agent for context, but it only responds when @mentioned, replied to, or given a command. Memory capture continues passively. |
 
 #### Mention Only vs. Binding-Level Require Mention
@@ -116,7 +116,7 @@ Some settings can be toggled at runtime via slash commands in chat:
 | Command | Effect |
 |---------|--------|
 | `/active` | Switch to Active response mode |
-| `/quiet` | Switch to Quiet response mode |
+| `/observe` | Switch to Observe response mode |
 | `/mention-only` | Switch to Mention Only response mode |
 
 These persist to the channel's settings and survive restarts.

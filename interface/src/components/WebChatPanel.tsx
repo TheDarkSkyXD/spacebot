@@ -336,9 +336,9 @@ export function WebChatPanel({agentId}: WebChatPanelProps) {
 									?? settings.model ?? defaults.model}
 							</span>
 						)}
-						{settings.response_mode === "quiet" && (
+						{settings.response_mode === "observe" && (
 							<span className="rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
-								Quiet
+								Observe
 							</span>
 						)}
 						{settings.response_mode === "mention_only" && (

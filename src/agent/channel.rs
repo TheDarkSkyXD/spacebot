@@ -694,7 +694,7 @@ impl Channel {
         self.resolved_settings = resolved;
     }
 
-    /// Whether the channel is in a non-active response mode (Quiet or MentionOnly).
+    /// Whether the channel is in a non-active response mode (Observe or MentionOnly).
     fn is_suppressed(&self) -> bool {
         !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
     }
@@ -917,7 +917,7 @@ impl Channel {
                     .unwrap_or_else(|| routing.resolve(ProcessType::Branch, None));
                 let mode = match self.resolved_settings.response_mode {
                     ResponseMode::Active => "active",
-                    ResponseMode::Quiet => "quiet (only command/@mention/reply)",
+                    ResponseMode::Observe => "observe (learning, never responds)",
                     ResponseMode::MentionOnly => "mention-only (@mention/reply only)",
                 };
                 let adapter = self.current_adapter().unwrap_or("unknown");
@@ -941,11 +941,11 @@ impl Channel {
                 self.send_builtin_text(body, "status").await;
                 return Ok(true);
             }
-            "/quiet" => {
-                self.set_response_mode(ResponseMode::Quiet).await;
+            "/quiet" | "/observe" => {
+                self.set_response_mode(ResponseMode::Observe).await;
                 self.send_builtin_text(
-                    "quiet mode enabled. i'll only reply to commands, @mentions, or replies to my message.".to_string(),
-                    "quiet",
+                    "observe mode enabled. i'll learn from this conversation but won't respond.".to_string(),
+                    "observe",
                 ).await;
                 return Ok(true);
             }
@@ -975,8 +975,8 @@ impl Channel {
                     "- /today: in-progress + ready task snapshot".to_string(),
                     "- /tasks: ready task list".to_string(),
                     "- /digest: one-shot day digest (00:00 -> now)".to_string(),
-                    "- /quiet: only reply to commands, @mentions, or replies".to_string(),
-                    "- /mention-only: only respond when @mentioned or replied to".to_string(),
+                    "- /observe: learn from conversation, never respond".to_string(),
+                    "- /mention-only: only respond when @mentioned, replied to, or given a command".to_string(),
                     "- /active: normal reply mode".to_string(),
                     "- /agent-id: runtime agent id".to_string(),
                 ];
@@ -1418,37 +1418,36 @@ impl Channel {
             }
         }
 
-        if !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
-            && !batch_has_invoke
-            && !self.is_dm()
-        {
+        // Observe mode: always suppress (even with mentions in batch).
+        // MentionOnly mode: suppress only when no invocations in the batch.
+        let should_suppress_batch = !self.is_dm()
+            && match self.resolved_settings.response_mode {
+                ResponseMode::Active => false,
+                ResponseMode::Observe => true,
+                ResponseMode::MentionOnly => !batch_has_invoke,
+            };
+
+        if should_suppress_batch {
             tracing::debug!(
                 channel_id = %self.id,
                 message_count,
                 response_mode = ?self.resolved_settings.response_mode,
                 "suppressing unsolicited coalesced batch"
             );
-            // In MentionOnly mode, inject batch messages into in-memory history
-            // so the LLM retains channel context when eventually triggered.
-            if matches!(
-                self.resolved_settings.response_mode,
-                ResponseMode::MentionOnly
-            ) {
-                {
-                    let mut history = self.state.history.write().await;
-                    for (formatted_text, _, _) in &pending_batch_entries {
-                        history.push(rig::message::Message::User {
-                            content: OneOrMany::one(UserContent::text(formatted_text)),
-                        });
-                    }
-                }
-                // Compaction guard: suppressed messages accumulate in history
-                // without agent turns, so check compaction to prevent unbounded growth.
-                if let Err(error) = self.compactor.check_and_compact().await {
-                    tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
+            // Inject batch messages into in-memory history so the agent
+            // retains channel context.
+            {
+                let mut history = self.state.history.write().await;
+                for (formatted_text, _, _) in &pending_batch_entries {
+                    history.push(rig::message::Message::User {
+                        content: OneOrMany::one(UserContent::text(formatted_text)),
+                    });
                 }
             }
-            // Both Quiet and MentionOnly keep passive memory capture.
+            if let Err(error) = self.compactor.check_and_compact().await {
+                tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
+            }
+            // Both Observe and MentionOnly keep passive memory capture.
             self.message_count += message_count;
             self.check_memory_persistence().await;
             return Ok(());
@@ -1798,9 +1797,12 @@ impl Channel {
             }
         }
 
-        // Deterministic ping ack for Discord quiet-mode mentions/replies to avoid
+        // Deterministic ping ack for Discord mention-only mentions/replies to avoid
         // flaky model behavior (e.g. skipping or over-formatting simple liveness checks).
-        if should_send_discord_quiet_mode_ping_ack(&message, &raw_text, self.is_suppressed()) {
+        // Skipped in Observe mode — the agent never responds in Observe.
+        if !matches!(self.resolved_settings.response_mode, ResponseMode::Observe)
+            && should_send_discord_quiet_mode_ping_ack(&message, &raw_text, self.is_suppressed())
+        {
             self.send_builtin_text("yeah i'm here".to_string(), "discord-ping")
                 .await;
             return Ok(());
@@ -1848,40 +1850,41 @@ impl Channel {
         let mut invoked_by_reply = false;
 
         // Response mode guardrail:
-        // In Quiet/MentionOnly modes, ingest messages but only reply when explicitly invoked.
+        // Observe mode: always suppress — agent learns but never responds.
+        // MentionOnly mode: suppress unless explicitly invoked.
         if !matches!(self.resolved_settings.response_mode, ResponseMode::Active)
             && message.source != "system"
             && !self.is_dm()
         {
-            (invoked_by_command, invoked_by_mention, invoked_by_reply) =
-                self.compute_listen_mode_invocation(&message, &raw_text);
+            // Observe mode always suppresses; MentionOnly checks for invocation.
+            let should_suppress =
+                if matches!(self.resolved_settings.response_mode, ResponseMode::Observe) {
+                    true
+                } else {
+                    (invoked_by_command, invoked_by_mention, invoked_by_reply) =
+                        self.compute_listen_mode_invocation(&message, &raw_text);
+                    !invoked_by_command && !invoked_by_mention && !invoked_by_reply
+                };
 
-            if !invoked_by_command && !invoked_by_mention && !invoked_by_reply {
+            if should_suppress {
                 tracing::debug!(
                     channel_id = %self.id,
                     source = %message.source,
                     response_mode = ?self.resolved_settings.response_mode,
                     "suppressing unsolicited reply"
                 );
-                // In MentionOnly mode, inject the message into in-memory history
-                // so the LLM retains channel context when eventually triggered.
-                if matches!(
-                    self.resolved_settings.response_mode,
-                    ResponseMode::MentionOnly
-                ) {
-                    {
-                        let mut history = self.state.history.write().await;
-                        history.push(rig::message::Message::User {
-                            content: OneOrMany::one(UserContent::text(&user_text)),
-                        });
-                    }
-                    // Compaction guard: suppressed messages accumulate in history
-                    // without agent turns, so check compaction to prevent unbounded growth.
-                    if let Err(error) = self.compactor.check_and_compact().await {
-                        tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
-                    }
+                // In Observe and MentionOnly modes, inject the message into
+                // in-memory history so the agent retains channel context.
+                {
+                    let mut history = self.state.history.write().await;
+                    history.push(rig::message::Message::User {
+                        content: OneOrMany::one(UserContent::text(&user_text)),
+                    });
                 }
-                // Both Quiet and MentionOnly keep passive memory capture.
+                if let Err(error) = self.compactor.check_and_compact().await {
+                    tracing::warn!(channel_id = %self.id, %error, "compaction check failed");
+                }
+                // Both Observe and MentionOnly keep passive memory capture.
                 self.message_count += 1;
                 self.check_memory_persistence().await;
                 return Ok(());
@@ -1948,10 +1951,10 @@ impl Channel {
         self.handle_agent_result(result, &skip_flag, &replied_flag, is_retrigger)
             .await;
 
-        // Safety-net: in quiet mode, explicit mention/reply should never be dropped silently.
+        // Safety-net: in mention-only mode, explicit mention/reply should never be dropped silently.
         if should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
+            ObserveModeFallbackState {
                 is_suppressed: self.is_suppressed(),
                 is_retrigger,
                 invoked_by_command,
@@ -3626,7 +3629,7 @@ fn should_send_discord_quiet_mode_ping_ack(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct QuietModeFallbackState {
+struct ObserveModeFallbackState {
     is_suppressed: bool,
     is_retrigger: bool,
     invoked_by_command: bool,
@@ -3638,7 +3641,7 @@ struct QuietModeFallbackState {
 
 fn should_send_quiet_mode_fallback(
     message: &InboundMessage,
-    state: QuietModeFallbackState,
+    state: ObserveModeFallbackState,
 ) -> bool {
     state.is_suppressed
         && !state.is_retrigger
@@ -3668,7 +3671,7 @@ fn is_dm_conversation_id(conv_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        QuietModeFallbackState, compute_listen_mode_invocation, is_dm_conversation_id,
+        ObserveModeFallbackState, compute_listen_mode_invocation, is_dm_conversation_id,
         recv_channel_event, should_process_event_for_channel,
         should_send_discord_quiet_mode_ping_ack, should_send_quiet_mode_fallback,
     };
@@ -3896,7 +3899,7 @@ mod tests {
 
         assert!(should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
+            ObserveModeFallbackState {
                 is_suppressed: true,
                 is_retrigger: false,
                 invoked_by_command: false,
@@ -3908,7 +3911,7 @@ mod tests {
         ));
         assert!(!should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
+            ObserveModeFallbackState {
                 is_suppressed: true,
                 is_retrigger: false,
                 invoked_by_command: false,
@@ -3920,7 +3923,7 @@ mod tests {
         ));
         assert!(!should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
+            ObserveModeFallbackState {
                 is_suppressed: true,
                 is_retrigger: false,
                 invoked_by_command: false,
@@ -3932,7 +3935,7 @@ mod tests {
         ));
         assert!(!should_send_quiet_mode_fallback(
             &message,
-            QuietModeFallbackState {
+            ObserveModeFallbackState {
                 is_suppressed: true,
                 is_retrigger: true,
                 invoked_by_command: false,

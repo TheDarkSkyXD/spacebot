@@ -116,9 +116,12 @@ pub enum ResponseMode {
     /// Respond to all messages normally.
     #[default]
     Active,
-    /// Observe and learn (history + memory persistence) but only respond
-    /// to @mentions, replies-to-bot, and slash commands.
-    Quiet,
+    /// Observe only — never respond, even when mentioned or replied to.
+    /// All messages are ingested into in-memory context and conversation
+    /// history, and passive memory capture continues. The agent learns
+    /// from the conversation but never generates a response.
+    #[serde(alias = "quiet")]
+    Observe,
     /// Only respond when explicitly @mentioned, replied to, or given a command.
     /// Messages that don't pass the mention check are still ingested into
     /// the in-memory context window (so the agent stays context-aware),
