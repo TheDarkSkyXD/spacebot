@@ -34,7 +34,7 @@ export function SkillsSidebar({
 	const virtualizer = useVirtualizer({
 		count: installedSkills.length,
 		getScrollElement: () => scrollRef.current,
-		estimateSize: () => 52,
+		estimateSize: () => 40,
 		overscan: 5,
 	});
 

@@ -58,12 +58,12 @@ bundle-sidecar:
     ./scripts/bundle-sidecar.sh --release
 
 # Run the desktop app in development mode.
-# Tauri's beforeDevCommand handles sidecar bundling and Vite automatically.
+# The desktop package script pre-bundles the sidecar, and Tauri starts Vite.
 desktop-dev:
     cd desktop && bun run tauri:dev
 
 # Build the full desktop app (sidecar + frontend + Tauri bundle).
-# Tauri's beforeBuildCommand handles sidecar bundling and frontend build automatically.
+# The desktop package script pre-bundles the sidecar, and Tauri builds the frontend.
 desktop-build:
     cd desktop && bun run tauri:build
 

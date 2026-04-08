@@ -100,7 +100,7 @@ export function GithubMetadataBadges({
               className="inline-flex"
               onClick={(event) => event.stopPropagation()}
             >
-              <Badge variant="blue" size="sm" className={className}>
+              <Badge variant="info" size="sm" className={className}>
                 {content}
               </Badge>
             </a>
@@ -110,7 +110,7 @@ export function GithubMetadataBadges({
         return (
           <Badge
             key={`${reference.kind}-${reference.label}`}
-            variant="blue"
+            variant="info"
             size="sm"
           >
             {content}

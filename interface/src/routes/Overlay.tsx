@@ -14,7 +14,12 @@ import {useTtsPlayback} from "@/hooks/useTtsPlayback";
 import {getPortalSessionId} from "@/hooks/usePortal";
 import {useEventSource} from "@/hooks/useEventSource";
 import {cx} from "class-variance-authority";
-import {IS_TAURI, resizeWindow, listen as platformListen} from "@/platform";
+import {
+	dragRegionAttributes,
+	IS_DESKTOP,
+	resizeWindow,
+	listen as platformListen,
+} from "@/platform";
 
 const Orb = lazy(() => import("@/components/Orb"));
 
@@ -83,7 +88,7 @@ export function Overlay() {
 	// Measure actual content height and ask the host to resize the window.
 	// The frontend is the single source of truth for layout dimensions.
 	useEffect(() => {
-		if (!IS_TAURI) return;
+		if (!IS_DESKTOP) return;
 		const element = containerRef.current;
 		if (!element) return;
 
@@ -247,7 +252,7 @@ export function Overlay() {
 	}, [recorderState, stopRecording, agentId, sessionId]);
 
 	useEffect(() => {
-		if (!IS_TAURI) return;
+		if (!IS_DESKTOP) return;
 
 		let disposed = false;
 		let unlistenStart: null | (() => void) = null;
@@ -438,6 +443,7 @@ export function Overlay() {
 
 			{/* Pill */}
 			<div
+				{...dragRegionAttributes()}
 				className={cx(
 					"voice-overlay-pill mb-2 flex w-full max-w-[460px] cursor-pointer items-center gap-2.5 overflow-hidden rounded-[20px] border px-3 py-2 shadow-2xl backdrop-blur-xl transition-all",
 					voiceState === "recording"
@@ -446,7 +452,6 @@ export function Overlay() {
 							? "border-violet-300/35 bg-violet-400/10"
 							: "border-white/10 bg-app-dark-box/95",
 				)}
-				data-tauri-drag-region
 				onClick={() => {
 					if (voiceState === "idle") setExpanded(!expanded);
 				}}

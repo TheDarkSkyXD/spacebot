@@ -1,5 +1,10 @@
 //! Cortex chat: persistent admin conversation with the cortex.
 //!
+//! **DEPRECATED:** Cortex chat is being replaced by per-channel settings
+//! (Channel Settings UI) which provide fine-grained control. Remaining
+//! functionality (skills_search, install_skill, config_inspect, etc.) is
+//! being ported to channel/worker toolsets. Do not add new features here.
+//!
 //! One session per agent. The admin talks to the cortex interactively,
 //! with the full toolset (memory, shell, file, browser, web search).
 //! When opened on a channel page, the channel's recent history is injected

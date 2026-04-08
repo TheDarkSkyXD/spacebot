@@ -32,7 +32,7 @@ const PAGE_TYPE_LABELS: Record<WikiPageType, string> = {
 
 function WikiMarkdown({ content, onNavigate }: { content: string; onNavigate: (slug: string) => void }) {
 	return (
-		<div className="markdown">
+		<div className="markdown text-xs">
 			<ReactMarkdown
 				remarkPlugins={[remarkGfm]}
 				rehypePlugins={[rehypeRaw]}
@@ -202,7 +202,7 @@ function PageDetail({ slug, onBack, onNavigate }: { slug: string; onBack: () => 
 					<ArrowLeft className="size-4" />
 				</button>
 				<div className="flex-1 min-w-0">
-					<h1 className="text-base font-semibold text-ink truncate">{page.title}</h1>
+					<h1 className="text-sm font-semibold text-ink truncate">{page.title}</h1>
 					<div className="flex items-center gap-2 text-xs text-ink-dull">
 						<span className="rounded bg-app-selected/40 px-1.5 py-0.5 capitalize">{page.page_type}</span>
 						<span>v{page.version}</span>
@@ -239,24 +239,26 @@ function PageDetail({ slug, onBack, onNavigate }: { slug: string; onBack: () => 
 				</div>
 			) : (
 				<div className="flex-1 overflow-y-auto p-4">
-					<WikiMarkdown content={page.content} onNavigate={onNavigate} />
+					<div className="mx-auto max-w-2xl">
+						<WikiMarkdown content={page.content} onNavigate={onNavigate} />
 
-					{page.related.length > 0 && (
-						<div className="mt-6 border-t border-app-line/30 pt-4">
-							<h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-dull">Related</h3>
-							<div className="flex flex-wrap gap-2">
-								{page.related.map((slug) => (
-									<button
-										key={slug}
-										onClick={() => onNavigate(slug)}
-										className="rounded-full bg-app-selected/30 px-2.5 py-1 text-xs text-ink hover:bg-app-selected/50"
-									>
-										{slug}
-									</button>
-								))}
+						{page.related.length > 0 && (
+							<div className="mt-6 border-t border-app-line/30 pt-4">
+								<h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-dull">Related</h3>
+								<div className="flex flex-wrap gap-2">
+									{page.related.map((slug) => (
+										<button
+											key={slug}
+											onClick={() => onNavigate(slug)}
+											className="rounded-full bg-app-selected/30 px-2.5 py-1 text-xs text-ink hover:bg-app-selected/50"
+										>
+											{slug}
+										</button>
+									))}
+								</div>
 							</div>
-						</div>
-					)}
+						)}
+					</div>
 				</div>
 			)}
 		</div>

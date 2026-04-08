@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Link, useMatchRoute, useNavigate } from "@tanstack/react-router";
+import { Link, useMatchRoute, useNavigate, useLocation } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import {
 	DndContext,
@@ -26,6 +26,7 @@ import { CircleButton, SelectPill, Popover, OptionList, OptionListItem, DialogRo
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 import { ProfileAvatar } from "@/components/ProfileAvatar";
 import { WorkersPanelButton } from "@/components/WorkersPanel";
+import { IS_MACOS } from "@/platform";
 
 interface SidebarProps {
 	liveStates: Record<string, ChannelLiveState>;
@@ -201,6 +202,8 @@ export function Sidebar({ liveStates: _liveStates }: SidebarProps) {
 	}
 
 	const matchRoute = useMatchRoute();
+	const location = useLocation();
+	const activeProjectId = location.pathname === "/projects" && typeof (location.search as Record<string, unknown>)?.id === "string" ? (location.search as Record<string, unknown>).id as string : null;
 
 	const sensors = useSensors(
 		useSensor(PointerSensor, {
@@ -226,7 +229,7 @@ export function Sidebar({ liveStates: _liveStates }: SidebarProps) {
 	return (
 		<aside className="flex w-[220px] shrink-0 flex-col bg-sidebar">
 			{/* Company switcher */}
-			<div className="px-3 pt-3">
+			<div className={`px-3 ${IS_MACOS ? "pt-[50px]" : "pt-3"}`}>
 				<Popover.Root open={switcherOpen} onOpenChange={setSwitcherOpen}>
 					<Popover.Trigger asChild>
 						<SelectPill variant="sidebar" size="md" className="w-full">
@@ -314,7 +317,11 @@ export function Sidebar({ liveStates: _liveStates }: SidebarProps) {
 										key={project.id}
 										to="/projects"
 										search={{ id: project.id }}
-										className="hover:bg-sidebar-selected/20 flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors"
+										className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${
+											activeProjectId === project.id
+												? "bg-sidebar-selected/40 text-sidebar-ink"
+												: "text-sidebar-inkDull hover:bg-sidebar-selected/20 hover:text-sidebar-ink"
+										}`}
 									>
 										{logoUrl ? (
 											<img

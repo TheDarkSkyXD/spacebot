@@ -3765,6 +3765,7 @@ async fn initialize_agents(
             let channel_store = spacebot::conversation::ChannelStore::new(agent.db.sqlite.clone());
             let run_logger = spacebot::conversation::ProcessRunLogger::new(agent.db.sqlite.clone());
             let cortex_ctx = spacebot::agent::cortex_chat::CortexChatSession::create_context();
+            #[allow(deprecated)] // Cortex chat is legacy — being replaced by Channel Settings
             let tool_server = spacebot::tools::create_cortex_chat_tool_server(
                 agent.deps.agent_id.clone(),
                 agent.deps.clone(),

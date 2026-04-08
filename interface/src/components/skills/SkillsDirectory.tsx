@@ -106,7 +106,7 @@ export function SkillsDirectory({
 	const virtualizer = useVirtualizer({
 		count: registrySkills.length,
 		getScrollElement: () => scrollRef.current,
-		estimateSize: () => 72,
+		estimateSize: () => 56,
 		overscan: 5,
 	});
 

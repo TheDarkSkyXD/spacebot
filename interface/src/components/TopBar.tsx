@@ -7,11 +7,10 @@ import {
 	type ReactNode,
 	type MouseEvent,
 } from "react";
-import {Link} from "@tanstack/react-router";
 import {useQuery} from "@tanstack/react-query";
 import {SelectPill} from "@spacedrive/primitives";
-import {api, BASE_PATH} from "@/api/client";
-import {IS_TAURI, startDragging} from "@/platform";
+import {api} from "@/api/client";
+import {IS_DESKTOP, IS_MACOS, startDragging} from "@/platform";
 
 // ── Context ──────────────────────────────────────────────────────────────
 
@@ -96,7 +95,7 @@ export function TopBar() {
 	);
 
 	const handleMouseDown = useCallback((e: MouseEvent) => {
-		if (!IS_TAURI) return;
+		if (!IS_DESKTOP) return;
 		// Only drag on primary button, and not when clicking interactive elements
 		if (e.buttons !== 1) return;
 		const target = e.target as HTMLElement;
@@ -108,15 +107,15 @@ export function TopBar() {
 
 	return (
 		<div
-			className={`flex h-12 w-full shrink-0 bg-app-dark-box/50${IS_TAURI ? " select-none" : ""}`}
+			className={`flex h-12 w-full shrink-0 bg-app-dark-box/50${IS_DESKTOP ? " select-none" : ""}`}
 			onMouseDown={handleMouseDown}
 		>
 			{/* Left corner block */}
-			{IS_TAURI ? (
-				/* Tauri: padding for macOS traffic lights */
+			{IS_MACOS ? (
+				/* Desktop macOS: padding for traffic lights */
 				<div className="w-[72px] shrink-0" />
 			) : (
-				/* Web: ball icon block matching sidebar width + border */
+				/* Browser/non-mac desktop: ball icon block matching sidebar width + border */
 				<div className="flex w-[220px] shrink-0 items-center border-r border-app-line bg-sidebar px-3">
 					<SelectPill variant="sidebar" size="md" className="w-full">
 						<span className="font-semibold">{companyName}</span>

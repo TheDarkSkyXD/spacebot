@@ -33,7 +33,7 @@ export function RegistrySkillRow({
 		<button
 			onClick={onClick}
 			className={cx(
-				"flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors",
+				"flex h-[56px] w-full items-center gap-3 rounded-md px-3 text-left transition-colors",
 				isSelected
 					? "bg-app-line text-ink"
 					: "hover:bg-app-dark-box/40 text-ink-dull hover:text-ink",
@@ -41,24 +41,16 @@ export function RegistrySkillRow({
 		>
 			<div className="min-w-0 flex-1">
 				<div className="flex items-center gap-2">
-					<span className="truncate text-sm font-medium text-ink">{skill.name}</span>
-				</div>
-				<div className="mt-0.5 flex items-center gap-2">
-					<span className="truncate font-mono text-[11px] text-ink-dull/60">
-						{skill.source}
-					</span>
+					<span className="truncate text-sm font-medium leading-tight text-ink">{skill.name}</span>
 					{skill.installs > 0 && (
-						<>
-							<span className="text-ink-dull/30">·</span>
-							<span className="text-[11px] text-ink-faint">
-								{formatInstalls(skill.installs)}
-							</span>
-						</>
+						<span className="shrink-0 text-[11px] leading-tight text-ink-faint">
+							{formatInstalls(skill.installs)}
+						</span>
 					)}
 				</div>
-				{skill.description && (
-					<p className="mt-1 truncate text-xs text-ink-faint">{skill.description}</p>
-				)}
+				<p className="mt-0.5 truncate text-xs leading-tight text-ink-faint">
+					{skill.description || <span className="font-mono text-ink-dull/60">{skill.source}</span>}
+				</p>
 			</div>
 
 			<button

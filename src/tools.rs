@@ -978,7 +978,12 @@ pub fn create_cortex_tool_server(
 /// tools (reply, react, skip) since the cortex chat doesn't talk to platforms.
 /// Adds `config_inspect` for live runtime config introspection and
 /// `spacebot_docs` for embedded docs/changelog retrieval.
+///
+/// **DEPRECATED:** Cortex chat is being replaced by Channel Settings.
+/// Remaining unique tools here (skills_search, install_skill, config_inspect)
+/// need to be ported to channel/worker toolsets before removal.
 #[allow(clippy::too_many_arguments)]
+#[deprecated(note = "Cortex chat is being replaced by Channel Settings. Port remaining tools before removing.")]
 pub fn create_cortex_chat_tool_server(
     agent_id: AgentId,
     deps: crate::AgentDeps,

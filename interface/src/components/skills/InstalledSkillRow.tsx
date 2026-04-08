@@ -17,27 +17,19 @@ export function InstalledSkillRow({
 		<button
 			onClick={onClick}
 			className={cx(
-				"flex w-full flex-col gap-0.5 rounded-md px-2.5 py-2 text-left transition-colors",
+				"flex h-[40px] w-full flex-col justify-center rounded-md px-2.5 text-left transition-colors",
 				isSelected
 					? "bg-app-dark-box text-ink"
 					: "text-ink-dull hover:bg-app-dark-box/50 hover:text-ink",
 			)}
 		>
 			<div className="flex items-center gap-1.5 min-w-0">
-				<span className="truncate text-sm font-medium">{skill.name}</span>
-				<Badge
-					// variant={skill.source === "instance" ? "default" : "success"}
-					size="sm"
-					// className="shrink-0"
-				>
-					{skill.source}
-				</Badge>
+				<span className="truncate text-sm leading-tight font-medium">{skill.name}</span>
+				<Badge size="sm">{skill.source}</Badge>
 			</div>
-			{skill.description && (
-				<span className="truncate text-xs text-ink-faint">
-					{skill.description}
-				</span>
-			)}
+			<span className="truncate text-xs leading-tight text-ink-faint">
+				{skill.description || "\u00A0"}
+			</span>
 		</button>
 	);
 }

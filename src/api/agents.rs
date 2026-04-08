@@ -966,6 +966,7 @@ pub async fn create_agent_internal(
     let channel_store = crate::conversation::ChannelStore::new(db.sqlite.clone());
     let run_logger = crate::conversation::ProcessRunLogger::new(db.sqlite.clone());
     let cortex_ctx = crate::agent::cortex_chat::CortexChatSession::create_context();
+    #[allow(deprecated)] // Cortex chat is legacy — being replaced by Channel Settings
     let cortex_tool_server = crate::tools::create_cortex_chat_tool_server(
         deps.agent_id.clone(),
         deps.clone(),

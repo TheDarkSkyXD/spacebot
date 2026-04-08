@@ -293,19 +293,19 @@ export function AgentCron({agentId}: AgentCronProps) {
 					<Badge variant="accent" size="md">
 						{totalJobs} total
 					</Badge>
-					<Badge variant="green" size="md">
+					<Badge variant="success" size="md">
 						{enabledJobs} enabled
 					</Badge>
 					<Badge variant="outline" size="md">
 						{totalRuns} executions
 					</Badge>
 					{executionFailures > 0 && (
-						<Badge variant="red" size="md">
+						<Badge variant="error" size="md">
 							{executionFailures} exec failed
 						</Badge>
 					)}
 					{deliveryFailures > 0 && (
-						<Badge variant="red" size="md">
+						<Badge variant="error" size="md">
 							{deliveryFailures} delivery failed
 						</Badge>
 					)}

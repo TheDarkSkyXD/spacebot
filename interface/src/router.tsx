@@ -179,8 +179,12 @@ const agentWorkersRoute = createRoute({
 const projectsRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/projects",
+	validateSearch: (search: Record<string, unknown>): {id?: string} => ({
+		id: typeof search.id === "string" ? search.id : undefined,
+	}),
 	component: function ProjectsPage() {
-		return <AgentProjects />;
+		const {id} = projectsRoute.useSearch();
+		return <AgentProjects projectId={id} />;
 	},
 });
 

@@ -1,4 +1,6 @@
-import {useState, useEffect} from "react";
+import {useState, useEffect, useCallback} from "react";
+import {useNavigate} from "@tanstack/react-router";
+import {ArrowLeft, PencilSimple, Trash, Plus, FolderSimple, Clock} from "@phosphor-icons/react";
 import {useQuery, useMutation, useQueryClient} from "@tanstack/react-query";
 import {
 	api,
@@ -8,10 +10,13 @@ import {
 	type CreateProjectRequest,
 	type CreateWorktreeRequest,
 	type UpdateProjectRequest,
+	getApiBase,
 } from "@/api/client";
 import {
 	Badge,
 	Button,
+	Card,
+	CircleButton,
 	DialogRoot,
 	DialogContent,
 	DialogHeader,
@@ -39,11 +44,6 @@ function formatBytes(bytes: number): string {
 	return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-const STATUS_DOT: Record<string, string> = {
-	active: "bg-emerald-500",
-	archived: "bg-ink-faint",
-};
-
 // ---------------------------------------------------------------------------
 // Project Card (list view)
 // ---------------------------------------------------------------------------
@@ -55,35 +55,46 @@ function ProjectCard({
 	project: Project;
 	onClick: () => void;
 }) {
+	const logoUrl = project.logo_path
+		? `${getApiBase()}/agents/projects/${encodeURIComponent(project.id)}/logo`
+		: null;
+	const fallback = project.icon || project.name.slice(0, 1).toUpperCase();
+
 	return (
-		<motion.button
+		<motion.div
 			layout
 			initial={{opacity: 0, y: 8}}
 			animate={{opacity: 1, y: 0}}
 			exit={{opacity: 0, y: -8}}
-			onClick={onClick}
-			className="w-full cursor-pointer rounded-xl border border-app-line bg-app-dark-box p-5 text-left transition-colors hover:border-accent/30"
 		>
-			<div className="flex items-start justify-between gap-3">
-				<div className="flex min-w-0 items-center gap-3">
-					{project.icon ? (
-						<span className="text-xl leading-none">{project.icon}</span>
+			<Card
+				variant="dark"
+				className="cursor-pointer p-4 transition-colors hover:bg-app-hover/50"
+				onClick={onClick}
+			>
+				<div className="flex items-center gap-3">
+					{logoUrl ? (
+						<img
+							src={logoUrl}
+							alt=""
+							className="size-8 shrink-0 rounded-md object-contain"
+							draggable={false}
+						/>
 					) : (
-						<span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent/10 text-sm text-accent">
-							{project.name.charAt(0).toUpperCase()}
-						</span>
+						<div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-sidebar-selected/40 text-sm font-semibold text-sidebar-ink">
+							{fallback}
+						</div>
 					)}
-					<div className="min-w-0">
+					<div className="min-w-0 flex-1">
 						<div className="flex items-center gap-2">
-							<h3 className="truncate font-plex text-sm font-semibold text-ink">
+							<h3 className="truncate font-plex text-sm font-medium text-ink">
 								{project.name}
 							</h3>
-							<span
-								className={clsx(
-									"h-2 w-2 rounded-full",
-									STATUS_DOT[project.status] ?? STATUS_DOT.active,
-								)}
-							/>
+							{project.tags.map((tag) => (
+								<Badge key={tag} variant="outline" size="sm">
+									{tag}
+								</Badge>
+							))}
 						</div>
 						{project.description && (
 							<p className="mt-0.5 line-clamp-1 text-xs text-ink-dull">
@@ -92,23 +103,19 @@ function ProjectCard({
 						)}
 					</div>
 				</div>
-			</div>
 
-			{project.tags.length > 0 && (
-				<div className="mt-3 flex flex-wrap gap-1.5">
-					{project.tags.map((tag) => (
-						<Badge key={tag} variant="outline" size="sm">
-							{tag}
-						</Badge>
-					))}
+				<div className="mt-3 flex items-center gap-3 text-[11px] text-ink-faint">
+					<span className="flex items-center gap-1">
+						<FolderSimple className="size-3" weight="bold" />
+						<span className="font-mono">{project.root_path}</span>
+					</span>
+					<span className="flex items-center gap-1 ml-auto">
+						<Clock className="size-3" weight="bold" />
+						{formatTimeAgo(project.updated_at)}
+					</span>
 				</div>
-			)}
-
-			<div className="mt-3 flex items-center gap-4 text-[11px] text-ink-faint">
-				<span className="font-mono">{project.root_path}</span>
-				<span className="ml-auto">{formatTimeAgo(project.updated_at)}</span>
-			</div>
-		</motion.button>
+			</Card>
+		</motion.div>
 	);
 }
 
@@ -603,28 +610,12 @@ function RepoCard({
 					<Button variant="outline" size="sm" onClick={onAddWorktree}>
 						+ Worktree
 					</Button>
-					<Button
-						variant="outline"
-						size="icon"
+					<CircleButton
+						icon={Trash}
+						title={`Delete repo ${repo.name}`}
 						onClick={onDelete}
 						disabled={isDeleting}
-						className="h-6 w-6 text-red-500 hover:text-red-400"
-						aria-label={`Delete repo ${repo.name}`}
-					>
-						<svg
-							className="h-3 w-3"
-							fill="none"
-							viewBox="0 0 24 24"
-							stroke="currentColor"
-							strokeWidth={2}
-						>
-							<path
-								strokeLinecap="round"
-								strokeLinejoin="round"
-								d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-							/>
-						</svg>
-					</Button>
+					/>
 				</div>
 			</div>
 			<div className="mt-2 flex items-center gap-3 text-xs text-ink-faint">
@@ -676,10 +667,7 @@ function WorktreeCard({
 						<Badge variant="accent" size="sm">
 							{worktree.branch}
 						</Badge>
-						<Badge
-							variant={worktree.created_by === "agent" ? "violet" : "default"}
-							size="sm"
-						>
+						<Badge variant="default" size="sm">
 							{worktree.created_by}
 						</Badge>
 					</div>
@@ -697,28 +685,12 @@ function WorktreeCard({
 						)}
 					</p>
 				</div>
-				<Button
-					variant="outline"
-					size="icon"
+				<CircleButton
+					icon={Trash}
+					title={`Delete worktree ${worktree.name}`}
 					onClick={onDelete}
 					disabled={isDeleting}
-					className="h-6 w-6 text-red-500 hover:text-red-400"
-					aria-label={`Delete worktree ${worktree.name}`}
-				>
-					<svg
-						className="h-3 w-3"
-						fill="none"
-						viewBox="0 0 24 24"
-						stroke="currentColor"
-						strokeWidth={2}
-					>
-						<path
-							strokeLinecap="round"
-							strokeLinejoin="round"
-							d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
-						/>
-					</svg>
-				</Button>
+				/>
 			</div>
 		</div>
 	);
@@ -741,15 +713,6 @@ function ProjectDetail({
 		queryKey: ["project", projectId],
 		queryFn: () => api.getProject(projectId),
 		refetchInterval: 10_000,
-	});
-
-	const scanMutation = useMutation({
-		mutationFn: () => api.scanProject(projectId),
-		onSuccess: () => {
-			queryClient.invalidateQueries({
-				queryKey: ["project", projectId],
-			});
-		},
 	});
 
 	const deleteProjectMutation = useMutation({
@@ -821,102 +784,54 @@ function ProjectDetail({
 		worktrees.reduce((sum, w) => sum + (w.disk_usage_bytes ?? 0), 0);
 
 	return (
-		<div className="h-full overflow-y-auto">
-			<div className="mx-auto max-w-4xl space-y-6 p-6">
-				{/* Header */}
-				<div>
-					<button
-						onClick={onBack}
-						className="mb-3 flex items-center gap-1 text-xs text-ink-faint transition-colors hover:text-ink-dull"
-					>
-						<svg
-							className="h-3.5 w-3.5"
-							fill="none"
-							viewBox="0 0 24 24"
-							stroke="currentColor"
-							strokeWidth={2}
-						>
-							<path
-								strokeLinecap="round"
-								strokeLinejoin="round"
-								d="M15 19l-7-7 7-7"
+		<div className="flex h-full flex-col">
+			{/* Top Bar */}
+			<div className="flex items-center justify-between border-b border-app-line px-4 py-2">
+				<div className="flex items-center gap-2">
+					<CircleButton icon={ArrowLeft} title="All Projects" onClick={onBack} />
+					{(() => {
+						const logoUrl = project.logo_path
+							? `${getApiBase()}/agents/projects/${encodeURIComponent(project.id)}/logo`
+							: null;
+						const fallback = project.icon || project.name.slice(0, 1).toUpperCase();
+						return logoUrl ? (
+							<img
+								src={logoUrl}
+								alt=""
+								className="size-[22px] shrink-0 rounded-md object-contain"
+								draggable={false}
 							/>
-						</svg>
-						All Projects
-					</button>
-
-					<div className="flex items-start justify-between gap-4">
-						<div className="min-w-0 flex-1">
-							<div className="flex items-center gap-3">
-								{project.icon ? (
-									<span className="text-2xl leading-none">{project.icon}</span>
-								) : (
-									<span className="flex h-10 w-10 items-center justify-center rounded-lg bg-accent/10 text-base font-semibold text-accent">
-										{project.name.charAt(0).toUpperCase()}
-									</span>
-								)}
-								<div>
-									<h2 className="font-plex text-lg font-semibold text-ink">
-										{project.name}
-									</h2>
-									{project.description && (
-										<p className="mt-0.5 text-sm text-ink-dull">
-											{project.description}
-										</p>
-									)}
-								</div>
+						) : (
+							<div className="flex size-[22px] shrink-0 items-center justify-center rounded-md bg-sidebar-selected/40 text-[10px] font-semibold text-sidebar-ink">
+								{fallback}
 							</div>
-
-							<div className="mt-3 flex flex-wrap items-center gap-2">
-								<Badge
-									variant={project.status === "active" ? "green" : "default"}
-									size="sm"
-								>
-									{project.status}
-								</Badge>
-								{project.tags.map((tag) => (
-									<Badge key={tag} variant="outline" size="sm">
-										{tag}
-									</Badge>
-								))}
-								<span className="font-mono text-[11px] text-ink-faint">
-									{project.root_path}
-								</span>
-								{totalDiskUsage > 0 && (
-									<span className="rounded-md bg-app-button px-2 py-0.5 font-mono text-[11px] text-ink-dull">
-										{formatBytes(totalDiskUsage)}
-									</span>
-								)}
-							</div>
-						</div>
-
-						<div className="flex shrink-0 items-center gap-2">
-							<Button
-								variant="outline"
-								size="sm"
-								onClick={() => setShowEditProject(true)}
-							>
-								Edit
-							</Button>
-							<Button
-								variant="outline"
-								size="sm"
-								onClick={() => scanMutation.mutate()}
-								loading={scanMutation.isPending}
-							>
-								Scan
-							</Button>
-							<Button
-								variant="outline"
-								size="sm"
-								className="text-red-500 hover:text-red-400"
-								onClick={() => setShowDeleteProject(true)}
-							>
-								Delete
-							</Button>
-						</div>
-					</div>
+						);
+					})()}
+					<h2 className="text-sm font-medium text-ink">{project.name}</h2>
+					{project.tags.map((tag) => (
+						<Badge key={tag} variant="outline" size="sm">
+							{tag}
+						</Badge>
+					))}
+					{totalDiskUsage > 0 && (
+						<Badge variant="default" size="sm">
+							{formatBytes(totalDiskUsage)}
+						</Badge>
+					)}
 				</div>
+
+				<div className="flex items-center gap-2">
+					<CircleButton icon={PencilSimple} title="Edit" onClick={() => setShowEditProject(true)} />
+					<CircleButton icon={Trash} title="Delete" onClick={() => setShowDeleteProject(true)} />
+				</div>
+			</div>
+
+			<div className="flex-1 overflow-y-auto">
+			<div className="mx-auto max-w-4xl space-y-6 p-6">
+				{/* Project Info */}
+				{project.description && (
+					<p className="text-sm text-ink-dull">{project.description}</p>
+				)}
 
 				{/* Repos Section */}
 				<section>
@@ -986,11 +901,13 @@ function ProjectDetail({
 					)}
 				</section>
 
-				{/* Stats */}
+				{/* Meta */}
 				<div className="flex items-center gap-4 text-xs text-ink-faint">
+					<span className="font-mono">{project.root_path}</span>
 					<span>Created {formatTimeAgo(project.created_at)}</span>
 					<span>Updated {formatTimeAgo(project.updated_at)}</span>
 				</div>
+			</div>
 			</div>
 
 			{/* Dialogs */}
@@ -1064,10 +981,20 @@ function ProjectDetail({
 // Main Page
 // ---------------------------------------------------------------------------
 
-export function AgentProjects() {
-	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
-		null,
+export function AgentProjects({ projectId }: { projectId?: string }) {
+	const navigate = useNavigate();
+	const selectedProjectId = projectId ?? null;
+
+	const setSelectedProjectId = useCallback(
+		(id: string | null) => {
+			navigate({
+				to: "/projects",
+				search: id ? { id } : {},
+			});
+		},
+		[navigate],
 	);
+
 	const [showCreate, setShowCreate] = useState(false);
 
 	const {data, isLoading} = useQuery({
@@ -1088,53 +1015,56 @@ export function AgentProjects() {
 	}
 
 	return (
-		<div className="h-full overflow-y-auto">
-			<div className="mx-auto max-w-4xl p-6">
-				<div className="mb-6 flex items-center justify-between">
-					<div>
-						<h2 className="font-plex text-base font-semibold text-ink">
-							Projects
-						</h2>
-						<p className="mt-0.5 text-xs text-ink-faint">
-							Workspaces, repos, and worktrees across all agents.
-						</p>
-					</div>
-					<Button size="sm" onClick={() => setShowCreate(true)}>
-						+ Project
-					</Button>
+		<div className="flex h-full flex-col">
+			{/* Top Bar */}
+			<div className="flex items-center justify-between border-b border-app-line px-4 py-2">
+				<div className="flex items-center gap-2">
+					<h2 className="text-sm font-medium text-ink">Projects</h2>
+					<span className="text-xs text-ink-faint">
+						{projects.length} project{projects.length !== 1 ? "s" : ""}
+					</span>
 				</div>
+				<Button variant="gray" size="md" onClick={() => setShowCreate(true)}>
+					<Plus className="mr-1 size-3.5" weight="bold" />
+					New Project
+				</Button>
+			</div>
 
-				{isLoading ? (
-					<div className="flex items-center justify-center py-20">
-						<div className="h-6 w-6 animate-spin rounded-full border-2 border-accent border-t-transparent" />
-					</div>
-				) : projects.length === 0 ? (
-					<div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-app-line py-20">
-						<p className="text-sm text-ink-faint">
-							No projects registered yet.
-						</p>
-						<Button
-							variant="outline"
-							size="sm"
-							className="mt-4"
-							onClick={() => setShowCreate(true)}
-						>
-							Create your first project
-						</Button>
-					</div>
-				) : (
-					<div className="grid gap-3 sm:grid-cols-2">
-						<AnimatePresence mode="popLayout">
-							{projects.map((project) => (
-								<ProjectCard
-									key={project.id}
-									project={project}
-									onClick={() => setSelectedProjectId(project.id)}
-								/>
-							))}
-						</AnimatePresence>
-					</div>
-				)}
+			<div className="flex-1 overflow-y-auto">
+				<div className="mx-auto max-w-4xl p-6">
+					{isLoading ? (
+						<div className="flex items-center justify-center py-20">
+							<div className="h-6 w-6 animate-spin rounded-full border-2 border-accent border-t-transparent" />
+						</div>
+					) : projects.length === 0 ? (
+						<div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-app-line py-20">
+							<FolderSimple className="mb-3 size-8 text-ink-faint" weight="bold" />
+							<p className="text-sm text-ink-faint">
+								No projects registered yet.
+							</p>
+							<Button
+								variant="gray"
+								size="md"
+								className="mt-4"
+								onClick={() => setShowCreate(true)}
+							>
+								Create your first project
+							</Button>
+						</div>
+					) : (
+						<div className="grid gap-3 sm:grid-cols-2">
+							<AnimatePresence mode="popLayout">
+								{projects.map((project) => (
+									<ProjectCard
+										key={project.id}
+										project={project}
+										onClick={() => setSelectedProjectId(project.id)}
+									/>
+								))}
+							</AnimatePresence>
+						</div>
+					)}
+				</div>
 			</div>
 
 			<CreateProjectDialog open={showCreate} onOpenChange={setShowCreate} />
