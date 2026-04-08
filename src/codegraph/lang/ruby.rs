@@ -14,7 +14,7 @@
 //! call with receiver text recorded for downstream resolution.
 
 use super::languages::SupportedLanguage;
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use crate::codegraph::types::NodeLabel;
 
 pub struct RubyProvider;
@@ -47,6 +47,18 @@ impl LanguageProvider for RubyProvider {
         }
     }
 
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
     fn file_extensions(&self) -> &[&str] {
         &["rb", "rake", "gemspec"]
     }
@@ -58,6 +70,7 @@ impl LanguageProvider for RubyProvider {
             NodeLabel::Method,
             NodeLabel::Function,
             NodeLabel::Const,
+            NodeLabel::Variable,
             NodeLabel::Import,
         ]
     }
@@ -111,6 +124,30 @@ fn walk_ruby_node(
                     decorates: None,
                     metadata: std::collections::HashMap::new(),
                 });
+
+                // Ruby has no field declarations — instance variables (`@x`)
+                // are discovered by use. Walk the class body collecting all
+                // distinct `@x` names and emit one Variable node per name
+                // parented to the class.
+                let mut fields: std::collections::HashMap<String, (u32, u32)> =
+                    std::collections::HashMap::new();
+                collect_ruby_instance_vars(node, source, &mut fields);
+                for (fname, (line_start, line_end)) in &fields {
+                    symbols.push(ExtractedSymbol {
+                        name: fname.clone(),
+                        qualified_name: format!("{qn}::{fname}"),
+                        label: NodeLabel::Variable,
+                        line_start: *line_start,
+                        line_end: *line_end,
+                        parent: Some(qn.clone()),
+                        import_source: None,
+                        extends: None,
+                        implements: Vec::new(),
+                        decorates: None,
+                        metadata: std::collections::HashMap::new(),
+                    });
+                }
+
                 let cursor = &mut node.walk();
                 for child in node.children(cursor) {
                     walk_ruby_node(child, file_path, source, symbols, Some(&qn));
@@ -285,6 +322,151 @@ fn walk_ruby_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_ruby_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+/// Collect all distinct `@instance_var` names referenced anywhere inside
+/// a class body. Used to synthesize Ruby field nodes since Ruby has no
+/// declarative field syntax. Skips nested class bodies.
+#[cfg(feature = "codegraph")]
+fn collect_ruby_instance_vars(
+    node: tree_sitter::Node,
+    source: &str,
+    fields: &mut std::collections::HashMap<String, (u32, u32)>,
+) {
+    let kind = node.kind();
+    if kind == "class" {
+        // Skip the outer entry's own children handled by the caller.
+        // For nested classes encountered during recursion, return so
+        // their @vars belong to their own class.
+        // We'll recurse manually below for the top-level call so this
+        // only affects deeper nesting.
+    }
+    if kind == "instance_variable" {
+        let raw = text(node, source);
+        // Strip the leading `@` (or `@@` for class variables which we
+        // also surface as fields for graph purposes).
+        let fname = raw.trim_start_matches('@').to_string();
+        if !fname.is_empty() {
+            fields.entry(fname).or_insert((
+                node.start_position().row as u32 + 1,
+                node.end_position().row as u32 + 1,
+            ));
+        }
+    } else if kind == "class_variable" {
+        // `@@count` style — also a field on the class.
+        let raw = text(node, source);
+        let fname = raw.trim_start_matches('@').to_string();
+        if !fname.is_empty() {
+            fields.entry(fname).or_insert((
+                node.start_position().row as u32 + 1,
+                node.end_position().row as u32 + 1,
+            ));
+        }
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        // Don't descend into nested class definitions — their fields
+        // belong to the inner class, which gets its own collect pass.
+        if child.kind() == "class" {
+            continue;
+        }
+        collect_ruby_instance_vars(child, source, fields);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(file_path: &str, content: &str) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_ruby::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_ruby_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the Ruby AST collecting `@x` instance variable references inside
+/// method bodies. Receiver is normalized to `"this"` so the resolver in
+/// `pipeline/calls.rs` (which checks `self`/`this`) matches.
+#[cfg(feature = "codegraph")]
+fn walk_ruby_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "class" | "module" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_ruby_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "method" | "singleton_method" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_ruby_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "instance_variable" | "class_variable" => {
+            if let Some(caller) = enclosing.last() {
+                let raw = text(node, source);
+                let fname = raw.trim_start_matches('@').to_string();
+                if !fname.is_empty() {
+                    accesses.push(AccessSite {
+                        caller_qualified_name: caller.clone(),
+                        field_name: fname,
+                        receiver: "this".to_string(),
+                        line: node.start_position().row as u32 + 1,
+                        is_write: false,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_ruby_accesses(child, file_path, source, accesses, enclosing);
     }
 }
 

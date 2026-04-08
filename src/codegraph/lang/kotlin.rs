@@ -14,7 +14,7 @@
 //! which we unpack to extract receiver + callee name.
 
 use super::languages::SupportedLanguage;
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use crate::codegraph::types::NodeLabel;
 
 pub struct KotlinProvider;
@@ -39,6 +39,18 @@ impl LanguageProvider for KotlinProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -295,6 +307,111 @@ fn walk_kotlin_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_kotlin_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(file_path: &str, content: &str) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_kotlin_ng::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_kotlin_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the Kotlin AST collecting `this.field` accesses inside method
+/// bodies. Tree-sitter-kotlin uses `navigation_expression` for `recv.x`,
+/// where the receiver is the first child. We match when that child is
+/// the `this` keyword (kind `this_expression` in this grammar).
+#[cfg(feature = "codegraph")]
+fn walk_kotlin_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "class_declaration" | "object_declaration" | "interface_declaration" => {
+            let name = find_name_child(node, source);
+            if !name.is_empty() {
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_kotlin_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "function_declaration" => {
+            let name = find_name_child(node, source);
+            if !name.is_empty() {
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_kotlin_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "navigation_expression" => {
+            // First child is the expression being navigated; we want it
+            // to be `this` (or `this_expression`). The field name is the
+            // last simple_identifier in the navigation_suffix.
+            if let Some(caller) = enclosing.last()
+                && let Some(receiver_node) = node.child(0)
+            {
+                let recv_kind = receiver_node.kind();
+                let is_this = recv_kind == "this_expression"
+                    || (recv_kind == "simple_identifier"
+                        && text(receiver_node, source) == "this");
+                if is_this {
+                    let fname = find_last_identifier(node, source);
+                    if !fname.is_empty() {
+                        accesses.push(AccessSite {
+                            caller_qualified_name: caller.clone(),
+                            field_name: fname,
+                            receiver: "this".to_string(),
+                            line: node.start_position().row as u32 + 1,
+                            is_write: false,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_kotlin_accesses(child, file_path, source, accesses, enclosing);
     }
 }
 

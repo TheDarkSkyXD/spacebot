@@ -18,7 +18,7 @@
 //! - `scoped_call_expression`   → `Class::method()` (static call with receiver)
 
 use super::languages::SupportedLanguage;
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use crate::codegraph::types::NodeLabel;
 
 pub struct PhpProvider;
@@ -43,6 +43,18 @@ impl LanguageProvider for PhpProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -415,6 +427,109 @@ fn walk_php_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_php_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(file_path: &str, content: &str) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_php::LANGUAGE_PHP.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_php_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the PHP AST collecting `$this->field` accesses inside method bodies.
+/// Tree-sitter-php uses `member_access_expression` for property reads with
+/// an `object` field that is a `variable_name` containing the text `$this`.
+#[cfg(feature = "codegraph")]
+fn walk_php_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "namespace_definition"
+        | "class_declaration"
+        | "interface_declaration"
+        | "trait_declaration"
+        | "enum_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_php_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "function_definition" | "method_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_php_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "member_access_expression" => {
+            // Normalize `$this` to `this` so the resolver in pipeline/calls.rs
+            // (which checks receiver == "self" || receiver == "this") matches.
+            if let Some(caller) = enclosing.last()
+                && let Some(object) = node.child_by_field_name("object")
+                && text(object, source) == "$this"
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let fname = text(name, source);
+                if !fname.is_empty() {
+                    accesses.push(AccessSite {
+                        caller_qualified_name: caller.clone(),
+                        field_name: fname,
+                        receiver: "this".to_string(),
+                        line: node.start_position().row as u32 + 1,
+                        is_write: false,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_php_accesses(child, file_path, source, accesses, enclosing);
     }
 }
 

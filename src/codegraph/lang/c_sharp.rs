@@ -19,7 +19,7 @@
 //! `member_access_expression` (receiver.method), or a generic variant.
 
 use super::languages::SupportedLanguage;
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use crate::codegraph::types::NodeLabel;
 
 pub struct CSharpProvider;
@@ -44,6 +44,18 @@ impl LanguageProvider for CSharpProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -407,6 +419,108 @@ fn walk_csharp_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_csharp_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(file_path: &str, content: &str) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_c_sharp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_csharp_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the C# AST collecting `this.field` accesses inside method bodies.
+/// Tree-sitter-c-sharp uses `member_access_expression` with an `expression`
+/// field that may be a `this_expression` keyword.
+#[cfg(feature = "codegraph")]
+fn walk_csharp_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "class_declaration"
+        | "struct_declaration"
+        | "record_declaration"
+        | "interface_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_csharp_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_csharp_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "member_access_expression" => {
+            if let Some(caller) = enclosing.last()
+                && let Some(expr) = node.child_by_field_name("expression")
+                && expr.kind() == "this_expression"
+                && let Some(name) = node.child_by_field_name("name")
+            {
+                let fname = text(name, source);
+                if !fname.is_empty() {
+                    accesses.push(AccessSite {
+                        caller_qualified_name: caller.clone(),
+                        field_name: fname,
+                        receiver: "this".to_string(),
+                        line: node.start_position().row as u32 + 1,
+                        is_write: false,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_csharp_accesses(child, file_path, source, accesses, enclosing);
     }
 }
 

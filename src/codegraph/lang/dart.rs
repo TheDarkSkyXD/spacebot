@@ -16,7 +16,7 @@
 //! emit call sites with optional receiver information.
 
 use super::languages::SupportedLanguage;
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use crate::codegraph::types::NodeLabel;
 
 pub struct DartProvider;
@@ -41,6 +41,18 @@ impl LanguageProvider for DartProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -340,6 +352,110 @@ fn walk_dart_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_dart_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(file_path: &str, content: &str) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_dart::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_dart_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the Dart AST collecting `this.field` accesses inside method
+/// bodies. Tree-sitter-dart's grammar varies between versions, so this
+/// uses a structural-pattern-match approach: any node whose first child
+/// is the `this` keyword followed by `.<identifier>` is treated as a
+/// field access. This is intentionally permissive to survive grammar
+/// updates.
+#[cfg(feature = "codegraph")]
+fn walk_dart_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "class_definition" | "mixin_declaration" | "enum_declaration" => {
+            if let Some(name) = find_ident(node, source, &["name", "identifier"]) {
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_dart_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "function_signature" | "method_signature" => {
+            if let Some(name) = find_ident(node, source, &["name", "identifier"]) {
+                let qn = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(qn);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_dart_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    // Permissive pattern match: a node with first child = `this`,
+    // followed by `.`, followed by an `identifier`. Catches
+    // assignable_expression and similar shapes across grammar versions.
+    if let Some(caller) = enclosing.last()
+        && node.child_count() >= 3
+        && let Some(c0) = node.child(0)
+        && c0.kind() == "this"
+        && let Some(c1) = node.child(1)
+        && text(c1, source) == "."
+        && let Some(c2) = node.child(2)
+        && c2.kind() == "identifier"
+    {
+        let fname = text(c2, source);
+        if !fname.is_empty() {
+            accesses.push(AccessSite {
+                caller_qualified_name: caller.clone(),
+                field_name: fname,
+                receiver: "this".to_string(),
+                line: node.start_position().row as u32 + 1,
+                is_write: false,
+            });
+        }
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_dart_accesses(child, file_path, source, accesses, enclosing);
     }
 }
 

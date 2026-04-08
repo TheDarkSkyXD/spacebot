@@ -13,7 +13,7 @@
 //! - `preproc_include`                                   → Import
 //! - `type_definition`                                   → TypeAlias
 
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use super::languages::SupportedLanguage;
 use crate::codegraph::types::NodeLabel;
 
@@ -40,6 +40,18 @@ impl LanguageProvider for CProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content, Dialect::C)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content, Dialect::C)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -84,6 +96,18 @@ impl LanguageProvider for CppProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content, Dialect::Cpp)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content, Dialect::Cpp)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -472,6 +496,132 @@ fn walk_c_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_c_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(
+    file_path: &str,
+    content: &str,
+    dialect: Dialect,
+) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = match dialect {
+        Dialect::C => tree_sitter_c::LANGUAGE.into(),
+        Dialect::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+    };
+
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_c_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the C/C++ AST collecting `this->field` accesses inside method
+/// bodies. Tree-sitter-cpp uses `field_expression` for both `obj.x` and
+/// `obj->x`; we only emit when the argument is the `this` keyword (C++)
+/// since C has no `this`. C input still routes through this walker but
+/// will produce zero accesses.
+#[cfg(feature = "codegraph")]
+fn walk_c_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "namespace_definition" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let outer = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(outer);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_c_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "class_specifier" | "struct_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                if !name.is_empty() {
+                    let outer = match enclosing.last() {
+                        Some(p) => format!("{p}::{name}"),
+                        None => format!("{file_path}::{name}"),
+                    };
+                    enclosing.push(outer);
+                    let cursor = &mut node.walk();
+                    for child in node.children(cursor) {
+                        walk_c_accesses(child, file_path, source, accesses, enclosing);
+                    }
+                    enclosing.pop();
+                    return;
+                }
+            }
+        }
+        "function_definition" => {
+            if let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name) = extract_function_name(declarator, source)
+            {
+                let fq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_c_accesses(child, file_path, source, accesses, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "field_expression" => {
+            if let Some(caller) = enclosing.last()
+                && let Some(arg) = node.child_by_field_name("argument")
+                && arg.kind() == "this"
+                && let Some(field) = node.child_by_field_name("field")
+            {
+                let fname = text(field, source);
+                if !fname.is_empty() {
+                    accesses.push(AccessSite {
+                        caller_qualified_name: caller.clone(),
+                        field_name: fname,
+                        receiver: "this".to_string(),
+                        line: node.start_position().row as u32 + 1,
+                        is_write: false,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_c_accesses(child, file_path, source, accesses, enclosing);
     }
 }
 

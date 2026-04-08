@@ -13,7 +13,7 @@
 //! function or method, handling both bare identifier calls and
 //! `selector_expression` calls (`pkg.Func()` or `receiver.Method()`).
 
-use super::provider::{CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
 use super::languages::SupportedLanguage;
 use crate::codegraph::types::NodeLabel;
 
@@ -39,6 +39,18 @@ impl LanguageProvider for GoProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_calls_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_accesses(&self, file_path: &str, content: &str) -> Vec<AccessSite> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_accesses_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -452,6 +464,156 @@ fn walk_go_calls(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_go_calls(child, file_path, source, calls, enclosing);
+    }
+}
+
+/// Extract the receiver parameter NAME from a method's `receiver`
+/// parameter_list. Returns e.g. "s" for `func (s *Server) Handle()`.
+#[cfg(feature = "codegraph")]
+fn receiver_param_name(recv_node: tree_sitter::Node, source: &str) -> Option<String> {
+    let cursor = &mut recv_node.walk();
+    for child in recv_node.children(cursor) {
+        if child.kind() == "parameter_declaration"
+            && let Some(name_node) = child.child_by_field_name("name")
+        {
+            return Some(text(name_node, source));
+        }
+    }
+    None
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_accesses_tree_sitter(file_path: &str, content: &str) -> Vec<AccessSite> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_go::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut accesses = Vec::new();
+    walk_go_accesses(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut accesses,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
+    accesses
+}
+
+/// Walk the Go AST collecting receiver-field accesses inside methods.
+///
+/// Go has no `this`/`self` keyword — the receiver name is whatever the
+/// method declares (`func (s *Server) Handle() { s.field }`). We track
+/// the current method's receiver name in a parallel stack so the
+/// selector_expression handler knows which operand text to match.
+///
+/// Receiver normalized to "this" so `pipeline/calls.rs` resolution
+/// matches without per-language special-casing.
+#[cfg(feature = "codegraph")]
+fn walk_go_accesses(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    accesses: &mut Vec<AccessSite>,
+    enclosing: &mut Vec<String>,
+    receiver_names: &mut Vec<Option<String>>,
+) {
+    match node.kind() {
+        "function_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let fq = format!("{file_path}::{name}");
+                enclosing.push(fq);
+                receiver_names.push(None); // free function — no receiver
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_go_accesses(
+                        child,
+                        file_path,
+                        source,
+                        accesses,
+                        enclosing,
+                        receiver_names,
+                    );
+                }
+                enclosing.pop();
+                receiver_names.pop();
+                return;
+            }
+        }
+        "method_declaration" => {
+            let receiver_node = node.child_by_field_name("receiver");
+            let receiver_type = receiver_node.and_then(|r| receiver_type_name(r, source));
+            let recv_name = receiver_node.and_then(|r| receiver_param_name(r, source));
+
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let fq = match receiver_type {
+                    Some(rt) => format!("{file_path}::{rt}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                receiver_names.push(recv_name);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_go_accesses(
+                        child,
+                        file_path,
+                        source,
+                        accesses,
+                        enclosing,
+                        receiver_names,
+                    );
+                }
+                enclosing.pop();
+                receiver_names.pop();
+                return;
+            }
+        }
+        "selector_expression" => {
+            // Match `<receiver_name>.field` where receiver_name is the
+            // current method's declared receiver param.
+            if let Some(caller) = enclosing.last()
+                && let Some(Some(recv)) = receiver_names.last()
+                && let Some(operand) = node.child_by_field_name("operand")
+                && operand.kind() == "identifier"
+                && text(operand, source) == *recv
+                && let Some(field) = node.child_by_field_name("field")
+            {
+                let fname = text(field, source);
+                if !fname.is_empty() {
+                    accesses.push(AccessSite {
+                        caller_qualified_name: caller.clone(),
+                        field_name: fname,
+                        receiver: "this".to_string(),
+                        line: node.start_position().row as u32 + 1,
+                        is_write: false,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_go_accesses(
+            child,
+            file_path,
+            source,
+            accesses,
+            enclosing,
+            receiver_names,
+        );
     }
 }
 
