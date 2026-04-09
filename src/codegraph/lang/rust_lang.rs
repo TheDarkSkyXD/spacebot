@@ -108,8 +108,6 @@ fn walk_rust_node(
                         {
                             let fname = text(fn_node, source);
                             let mut field_sym = sym(file_path, Some(&struct_qname), &fname, NodeLabel::Variable, &child);
-                            // Capture the declared type text so the
-                            // resolver can bind `self.field.method()` calls.
                             if let Some(type_node) = child.child_by_field_name("type") {
                                 let ty = text(type_node, source);
                                 if !ty.is_empty() {
@@ -215,9 +213,15 @@ fn walk_rust_node(
                 } else {
                     NodeLabel::Function
                 };
-                symbols.push(sym(file_path, parent_name, &name, label, &node));
+                let mut fn_sym = sym(file_path, parent_name, &name, label, &node);
+                if let Some(return_type) = node.child_by_field_name("return_type") {
+                    let ty = text(return_type, source);
+                    if !ty.is_empty() {
+                        fn_sym.metadata.insert("declared_type".to_string(), ty);
+                    }
+                }
+                symbols.push(fn_sym);
 
-                // Extract parameters from the parameters list.
                 let fn_qname = qname(file_path, parent_name, &name);
                 if let Some(params) = node.child_by_field_name("parameters") {
                     collect_rust_params(params, source, &fn_qname, symbols);
@@ -304,10 +308,6 @@ fn collect_rust_params(
             continue;
         }
 
-        // Capture the parameter type text for the call-site resolver.
-        // The type field on `parameter` nodes in tree-sitter-rust holds
-        // everything after the colon: `Foo`, `&mut Foo`,
-        // `Arc<Mutex<Foo>>`, etc.
         let mut metadata = std::collections::HashMap::new();
         if let Some(type_node) = child.child_by_field_name("type") {
             let ty = text(type_node, source);

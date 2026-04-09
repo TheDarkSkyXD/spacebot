@@ -127,7 +127,18 @@ fn walk_go_node(
                 let name = text(name_node, source);
                 if !name.is_empty() {
                     let fn_qname = format!("{file_path}::{name}");
-                    symbols.push(sym(file_path, None, &name, NodeLabel::Function, &node));
+                    let mut fn_sym = sym(file_path, None, &name, NodeLabel::Function, &node);
+                    // The `result` field is either a single type
+                    // (`func f() Foo`) or a parameter_list for multi-
+                    // return. Store raw text — downstream normalization
+                    // picks the leaf type.
+                    if let Some(result) = node.child_by_field_name("result") {
+                        let ty = text(result, source);
+                        if !ty.is_empty() {
+                            fn_sym.metadata.insert("declared_type".to_string(), ty);
+                        }
+                    }
+                    symbols.push(fn_sym);
                     if let Some(params) = node.child_by_field_name("parameters") {
                         collect_go_params(params, source, &fn_qname, symbols);
                     }
@@ -151,13 +162,22 @@ fn walk_go_node(
                         Some(p) => format!("{p}::{name}"),
                         None => format!("{file_path}::{name}"),
                     };
-                    symbols.push(sym(
+                    let mut method_sym = sym(
                         file_path,
                         parent_qname.as_deref(),
                         &name,
                         NodeLabel::Method,
                         &node,
-                    ));
+                    );
+                    if let Some(result) = node.child_by_field_name("result") {
+                        let ty = text(result, source);
+                        if !ty.is_empty() {
+                            method_sym
+                                .metadata
+                                .insert("declared_type".to_string(), ty);
+                        }
+                    }
+                    symbols.push(method_sym);
                     if let Some(params) = node.child_by_field_name("parameters") {
                         collect_go_params(params, source, &method_qname, symbols);
                     }
@@ -235,15 +255,15 @@ fn walk_type_spec(
             let parent_qname = format!("{file_path}::{name}");
             symbols.push(sym(file_path, None, &name, NodeLabel::Struct, &node));
 
-            // Extract field declarations as Variables under the struct.
             if let Some(fields) = type_node.child_by_field_name("fields")
                 .or_else(|| type_node.child(0))
             {
                 let cursor = &mut fields.walk();
                 for child in fields.children(cursor) {
                     if child.kind() == "field_declaration" {
-                        // Type applies to every field_identifier in the
-                        // same declaration (`Foo, Bar int` → both int).
+                        // Grouped declarations like `Foo, Bar int` share
+                        // one `type` field across all field_identifiers,
+                        // so the type must be read once at this level.
                         let declared_type = child
                             .child_by_field_name("type")
                             .map(|n| text(n, source))

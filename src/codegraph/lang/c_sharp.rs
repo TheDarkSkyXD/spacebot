@@ -247,7 +247,22 @@ fn walk_csharp_node(
                 let name = text(name_node, source);
                 if !name.is_empty() {
                     let method_qname = qname(file_path, parent_name, &name);
-                    symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node));
+                    let mut method_sym =
+                        sym(file_path, parent_name, &name, NodeLabel::Method, &node);
+                    // Only `method_declaration` carries a `returns` field;
+                    // constructors and destructors have an implicit void
+                    // return that offers no useful type information.
+                    if node.kind() == "method_declaration"
+                        && let Some(returns) = node.child_by_field_name("returns")
+                    {
+                        let ty = text(returns, source);
+                        if !ty.is_empty() && ty != "void" {
+                            method_sym
+                                .metadata
+                                .insert("declared_type".to_string(), ty);
+                        }
+                    }
+                    symbols.push(method_sym);
                     if let Some(params) = node.child_by_field_name("parameters") {
                         collect_csharp_params(params, source, &method_qname, symbols);
                     }
@@ -255,11 +270,10 @@ fn walk_csharp_node(
             }
         }
         "field_declaration" | "property_declaration" | "event_declaration" => {
-            // Resolve the declared type for call-site resolution.
-            // `property_declaration` / `event_declaration` carry a
-            // `type` field directly. `field_declaration` wraps a
-            // `variable_declaration` whose `type` field holds the type
-            // shared by all declarators.
+            // Property and event declarations carry `type` directly,
+            // while field_declaration nests it one level deeper inside
+            // a `variable_declaration`. Read whichever applies, shared
+            // across every declarator in the statement.
             let declared_type = node
                 .child_by_field_name("type")
                 .map(|n| text(n, source))
@@ -275,7 +289,6 @@ fn walk_csharp_node(
                 })
                 .unwrap_or_default();
 
-            // Walk descendants for variable_declarator(s) / identifier name.
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
@@ -288,8 +301,6 @@ fn walk_csharp_node(
                     symbols.push(var_sym);
                 }
             } else {
-                // Field declarations have a declaration child whose
-                // variable_declarator children carry identifiers.
                 let cursor = &mut node.walk();
                 for child in node.children(cursor) {
                     collect_field_names(
@@ -366,8 +377,6 @@ fn collect_csharp_params(
         if pname.is_empty() || pname == "this" {
             continue;
         }
-        // C# parameters carry a `type` field (e.g. `Foo`, `List<Bar>`,
-        // `Foo?`). Stash it for the call-site resolver.
         let mut metadata = std::collections::HashMap::new();
         if let Some(type_node) = child.child_by_field_name("type") {
             let ty = text(type_node, source);

@@ -258,7 +258,14 @@ fn walk_c_node(
                     NodeLabel::Function
                 };
                 let fn_qname = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, label, &node));
+                let mut fn_sym = sym(file_path, parent_name, &name, label, &node);
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let ty = text(type_node, source);
+                    if !ty.is_empty() && ty != "void" {
+                        fn_sym.metadata.insert("declared_type".to_string(), ty);
+                    }
+                }
+                symbols.push(fn_sym);
                 if let Some(fn_declarator) = find_function_declarator(declarator)
                     && let Some(params) = fn_declarator.child_by_field_name("parameters")
                 {
@@ -273,7 +280,14 @@ fn walk_c_node(
                 && let Some(name) = extract_function_name(declarator, source)
             {
                 let fn_qname = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Function, &node));
+                let mut fn_sym = sym(file_path, parent_name, &name, NodeLabel::Function, &node);
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let ty = text(type_node, source);
+                    if !ty.is_empty() && ty != "void" {
+                        fn_sym.metadata.insert("declared_type".to_string(), ty);
+                    }
+                }
+                symbols.push(fn_sym);
                 if let Some(params) = declarator.child_by_field_name("parameters") {
                     collect_c_params(params, source, &fn_qname, symbols);
                 }
@@ -289,13 +303,10 @@ fn walk_c_node(
             }
         }
         "field_declaration" => {
-            // Struct / class member variable.
             if let Some(declarator) = node.child_by_field_name("declarator")
                 && let Some(name) = extract_plain_name(declarator, source)
             {
                 let mut var_sym = sym(file_path, parent_name, &name, NodeLabel::Variable, &node);
-                // Capture the field type (e.g. `Foo`, `Foo*`,
-                // `std::shared_ptr<Bar>`) for the call-site resolver.
                 if let Some(type_node) = node.child_by_field_name("type") {
                     let ty = text(type_node, source);
                     if !ty.is_empty() {
@@ -357,8 +368,6 @@ fn collect_c_params(
         if pname.is_empty() {
             continue;
         }
-        // Read the parameter's `type` field. `Foo*`, `const Foo&` etc.
-        // — the resolver will strip pointers/qualifiers later.
         let mut metadata = std::collections::HashMap::new();
         if let Some(type_node) = child.child_by_field_name("type") {
             let ty = text(type_node, source);

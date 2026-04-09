@@ -211,7 +211,22 @@ fn walk_java_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
-                    symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node));
+                    let mut method_sym = sym(
+                        file_path,
+                        parent_name,
+                        &name,
+                        NodeLabel::Method,
+                        &node,
+                    );
+                    if let Some(type_node) = node.child_by_field_name("type") {
+                        let ty = text(type_node, source);
+                        if !ty.is_empty() && ty != "void" {
+                            method_sym
+                                .metadata
+                                .insert("declared_type".to_string(), ty);
+                        }
+                    }
+                    symbols.push(method_sym);
                     let fn_qname = qname(file_path, parent_name, &name);
                     if let Some(params) = node.child_by_field_name("parameters") {
                         collect_java_params(params, source, &fn_qname, symbols);
@@ -232,10 +247,10 @@ fn walk_java_node(
             }
         }
         "field_declaration" => {
-            // `field_declaration → variable_declarator → name`.
-            // The type lives on the enclosing field_declaration's `type`
-            // field and applies to every declarator in the same statement
-            // (`private Foo a, b;` → both `a` and `b` have type `Foo`).
+            // A single field_declaration can declare multiple variables
+            // that share one type (`private Foo a, b;`), so read the
+            // type once at the declaration level and apply it to every
+            // variable_declarator child.
             let declared_type = node
                 .child_by_field_name("type")
                 .map(|n| text(n, source))
@@ -255,8 +270,6 @@ fn walk_java_node(
                             &child,
                         );
                         if !declared_type.is_empty() {
-                            // Stash the type for the call-site resolver
-                            // so `this.field.method()` can bind.
                             field_sym
                                 .metadata
                                 .insert("declared_type".to_string(), declared_type.clone());
@@ -333,8 +346,6 @@ fn collect_java_params(
             continue;
         }
 
-        // Capture parameter type (e.g. `Foo`, `List<Bar>`, `String...`
-        // for varargs) for the call-site resolver.
         let mut metadata = std::collections::HashMap::new();
         if let Some(type_node) = child.child_by_field_name("type") {
             let ty = text(type_node, source);

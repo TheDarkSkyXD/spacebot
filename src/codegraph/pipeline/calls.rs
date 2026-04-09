@@ -45,13 +45,18 @@ pub async fn resolve_calls(
 
     tracing::debug!(project_id = %project_id, "resolving call-sites (AST-aware)");
 
-    // 1. Query all Function and Method nodes — build symbol table.
+    // 1. Query all Function and Method nodes.
     let mut symbols_by_name: HashMap<String, Vec<SymbolEntry>> = HashMap::new();
+    // qname → (return_type_text, src_label) — keyed by qname because
+    // we emit one USES edge per callable, and src_label is stashed so
+    // the edge MATCH clause can use the correct source label without
+    // re-deriving it from the qname.
+    let mut function_return_types: HashMap<String, (String, String)> = HashMap::new();
 
     for (node_label, label_str) in &[("Function", "Function"), ("Method", "Method")] {
         let rows = db.query(&format!(
             "MATCH (n:{node_label}) WHERE n.project_id = '{pid}' \
-             RETURN n.qualified_name, n.name, n.source_file"
+             RETURN n.qualified_name, n.name, n.source_file, n.declared_type"
         )).await?;
 
         for row in &rows {
@@ -59,13 +64,20 @@ pub async fn resolve_calls(
                 Some(lbug::Value::String(qname)),
                 Some(lbug::Value::String(name)),
                 Some(lbug::Value::String(source_file)),
-            ) = (row.first(), row.get(1), row.get(2))
+                declared_type_val,
+            ) = (row.first(), row.get(1), row.get(2), row.get(3))
             {
                 symbols_by_name.entry(name.clone()).or_default().push(SymbolEntry {
                     qualified_name: qname.clone(),
                     source_file: source_file.clone(),
                     label: label_str.to_string(),
                 });
+                if let Some(lbug::Value::String(ty)) = declared_type_val
+                    && !ty.is_empty()
+                {
+                    function_return_types
+                        .insert(qname.clone(), (ty.clone(), label_str.to_string()));
+                }
             }
         }
     }
@@ -423,6 +435,104 @@ pub async fn resolve_calls(
         }
     }
 
+    // Disambiguation policy for every USES tier below: a unique base
+    // class match scores 0.85, multiple matches drop to 0.50 and fan
+    // out to at most three candidates to keep the edge set bounded on
+    // names that collide across large workspaces.
+    if let Some(pf) = progress_fn {
+        pf(
+            0.78,
+            &format!(
+                "Emitting type-reference edges ({} params, {} fields)",
+                param_types.len(),
+                field_types.len()
+            ),
+            &result,
+        );
+    }
+
+    for ((fn_qname, param_name), type_text) in &param_types {
+        let Some(base) = base_type_name(type_text) else { continue };
+        let Some(entries) = classes_by_name.get(&base) else { continue };
+        let param_qname = format!("{fn_qname}::{param_name}");
+        let confidence = if entries.len() == 1 { 0.85 } else { 0.50 };
+        let reason = if entries.len() == 1 {
+            "type-ref-unique"
+        } else {
+            "type-ref-multi"
+        };
+        for (class_qn, _sf) in entries.iter().take(3) {
+            let edge_key = format!("USE:{param_qname}->{class_qn}");
+            if seen_edges.insert(edge_key) {
+                push_uses_edge(
+                    &mut edge_stmts,
+                    "Parameter",
+                    &param_qname,
+                    class_qn,
+                    &pid,
+                    confidence,
+                    reason,
+                );
+            }
+        }
+    }
+
+    for ((class_qn, field_name), type_text) in &field_types {
+        let Some(base) = base_type_name(type_text) else { continue };
+        let Some(entries) = classes_by_name.get(&base) else { continue };
+        let field_qname = format!("{class_qn}::{field_name}");
+        let confidence = if entries.len() == 1 { 0.85 } else { 0.50 };
+        let reason = if entries.len() == 1 {
+            "type-ref-unique"
+        } else {
+            "type-ref-multi"
+        };
+        for (target_qn, _sf) in entries.iter().take(3) {
+            // Skip self-edges (linked-list nodes that hold a field of
+            // their own type) — the edge carries no new information.
+            if target_qn == class_qn {
+                continue;
+            }
+            let edge_key = format!("USE:{field_qname}->{target_qn}");
+            if seen_edges.insert(edge_key) {
+                push_uses_edge(
+                    &mut edge_stmts,
+                    "Variable",
+                    &field_qname,
+                    target_qn,
+                    &pid,
+                    confidence,
+                    reason,
+                );
+            }
+        }
+    }
+
+    for (fn_qname, (type_text, src_label)) in &function_return_types {
+        let Some(base) = base_type_name(type_text) else { continue };
+        let Some(entries) = classes_by_name.get(&base) else { continue };
+        let confidence = if entries.len() == 1 { 0.85 } else { 0.50 };
+        let reason = if entries.len() == 1 {
+            "return-type-unique"
+        } else {
+            "return-type-multi"
+        };
+        for (target_qn, _sf) in entries.iter().take(3) {
+            let edge_key = format!("USE:{fn_qname}->{target_qn}");
+            if seen_edges.insert(edge_key) {
+                push_uses_edge(
+                    &mut edge_stmts,
+                    src_label,
+                    fn_qname,
+                    target_qn,
+                    &pid,
+                    confidence,
+                    reason,
+                );
+            }
+        }
+    }
+
     // 4. Execute edge batch.
     const BATCH_SIZE: usize = 100;
     let total_edge_chunks = (edge_stmts.len() + BATCH_SIZE - 1).max(1) / BATCH_SIZE.max(1);
@@ -677,6 +787,36 @@ fn push_edge(
              WHERE a.qualified_name = '{src_escaped}' AND a.project_id = '{pid}' \
              AND b.qualified_name = '{tgt_escaped}' AND b.project_id = '{pid}' \
              CREATE (a)-[:CodeRelation {{type: 'CALLS', confidence: {confidence}, reason: '{reason}', step: 0}}]->(b)",
+        ));
+    }
+}
+
+/// Build and push a USES edge from a typed symbol to its declared class.
+///
+/// Unlike `push_edge`, the source label is passed in explicitly — callers
+/// already know whether the source is Parameter/Variable/Function/Method
+/// and fanning out across both Function and Method (as `push_edge` does)
+/// would double-emit for Parameter/Variable sources. One MATCH statement
+/// is produced per candidate target label so Class/Struct/Interface/Trait
+/// all resolve without the caller needing to know which applies.
+fn push_uses_edge(
+    stmts: &mut Vec<String>,
+    src_label: &str,
+    src_qn: &str,
+    tgt_qn: &str,
+    pid: &str,
+    confidence: f64,
+    reason: &str,
+) {
+    let src_escaped = cypher_escape(src_qn);
+    let tgt_escaped = cypher_escape(tgt_qn);
+
+    for tgt_label in &["Class", "Struct", "Interface", "Trait"] {
+        stmts.push(format!(
+            "MATCH (a:{src_label}), (b:{tgt_label}) \
+             WHERE a.qualified_name = '{src_escaped}' AND a.project_id = '{pid}' \
+             AND b.qualified_name = '{tgt_escaped}' AND b.project_id = '{pid}' \
+             CREATE (a)-[:CodeRelation {{type: 'USES', confidence: {confidence}, reason: '{reason}', step: 0}}]->(b)",
         ));
     }
 }

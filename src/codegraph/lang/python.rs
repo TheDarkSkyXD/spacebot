@@ -110,8 +110,9 @@ fn walk_py_node(
                     metadata: std::collections::HashMap::new(),
                 });
                 if let Some(body) = node.child_by_field_name("body") {
-                    // Collect class field names (class-level assignments and
-                    // self.X = ... assignments inside methods), deduped.
+                    // Collect class-level assignments (`x = 0`, `x: T = 0`)
+                    // and instance assignments (`self.x = ...`) into one
+                    // deduplicated map keyed by field name.
                     let mut fields: std::collections::HashMap<String, (u32, u32, Option<String>)> =
                         std::collections::HashMap::new();
                     collect_py_class_fields(body, source, &mut fields);
@@ -120,8 +121,6 @@ fn walk_py_node(
                         if let Some(ty) = declared_type
                             && !ty.is_empty()
                         {
-                            // Capture the annotation type for
-                            // `x: Foo = ...` style class fields.
                             metadata.insert("declared_type".to_string(), ty.clone());
                         }
                         symbols.push(ExtractedSymbol {
@@ -139,7 +138,6 @@ fn walk_py_node(
                         });
                     }
 
-                    // Then recurse normally for nested classes / methods.
                     let cursor = &mut body.walk();
                     for child in body.children(cursor) {
                         walk_py_node(child, file_path, source, symbols, Some(&qname));
@@ -157,6 +155,13 @@ fn walk_py_node(
                     NodeLabel::Function
                 };
                 let fn_qname = qname(file_path, parent_name, &name);
+                let mut metadata = std::collections::HashMap::new();
+                if let Some(return_type) = node.child_by_field_name("return_type") {
+                    let ty = text_str(return_type, source);
+                    if !ty.is_empty() {
+                        metadata.insert("declared_type".to_string(), ty);
+                    }
+                }
                 symbols.push(ExtractedSymbol {
                     name: name.clone(),
                     qualified_name: fn_qname.clone(),
@@ -168,10 +173,9 @@ fn walk_py_node(
                     extends: None,
                     implements: Vec::new(),
                     decorates: None,
-                    metadata: std::collections::HashMap::new(),
+                    metadata,
                 });
 
-                // Extract parameters as Parameter nodes parented to the function.
                 if let Some(params) = node.child_by_field_name("parameters") {
                     collect_py_params(params, source, &fn_qname, symbols);
                 }
@@ -257,9 +261,9 @@ fn collect_py_params(
         let (pname, declared_type) = match child.kind() {
             "identifier" => (Some(text_str(child, source)), None),
             "typed_parameter" | "typed_default_parameter" => {
-                // Name lives on the first identifier child or in the
-                // `name` field depending on grammar version. Try field
-                // first, fall back to scanning children.
+                // The parameter name sometimes lives on the `name` field
+                // and sometimes only as the first identifier child —
+                // which varies by tree-sitter-python grammar version.
                 let name = child
                     .child_by_field_name("name")
                     .map(|n| text_str(n, source))
@@ -272,9 +276,6 @@ fn collect_py_params(
                         }
                         None
                     });
-                // Capture annotation type for `x: Foo` parameters.
-                // `typed_parameter` is `identifier : type`; the `type`
-                // field carries the annotation.
                 let ty = child
                     .child_by_field_name("type")
                     .map(|n| text_str(n, source));

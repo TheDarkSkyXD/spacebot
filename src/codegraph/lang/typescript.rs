@@ -203,6 +203,13 @@ fn walk_ts_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, source);
                 let fn_qname = qualified_name(file_path, parent_name, &name);
+                let mut metadata = std::collections::HashMap::new();
+                if let Some(return_type) = node.child_by_field_name("return_type") {
+                    let ty = clean_ts_type_annotation(&node_text(return_type, source));
+                    if !ty.is_empty() {
+                        metadata.insert("declared_type".to_string(), ty);
+                    }
+                }
                 symbols.push(ExtractedSymbol {
                     name: name.clone(),
                     qualified_name: fn_qname.clone(),
@@ -214,7 +221,7 @@ fn walk_ts_node(
                     extends: None,
                     implements: Vec::new(),
                     decorates: None,
-                    metadata: std::collections::HashMap::new(),
+                    metadata,
                 });
                 if let Some(params) = node.child_by_field_name("parameters") {
                     collect_ts_params(params, source, &fn_qname, symbols);
@@ -230,13 +237,22 @@ fn walk_ts_node(
                     NodeLabel::Variable
                 };
                 let fn_qname = qualified_name(file_path, parent_name, &name);
-                // public_field_definition may carry a type annotation
-                // (`foo: Bar = ...`) that's the field's type.
+                // Both public_field_definition (`foo: Bar = ...`) and
+                // method_definition (`foo(): Bar`) can expose a type —
+                // the former through the `type` field and the latter
+                // through `return_type`. Try both so each kind is
+                // covered regardless of grammar quirks across versions.
                 let mut metadata = std::collections::HashMap::new();
-                if kind == "public_field_definition"
-                    && let Some(type_node) = node.child_by_field_name("type")
-                {
+                if let Some(type_node) = node.child_by_field_name("type") {
                     let ty = clean_ts_type_annotation(&node_text(type_node, source));
+                    if !ty.is_empty() {
+                        metadata.insert("declared_type".to_string(), ty);
+                    }
+                }
+                if kind == "method_definition"
+                    && let Some(return_type) = node.child_by_field_name("return_type")
+                {
+                    let ty = clean_ts_type_annotation(&node_text(return_type, source));
                     if !ty.is_empty() {
                         metadata.insert("declared_type".to_string(), ty);
                     }
@@ -254,7 +270,6 @@ fn walk_ts_node(
                     decorates: None,
                     metadata,
                 });
-                // Methods (and only methods) get parameter extraction.
                 if kind == "method_definition"
                     && let Some(params) = node.child_by_field_name("parameters")
                 {
@@ -286,12 +301,9 @@ fn walk_ts_node(
                 return;
             }
         }
-        // Interface/class property and method signatures.
         "property_signature" | "property_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, source);
-                // Capture the annotation type for interface/class
-                // property declarations (`foo: Bar`).
                 let mut metadata = std::collections::HashMap::new();
                 if let Some(type_node) = node.child_by_field_name("type") {
                     let ty = clean_ts_type_annotation(&node_text(type_node, source));
