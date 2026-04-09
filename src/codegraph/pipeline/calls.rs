@@ -193,6 +193,55 @@ pub async fn resolve_calls(
         }
     }
 
+    // Explicit symbol import map: source_file → (imported_name → SymbolEntry).
+    // Every per-symbol Import node ends up here when its name matches a
+    // Function/Method in the same project. The call loop consults this
+    // before falling through to the looser import-scoped-file tier, so
+    // `foo()` in a file that did `import { foo } from './bar'` binds
+    // directly to the specific `bar.ts::foo` even when multiple unrelated
+    // `foo` functions exist elsewhere in the graph.
+    let mut imported_symbols_by_file: HashMap<String, HashMap<String, SymbolEntry>> = HashMap::new();
+    let import_rows = db
+        .query(&format!(
+            "MATCH (i:Import) WHERE i.project_id = '{pid}' \
+             RETURN i.source_file, i.name, i.import_source"
+        ))
+        .await?;
+    for row in &import_rows {
+        if let (
+            Some(lbug::Value::String(src_file)),
+            Some(lbug::Value::String(local_name)),
+            Some(lbug::Value::String(_module)),
+        ) = (row.first(), row.get(1), row.get(2))
+            && !local_name.is_empty()
+            && local_name != "*"
+            && let Some(entries) = symbols_by_name.get(local_name.as_str())
+        {
+            // Prefer the Function/Method whose qname leaf matches the
+            // imported name exactly so that collisions across unrelated
+            // files don't map all of them to the same import binding.
+            if let Some(entry) = entries.iter().find(|e| {
+                e.qualified_name
+                    .rsplit("::")
+                    .next()
+                    .map(|leaf| leaf == local_name.as_str())
+                    .unwrap_or(false)
+            }) {
+                imported_symbols_by_file
+                    .entry(src_file.clone())
+                    .or_default()
+                    .insert(
+                        local_name.clone(),
+                        SymbolEntry {
+                            qualified_name: entry.qualified_name.clone(),
+                            source_file: entry.source_file.clone(),
+                            label: entry.label.clone(),
+                        },
+                    );
+            }
+        }
+    }
+
     // 3. Extract call sites from each file using AST analysis, then resolve.
     let mut edge_stmts: Vec<String> = Vec::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
@@ -363,6 +412,30 @@ pub async fn resolve_calls(
                         &pid,
                         0.95,
                         "same-file",
+                    );
+                }
+                continue;
+            }
+
+            // Tier 1b: explicitly imported symbol (0.93). An imported
+            // symbol match is strictly tighter than the bulk "imported-
+            // file" tier below — we know not just which file exports the
+            // callee but that the current file named it in its import
+            // list, so same-name collisions in unrelated files can't
+            // confuse resolution.
+            if let Some(file_imports) = imported_symbols_by_file.get(relative.as_str())
+                && let Some(target) = file_imports.get(&site.callee_name)
+            {
+                let edge_key = format!("{}->{}", site.caller_qualified_name, target.qualified_name);
+                if seen_edges.insert(edge_key) {
+                    push_edge(
+                        &mut edge_stmts,
+                        &site.caller_qualified_name,
+                        &target.qualified_name,
+                        &target.label,
+                        &pid,
+                        0.93,
+                        "imported-symbol",
                     );
                 }
                 continue;

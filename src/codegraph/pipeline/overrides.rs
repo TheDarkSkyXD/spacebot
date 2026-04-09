@@ -1,4 +1,4 @@
-//! Phase 6b: Resolve method overrides via parent-class chain walk.
+//! Resolve method overrides via parent-class chain walk.
 //!
 //! Runs after [`super::heritage::resolve_heritage`] inside the Heritage
 //! phase. Builds a transitive parent chain for every class-like node
@@ -6,7 +6,7 @@
 //! child class walks up the chain looking for the nearest ancestor
 //! method with the same name and emits an OVERRIDES edge.
 //!
-//! Limitations (intentional, will be relaxed in follow-up waves):
+//! Known limitations:
 //!
 //! - Single-name match only — no signature comparison. Overloading and
 //!   overriding are not distinguished, so a Java overload of
