@@ -1,4 +1,4 @@
-//! Phase 4: Resolve import/require/use statements.
+//! Resolve import/require/use statements.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,10 +49,10 @@ pub async fn resolve_imports_scoped(
         "resolving imports"
     );
 
-    // 1. Query all Import nodes with their source file and import_source.
+    // 1. Query all Import nodes with their source file, import_source, and name.
     let imports = db.query(&format!(
         "MATCH (i:Import) WHERE i.project_id = '{pid}' \
-         RETURN i.source_file, i.import_source"
+         RETURN i.source_file, i.import_source, i.name"
     )).await?;
 
     // 2. Query all File nodes to build a lookup map.
@@ -83,12 +83,45 @@ pub async fn resolve_imports_scoped(
         }
     }
 
+    // 2b. Build a (source_file, symbol_name) → (symbol_qname, symbol_label)
+    //     lookup across every symbol kind that an import can target.
+    //     Keyed by source_file because the resolver first narrows to the
+    //     target file via import_source, then looks up the name inside.
+    let mut symbols_by_file_name: HashMap<(String, String), (String, String)> = HashMap::new();
+    for label in &["Function", "Method", "Class", "Interface", "Struct", "Trait", "Variable", "Enum", "TypeAlias", "Const"] {
+        let rows = db.query(&format!(
+            "MATCH (n:{label}) WHERE n.project_id = '{pid}' \
+             RETURN n.source_file, n.name, n.qualified_name"
+        )).await?;
+        for row in &rows {
+            if let (
+                Some(lbug::Value::String(sf)),
+                Some(lbug::Value::String(name)),
+                Some(lbug::Value::String(qname)),
+            ) = (row.first(), row.get(1), row.get(2))
+            {
+                symbols_by_file_name
+                    .entry((sf.clone(), name.clone()))
+                    .or_insert_with(|| (qname.clone(), label.to_string()));
+            }
+        }
+    }
+
     // 3. For each import, resolve to a file and create an IMPORTS edge.
     let mut edge_stmts: Vec<String> = Vec::new();
 
     for row in &imports {
-        let (source_file, import_source) = match (row.first(), row.get(1)) {
-            (Some(lbug::Value::String(sf)), Some(lbug::Value::String(is))) => (sf, is),
+        let (source_file, import_source, name) = match (row.first(), row.get(1), row.get(2)) {
+            (
+                Some(lbug::Value::String(sf)),
+                Some(lbug::Value::String(is)),
+                Some(lbug::Value::String(n)),
+            ) => (sf, is, n.as_str()),
+            (
+                Some(lbug::Value::String(sf)),
+                Some(lbug::Value::String(is)),
+                _,
+            ) => (sf, is, ""),
             _ => continue,
         };
 
@@ -155,6 +188,23 @@ pub async fn resolve_imports_scoped(
                      AND t.qualified_name = '{tgt_escaped}' \
                      CREATE (s)-[:CodeRelation {{type: 'IMPORTS', confidence: 1.0, reason: 'import statement', step: 0}}]->(t)",
                 ));
+
+                // Symbol-level import edge: if the Import node carries a
+                // specific symbol name, try to find the matching symbol
+                // in the target file and emit File→Symbol alongside the
+                // File→File edge above. Wildcards and side-effect-only
+                // imports leave `name` empty or "*" and are skipped.
+                if !name.is_empty() && name != "*"
+                    && let Some((sym_qname, sym_label)) =
+                        symbols_by_file_name.get(&(normalized.clone(), name.to_string()))
+                {
+                    let sym_escaped = cypher_escape(sym_qname);
+                    edge_stmts.push(format!(
+                        "MATCH (s:File), (t:{sym_label}) WHERE s.qualified_name = '{src_escaped}' \
+                         AND t.qualified_name = '{sym_escaped}' \
+                         CREATE (s)-[:CodeRelation {{type: 'IMPORTS', confidence: 0.95, reason: 'symbol import', step: 0}}]->(t)",
+                    ));
+                }
 
                 // Record in import map for call resolution
                 import_map

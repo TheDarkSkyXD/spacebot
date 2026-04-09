@@ -417,13 +417,29 @@ fn collect_import_specs(
     match node.kind() {
         "import_spec" => {
             // path is an interpreted_string_literal; strip the quotes.
+            // The locally bound name is either the explicit alias
+            // (`f "fmt"`, `. "fmt"`, `_ "fmt"`) or the trailing segment
+            // of the package path (`"net/http"` → `http`).
             if let Some(path_node) = node.child_by_field_name("path") {
                 let raw = text(path_node, source);
                 let path = raw.trim_matches('"').to_string();
                 if !path.is_empty() {
+                    let alias = node.child_by_field_name("name").map(|n| text(n, source));
+                    let name = alias.clone().unwrap_or_else(|| {
+                        path.rsplit('/').next().unwrap_or(&path).to_string()
+                    });
+                    let mut metadata = std::collections::HashMap::new();
+                    if let Some(ref a) = alias
+                        && a != &name
+                    {
+                        metadata.insert(
+                            "original_name".to_string(),
+                            path.rsplit('/').next().unwrap_or(&path).to_string(),
+                        );
+                    }
                     symbols.push(ExtractedSymbol {
-                        name: path.clone(),
-                        qualified_name: format!("{file_path}::import::{path}"),
+                        name: name.clone(),
+                        qualified_name: format!("{file_path}::import::{path}::{name}"),
                         label: NodeLabel::Import,
                         line_start: node.start_position().row as u32 + 1,
                         line_end: node.end_position().row as u32 + 1,
@@ -432,7 +448,7 @@ fn collect_import_specs(
                         extends: None,
                         implements: Vec::new(),
                         decorates: None,
-                        metadata: std::collections::HashMap::new(),
+                        metadata,
                     });
                 }
             }

@@ -118,7 +118,8 @@ fn walk_java_node(
         }
         "import_declaration" => {
             // `import foo.bar.Baz;` — strip the trailing `;` and the leading
-            // `import` keyword. The scoped_identifier child carries the path.
+            // `import`/`static` keywords. Wildcards keep name="*" and use
+            // the package portion as the source.
             let raw = node
                 .utf8_text(source.as_bytes())
                 .unwrap_or("")
@@ -127,14 +128,20 @@ fn walk_java_node(
                 .trim();
             let path = raw.trim_start_matches("static").trim().to_string();
             if !path.is_empty() {
+                let (name, import_source) = if let Some(stripped) = path.strip_suffix(".*") {
+                    ("*".to_string(), stripped.to_string())
+                } else {
+                    let leaf = path.rsplit('.').next().unwrap_or(&path).to_string();
+                    (leaf, path.clone())
+                };
                 symbols.push(ExtractedSymbol {
-                    name: path.clone(),
-                    qualified_name: format!("{file_path}::import::{path}"),
+                    name: name.clone(),
+                    qualified_name: format!("{file_path}::import::{import_source}::{name}"),
                     label: NodeLabel::Import,
                     line_start: node.start_position().row as u32 + 1,
                     line_end: node.end_position().row as u32 + 1,
                     parent: None,
-                    import_source: Some(path),
+                    import_source: Some(import_source),
                     extends: None,
                     implements: Vec::new(),
                     decorates: None,

@@ -114,7 +114,10 @@ fn walk_csharp_node(
 ) {
     match node.kind() {
         "using_directive" => {
-            // using X.Y.Z;
+            // `using X.Y.Z;` or `using alias = X.Y.Z;`. Handle both by
+            // looking at the raw text — splitting on `=` picks up the
+            // alias form, and the trailing `.*` check is for the rare
+            // wildcard-like `using static X.Y.*` variant.
             let raw = node
                 .utf8_text(source.as_bytes())
                 .unwrap_or("")
@@ -125,18 +128,33 @@ fn walk_csharp_node(
                 .trim()
                 .to_string();
             if !raw.is_empty() {
+                let (name, import_source, original) = if let Some((alias, path)) = raw.split_once('=') {
+                    let alias = alias.trim().to_string();
+                    let path = path.trim().to_string();
+                    let orig = path.rsplit('.').next().unwrap_or(&path).to_string();
+                    (alias, path, Some(orig))
+                } else {
+                    let leaf = raw.rsplit('.').next().unwrap_or(&raw).to_string();
+                    (leaf, raw.clone(), None)
+                };
+                let mut metadata = std::collections::HashMap::new();
+                if let Some(orig) = original
+                    && orig != name
+                {
+                    metadata.insert("original_name".to_string(), orig);
+                }
                 symbols.push(ExtractedSymbol {
-                    name: raw.clone(),
-                    qualified_name: format!("{file_path}::import::{raw}"),
+                    name: name.clone(),
+                    qualified_name: format!("{file_path}::import::{import_source}::{name}"),
                     label: NodeLabel::Import,
                     line_start: node.start_position().row as u32 + 1,
                     line_end: node.end_position().row as u32 + 1,
                     parent: None,
-                    import_source: Some(raw),
+                    import_source: Some(import_source),
                     extends: None,
                     implements: Vec::new(),
                     decorates: None,
-                    metadata: std::collections::HashMap::new(),
+                    metadata,
                 });
             }
         }

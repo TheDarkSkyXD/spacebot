@@ -415,19 +415,7 @@ fn walk_ts_node(
                     .trim_matches('"')
                     .trim_matches('\'')
                     .to_string();
-                symbols.push(ExtractedSymbol {
-                    name: source_text.clone(),
-                    qualified_name: format!("{file_path}::import::{source_text}"),
-                    label: NodeLabel::Import,
-                    line_start: node.start_position().row as u32 + 1,
-                    line_end: node.end_position().row as u32 + 1,
-                    parent: None,
-                    import_source: Some(source_text),
-                    extends: None,
-                    implements: Vec::new(),
-                    decorates: None,
-                    metadata: std::collections::HashMap::new(),
-                });
+                collect_ts_imports(node, file_path, &source_text, source, symbols);
             }
         }
         "lexical_declaration" | "variable_declaration" => {
@@ -582,6 +570,120 @@ fn clean_ts_type_annotation(raw: &str) -> String {
         .trim_start_matches(':')
         .trim()
         .to_string()
+}
+
+/// Emit one Import node per imported binding from an `import_statement`.
+/// Default / namespace / named-imports each contribute one or more nodes;
+/// side-effect-only imports (`import "./style.css"`) emit a single nameless
+/// node so the file-level `File → File` edge still resolves.
+#[cfg(feature = "codegraph")]
+fn collect_ts_imports(
+    stmt: tree_sitter::Node,
+    file_path: &str,
+    source_text: &str,
+    source: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let line_start = stmt.start_position().row as u32 + 1;
+    let line_end = stmt.end_position().row as u32 + 1;
+
+    let push = |name: &str, original: Option<&str>, symbols: &mut Vec<ExtractedSymbol>| {
+        let qname = if name.is_empty() {
+            format!("{file_path}::import::{source_text}")
+        } else {
+            format!("{file_path}::import::{source_text}::{name}")
+        };
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(orig) = original {
+            metadata.insert("original_name".to_string(), orig.to_string());
+        }
+        symbols.push(ExtractedSymbol {
+            name: name.to_string(),
+            qualified_name: qname,
+            label: NodeLabel::Import,
+            line_start,
+            line_end,
+            parent: None,
+            import_source: Some(source_text.to_string()),
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata,
+        });
+    };
+
+    let import_clause = {
+        let cursor = &mut stmt.walk();
+        stmt.children(cursor).find(|c| c.kind() == "import_clause")
+    };
+
+    // Side-effect import: no clause, just `import "./style.css"`. Emit
+    // one nameless node so the file-level resolver still binds.
+    let Some(clause) = import_clause else {
+        push("", None, symbols);
+        return;
+    };
+
+    let mut emitted = false;
+    let clause_cursor = &mut clause.walk();
+    for child in clause.children(clause_cursor) {
+        match child.kind() {
+            "identifier" => {
+                // Default import: `import Foo from './x'`.
+                let name = node_text(child, source);
+                if !name.is_empty() {
+                    push(&name, None, symbols);
+                    emitted = true;
+                }
+            }
+            "namespace_import" => {
+                // `import * as foo from './x'` — walk to the identifier.
+                let ns_cursor = &mut child.walk();
+                for c in child.children(ns_cursor) {
+                    if c.kind() == "identifier" {
+                        let name = node_text(c, source);
+                        if !name.is_empty() {
+                            push(&name, None, symbols);
+                            emitted = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            "named_imports" => {
+                // `import { a, b as c } from './x'` — each import_specifier
+                // carries a `name` field and an optional `alias` field.
+                let named_cursor = &mut child.walk();
+                for spec in child.children(named_cursor) {
+                    if spec.kind() != "import_specifier" {
+                        continue;
+                    }
+                    let orig_name = spec
+                        .child_by_field_name("name")
+                        .map(|n| node_text(n, source))
+                        .unwrap_or_default();
+                    let local = spec
+                        .child_by_field_name("alias")
+                        .map(|n| node_text(n, source))
+                        .unwrap_or_else(|| orig_name.clone());
+                    if !local.is_empty() {
+                        let original = if local != orig_name {
+                            Some(orig_name.as_str())
+                        } else {
+                            None
+                        };
+                        push(&local, original, symbols);
+                        emitted = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !emitted {
+        push("", None, symbols);
+    }
 }
 
 #[cfg(feature = "codegraph")]

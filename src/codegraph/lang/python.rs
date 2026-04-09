@@ -182,26 +182,7 @@ fn walk_py_node(
             }
         }
         "import_statement" | "import_from_statement" => {
-            let text = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-            let source_module = if kind == "import_from_statement" {
-                node.child_by_field_name("module_name")
-                    .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("").to_string())
-            } else {
-                Some(text.trim_start_matches("import ").trim().to_string())
-            };
-            symbols.push(ExtractedSymbol {
-                name: source_module.clone().unwrap_or_default(),
-                qualified_name: format!("{file_path}::import::{}", source_module.as_deref().unwrap_or("?")),
-                label: NodeLabel::Import,
-                line_start: node.start_position().row as u32 + 1,
-                line_end: node.end_position().row as u32 + 1,
-                parent: None,
-                import_source: source_module,
-                extends: None,
-                implements: Vec::new(),
-                decorates: None,
-                metadata: std::collections::HashMap::new(),
-            });
+            collect_py_imports(node, file_path, source, symbols);
         }
         "decorated_definition" => {
             // Process the decorators, then recurse into the definition.
@@ -234,6 +215,149 @@ fn walk_py_node(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_py_node(child, file_path, source, symbols, parent_name);
+    }
+}
+
+/// Emit one Import node per imported binding from a Python
+/// `import_statement` or `import_from_statement`.
+///
+/// Layouts handled:
+/// - `import foo`                 → name="foo", source="foo"
+/// - `import foo as bar`          → name="bar", source="foo", original_name="foo"
+/// - `import foo, bar`            → two nodes
+/// - `from foo import bar`        → name="bar", source="foo"
+/// - `from foo import bar as baz` → name="baz", source="foo", original_name="bar"
+/// - `from foo import *`          → name="*", source="foo"
+/// - `from . import foo`          → name="foo", source="." (relative)
+#[cfg(feature = "codegraph")]
+fn collect_py_imports(
+    stmt: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let line_start = stmt.start_position().row as u32 + 1;
+    let line_end = stmt.end_position().row as u32 + 1;
+    let kind = stmt.kind();
+
+    let push = |name: &str,
+                import_source: &str,
+                original: Option<&str>,
+                symbols: &mut Vec<ExtractedSymbol>| {
+        let qname = if name.is_empty() {
+            format!("{file_path}::import::{import_source}")
+        } else {
+            format!("{file_path}::import::{import_source}::{name}")
+        };
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(orig) = original {
+            metadata.insert("original_name".to_string(), orig.to_string());
+        }
+        symbols.push(ExtractedSymbol {
+            name: name.to_string(),
+            qualified_name: qname,
+            label: NodeLabel::Import,
+            line_start,
+            line_end,
+            parent: None,
+            import_source: Some(import_source.to_string()),
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata,
+        });
+    };
+
+    if kind == "import_statement" {
+        // `import a, b as c, d.e.f` — each `name:` field is either a
+        // dotted_name (bound locally to its leftmost segment) or an
+        // aliased_import (name: dotted_name, alias: identifier).
+        let cursor = &mut stmt.walk();
+        for child in stmt.children(cursor) {
+            match child.kind() {
+                "dotted_name" => {
+                    let module = text_str(child, source);
+                    // `import foo.bar` binds `foo` in the local namespace.
+                    let local = module.split('.').next().unwrap_or(&module).to_string();
+                    if !local.is_empty() {
+                        push(&local, &module, None, symbols);
+                    }
+                }
+                "aliased_import" => {
+                    let module = child
+                        .child_by_field_name("name")
+                        .map(|n| text_str(n, source))
+                        .unwrap_or_default();
+                    let alias = child
+                        .child_by_field_name("alias")
+                        .map(|n| text_str(n, source))
+                        .unwrap_or_default();
+                    if !alias.is_empty() {
+                        let orig = if alias != module { Some(module.as_str()) } else { None };
+                        push(&alias, &module, orig, symbols);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    // import_from_statement: one module_name, any number of `name:` children.
+    let module_name = stmt
+        .child_by_field_name("module_name")
+        .map(|n| text_str(n, source))
+        .unwrap_or_default();
+
+    let mut emitted = false;
+    let cursor = &mut stmt.walk();
+    for child in stmt.children(cursor) {
+        match child.kind() {
+            "wildcard_import" => {
+                push("*", &module_name, None, symbols);
+                emitted = true;
+            }
+            "dotted_name" => {
+                // Skip the module_name dotted_name — it's a field child
+                // and will be the same node. Only non-module children
+                // represent imported names.
+                if let Some(module_node) = stmt.child_by_field_name("module_name")
+                    && module_node.id() == child.id()
+                {
+                    continue;
+                }
+                let name = text_str(child, source);
+                if !name.is_empty() {
+                    let local = name.split('.').next().unwrap_or(&name).to_string();
+                    push(&local, &module_name, None, symbols);
+                    emitted = true;
+                }
+            }
+            "aliased_import" => {
+                let orig_name = child
+                    .child_by_field_name("name")
+                    .map(|n| text_str(n, source))
+                    .unwrap_or_default();
+                let alias = child
+                    .child_by_field_name("alias")
+                    .map(|n| text_str(n, source))
+                    .unwrap_or_default();
+                if !alias.is_empty() {
+                    let orig = if alias != orig_name {
+                        Some(orig_name.as_str())
+                    } else {
+                        None
+                    };
+                    push(&alias, &module_name, orig, symbols);
+                    emitted = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !emitted && !module_name.is_empty() {
+        push("", &module_name, None, symbols);
     }
 }
 

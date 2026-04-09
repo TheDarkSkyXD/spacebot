@@ -247,20 +247,11 @@ fn walk_rust_node(
             }
         }
         "use_declaration" => {
-            let use_text = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-            symbols.push(ExtractedSymbol {
-                name: use_text.clone(),
-                qualified_name: format!("{file_path}::use::{use_text}"),
-                label: NodeLabel::Import,
-                line_start: node.start_position().row as u32 + 1,
-                line_end: node.end_position().row as u32 + 1,
-                parent: None,
-                import_source: Some(use_text),
-                extends: None,
-                implements: Vec::new(),
-                decorates: None,
-                metadata: std::collections::HashMap::new(),
-            });
+            if let Some(argument) = node.child_by_field_name("argument") {
+                let line_start = node.start_position().row as u32 + 1;
+                let line_end = node.end_position().row as u32 + 1;
+                collect_rust_uses(argument, "", file_path, line_start, line_end, source, symbols);
+            }
         }
         _ => {}
     }
@@ -274,6 +265,112 @@ fn walk_rust_node(
 #[cfg(feature = "codegraph")]
 fn text(node: tree_sitter::Node, source: &str) -> String {
     node.utf8_text(source.as_bytes()).unwrap_or("").to_string()
+}
+
+/// Walk a `use_declaration`'s argument subtree and emit one Import node
+/// per leaf binding. `prefix` is the `::`-joined path accumulated from
+/// outer `scoped_use_list`s so nested groupings collapse to full paths.
+#[cfg(feature = "codegraph")]
+fn collect_rust_uses(
+    node: tree_sitter::Node,
+    prefix: &str,
+    file_path: &str,
+    line_start: u32,
+    line_end: u32,
+    source: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let push = |name: &str, import_source: &str, original: Option<&str>, symbols: &mut Vec<ExtractedSymbol>| {
+        if name.is_empty() || import_source.is_empty() {
+            return;
+        }
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(orig) = original {
+            metadata.insert("original_name".to_string(), orig.to_string());
+        }
+        symbols.push(ExtractedSymbol {
+            name: name.to_string(),
+            qualified_name: format!("{file_path}::use::{import_source}::{name}"),
+            label: NodeLabel::Import,
+            line_start,
+            line_end,
+            parent: None,
+            import_source: Some(import_source.to_string()),
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata,
+        });
+    };
+
+    let join = |a: &str, b: &str| -> String {
+        if a.is_empty() {
+            b.to_string()
+        } else {
+            format!("{a}::{b}")
+        }
+    };
+
+    match node.kind() {
+        "identifier" | "self" | "super" | "crate" => {
+            let name = text(node, source);
+            let full = join(prefix, &name);
+            push(&name, &full, None, symbols);
+        }
+        "scoped_identifier" => {
+            let path_text = text(node, source);
+            let full = join(prefix, &path_text);
+            let leaf = node
+                .child_by_field_name("name")
+                .map(|n| text(n, source))
+                .unwrap_or_default();
+            push(&leaf, &full, None, symbols);
+        }
+        "use_as_clause" => {
+            let path_node = node.child_by_field_name("path");
+            let path_text = path_node.map(|n| text(n, source)).unwrap_or_default();
+            let full = join(prefix, &path_text);
+            let alias = node
+                .child_by_field_name("alias")
+                .map(|n| text(n, source))
+                .unwrap_or_default();
+            let orig = full.rsplit("::").next().unwrap_or("").to_string();
+            let original = if alias != orig { Some(orig.as_str()) } else { None };
+            push(&alias, &full, original, symbols);
+        }
+        "scoped_use_list" => {
+            let path_text = node
+                .child_by_field_name("path")
+                .map(|n| text(n, source))
+                .unwrap_or_default();
+            let new_prefix = join(prefix, &path_text);
+            if let Some(list) = node.child_by_field_name("list") {
+                let cursor = &mut list.walk();
+                for child in list.children(cursor) {
+                    collect_rust_uses(child, &new_prefix, file_path, line_start, line_end, source, symbols);
+                }
+            }
+        }
+        "use_list" => {
+            let cursor = &mut node.walk();
+            for child in node.children(cursor) {
+                collect_rust_uses(child, prefix, file_path, line_start, line_end, source, symbols);
+            }
+        }
+        "use_wildcard" => {
+            // `path::*` — find the path child (identifier or scoped_identifier)
+            // and emit one wildcard node.
+            let cursor = &mut node.walk();
+            let path_text = node
+                .children(cursor)
+                .find(|c| c.kind() == "identifier" || c.kind() == "scoped_identifier")
+                .map(|c| text(c, source))
+                .unwrap_or_default();
+            let full = join(prefix, &path_text);
+            push("*", &full, None, symbols);
+        }
+        _ => {}
+    }
 }
 
 /// Collect Rust function parameters as Parameter symbols.
