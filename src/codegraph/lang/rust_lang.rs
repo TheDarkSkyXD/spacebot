@@ -1,6 +1,6 @@
 //! Rust language provider.
 
-use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider, LocalBinding};
 use super::languages::SupportedLanguage;
 use crate::codegraph::types::NodeLabel;
 
@@ -38,6 +38,18 @@ impl LanguageProvider for RustProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_accesses_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_locals(&self, file_path: &str, content: &str) -> Vec<LocalBinding> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_locals_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -760,6 +772,140 @@ fn walk_rust_accesses(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_rust_accesses(child, file_path, source, accesses, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_locals_tree_sitter(file_path: &str, content: &str) -> Vec<LocalBinding> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut locals = Vec::new();
+    walk_rust_locals(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut locals,
+        &mut Vec::new(),
+    );
+    locals
+}
+
+#[cfg(feature = "codegraph")]
+fn walk_rust_locals(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    locals: &mut Vec<LocalBinding>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "mod_item" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let mq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(mq);
+                if let Some(body) = node.child_by_field_name("body") {
+                    let cursor = &mut body.walk();
+                    for child in body.children(cursor) {
+                        walk_rust_locals(child, file_path, source, locals, enclosing);
+                    }
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "impl_item" => {
+            let impl_name = node
+                .child_by_field_name("type")
+                .map(|n| text(n, source))
+                .unwrap_or_else(|| "impl".to_string());
+            let iq = match enclosing.last() {
+                Some(p) => format!("{p}::{impl_name}"),
+                None => format!("{file_path}::{impl_name}"),
+            };
+            enclosing.push(iq);
+            if let Some(body) = node.child_by_field_name("body") {
+                let cursor = &mut body.walk();
+                for child in body.children(cursor) {
+                    walk_rust_locals(child, file_path, source, locals, enclosing);
+                }
+            }
+            enclosing.pop();
+            return;
+        }
+        "trait_item" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let tq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(tq);
+                if let Some(body) = node.child_by_field_name("body") {
+                    let cursor = &mut body.walk();
+                    for child in body.children(cursor) {
+                        walk_rust_locals(child, file_path, source, locals, enclosing);
+                    }
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "function_item" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let fq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_rust_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "let_declaration" => {
+            // Only emit when the let has an explicit `: Type` annotation
+            // — untyped bindings would require flow analysis to resolve.
+            if let Some(function_qn) = enclosing.last()
+                && let Some(type_node) = node.child_by_field_name("type")
+                && let Some(pattern) = node.child_by_field_name("pattern")
+                && pattern.kind() == "identifier"
+            {
+                let name = text(pattern, source);
+                let declared_type = text(type_node, source);
+                if !name.is_empty() && !declared_type.is_empty() && name != "_" {
+                    locals.push(LocalBinding {
+                        function_qualified_name: function_qn.clone(),
+                        name,
+                        declared_type,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_rust_locals(child, file_path, source, locals, enclosing);
     }
 }
 

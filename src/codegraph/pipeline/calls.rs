@@ -245,6 +245,12 @@ pub async fn resolve_calls(
     // 3. Extract call sites from each file using AST analysis, then resolve.
     let mut edge_stmts: Vec<String> = Vec::new();
     let mut seen_edges: HashSet<String> = HashSet::new();
+    // (enclosing_function_qname, local_var_name) → declared type text.
+    // Populated inline during the file loop via provider.extract_locals
+    // and consulted by the call resolver before params and fields, so a
+    // local binding shadows an outer param or class field of the same
+    // name just like it would during real scope resolution.
+    let mut local_types: HashMap<(String, String), String> = HashMap::new();
     let total_files = files.len();
     let report_interval = (total_files / 20).max(1);
 
@@ -277,6 +283,16 @@ pub async fn resolve_calls(
         let imported_files = import_map.get(&relative);
         let call_sites = provider.extract_calls(&relative, &content);
         let access_sites = provider.extract_accesses(&relative, &content);
+
+        for binding in provider.extract_locals(&relative, &content) {
+            if binding.declared_type.is_empty() {
+                continue;
+            }
+            local_types.insert(
+                (binding.function_qualified_name, binding.name),
+                binding.declared_type,
+            );
+        }
 
         // --- Resolve self/this field accesses → ACCESSES edges ---
         for site in &access_sites {
@@ -364,6 +380,7 @@ pub async fn resolve_calls(
                     &classes_by_qname,
                     &param_types,
                     &field_types,
+                    &local_types,
                 )
                 && let Some(base) = base_type_name(&type_text)
                 && let Some(class_entries) = classes_by_name.get(&base)
@@ -664,6 +681,7 @@ fn resolve_receiver_type(
     classes_by_qname: &HashSet<String>,
     param_types: &HashMap<(String, String), String>,
     field_types: &HashMap<(String, String), String>,
+    local_types: &HashMap<(String, String), String>,
 ) -> Option<String> {
     // Case 1: self.field / this.field → single-level field access.
     if let Some(field) = receiver
@@ -693,10 +711,22 @@ fn resolve_receiver_type(
             .map(|c| c.is_alphabetic() || c == '_')
             .unwrap_or(false)
     {
-        // Walk up the enclosing-function chain so that params of a nested
-        // closure/lambda still resolve against the outer function's params.
-        // The caller qname is `file::...::fn::closure_x` etc. — strip
-        // segments until we find a function that owns a matching param.
+        // Locals shadow params and fields in real scope resolution, so
+        // consult them first. Walk the enclosing-function chain the same
+        // way as params: a nested closure's body sees the outer
+        // function's locals.
+        let mut scope = caller_qn;
+        loop {
+            if let Some(ty) =
+                local_types.get(&(scope.to_string(), receiver.to_string()))
+            {
+                return Some(ty.clone());
+            }
+            match scope.rsplit_once("::") {
+                Some((parent, _)) => scope = parent,
+                None => break,
+            }
+        }
         let mut scope = caller_qn;
         loop {
             if let Some(ty) =
@@ -709,9 +739,9 @@ fn resolve_receiver_type(
                 None => break,
             }
         }
-        // Fall back to class field lookup (covers Go-style naked receiver
-        // `s.field` inside a method on S, and Java/C# `field` without
-        // `this.`).
+        // Naked field access: `s.field` inside a method on S where the
+        // language has no `self.`/`this.` prefix (Go, and informal Java
+        // / C# patterns).
         if let Some(class_qn) = find_enclosing_class(caller_qn, classes_by_qname)
             && let Some(ty) =
                 field_types.get(&(class_qn.to_string(), receiver.to_string()))

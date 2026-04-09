@@ -13,7 +13,7 @@
 //! - `preproc_include`                                   → Import
 //! - `type_definition`                                   → TypeAlias
 
-use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider, LocalBinding};
 use super::languages::SupportedLanguage;
 use crate::codegraph::types::NodeLabel;
 
@@ -52,6 +52,18 @@ impl LanguageProvider for CProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_accesses_tree_sitter(file_path, content, Dialect::C)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_locals(&self, file_path: &str, content: &str) -> Vec<LocalBinding> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_locals_tree_sitter(file_path, content, Dialect::C)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -108,6 +120,18 @@ impl LanguageProvider for CppProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_accesses_tree_sitter(file_path, content, Dialect::Cpp)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_locals(&self, file_path: &str, content: &str) -> Vec<LocalBinding> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_locals_tree_sitter(file_path, content, Dialect::Cpp)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -718,6 +742,133 @@ fn walk_c_accesses(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_c_accesses(child, file_path, source, accesses, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_locals_tree_sitter(
+    file_path: &str,
+    content: &str,
+    dialect: Dialect,
+) -> Vec<LocalBinding> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = match dialect {
+        Dialect::C => tree_sitter_c::LANGUAGE.into(),
+        Dialect::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+    };
+
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut locals = Vec::new();
+    walk_c_locals(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut locals,
+        &mut Vec::new(),
+        false,
+    );
+    locals
+}
+
+#[cfg(feature = "codegraph")]
+fn walk_c_locals(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    locals: &mut Vec<LocalBinding>,
+    enclosing: &mut Vec<String>,
+    in_function_body: bool,
+) {
+    match node.kind() {
+        "namespace_definition" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let outer = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(outer);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_c_locals(child, file_path, source, locals, enclosing, false);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "class_specifier" | "struct_specifier" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                if !name.is_empty() {
+                    let outer = match enclosing.last() {
+                        Some(p) => format!("{p}::{name}"),
+                        None => format!("{file_path}::{name}"),
+                    };
+                    enclosing.push(outer);
+                    let cursor = &mut node.walk();
+                    for child in node.children(cursor) {
+                        walk_c_locals(child, file_path, source, locals, enclosing, false);
+                    }
+                    enclosing.pop();
+                    return;
+                }
+            }
+        }
+        "function_definition" => {
+            if let Some(declarator) = node.child_by_field_name("declarator")
+                && let Some(name) = extract_function_name(declarator, source)
+            {
+                let fq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_c_locals(child, file_path, source, locals, enclosing, true);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "declaration" if in_function_body => {
+            // Inside a function body, a `declaration` is a local.
+            // Outside one it would be a prototype or file-scope global,
+            // so the flag is required to discriminate the two.
+            if let Some(function_qn) = enclosing.last() {
+                let declared_type = node
+                    .child_by_field_name("type")
+                    .map(|n| text(n, source))
+                    .unwrap_or_default();
+                if !declared_type.is_empty()
+                    && let Some(decl_node) = node.child_by_field_name("declarator")
+                    && let Some(name) = extract_plain_name(decl_node, source)
+                    && !name.is_empty()
+                {
+                    locals.push(LocalBinding {
+                        function_qualified_name: function_qn.clone(),
+                        name,
+                        declared_type,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_c_locals(child, file_path, source, locals, enclosing, in_function_body);
     }
 }
 

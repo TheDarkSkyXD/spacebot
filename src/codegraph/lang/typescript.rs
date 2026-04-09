@@ -4,7 +4,7 @@
 //! Decorator, Namespace, TypeAlias, and Const nodes from TS/JS files
 //! using tree-sitter.
 
-use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider, LocalBinding};
 use super::languages::SupportedLanguage;
 use crate::codegraph::types::NodeLabel;
 
@@ -42,6 +42,18 @@ impl LanguageProvider for TypeScriptProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_accesses_tree_sitter(file_path, content, true)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_locals(&self, file_path: &str, content: &str) -> Vec<LocalBinding> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_locals_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -1056,6 +1068,114 @@ fn walk_ts_accesses_children(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_ts_accesses(child, file_path, source, accesses, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_locals_tree_sitter(file_path: &str, content: &str) -> Vec<LocalBinding> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut locals = Vec::new();
+    walk_ts_locals(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut locals,
+        &mut Vec::new(),
+    );
+    locals
+}
+
+#[cfg(feature = "codegraph")]
+fn walk_ts_locals(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    locals: &mut Vec<LocalBinding>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "class_declaration" | "abstract_class_declaration" | "interface_declaration"
+        | "namespace_declaration" | "internal_module" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(name_node, source);
+                let outer = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(outer);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_ts_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "function_declaration" | "method_definition" | "function_signature" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = node_text(name_node, source);
+                let fq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_ts_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "lexical_declaration" | "variable_declaration" => {
+            // `const`/`let`/`var` at any nesting level — only emit for
+            // bindings that are inside a function and carry an explicit
+            // `: Type` annotation on the declarator.
+            if let Some(function_qn) = enclosing.last() {
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    if child.kind() != "variable_declarator" {
+                        continue;
+                    }
+                    let Some(pattern) = child.child_by_field_name("name") else {
+                        continue;
+                    };
+                    if pattern.kind() != "identifier" {
+                        continue;
+                    }
+                    let Some(type_node) = child.child_by_field_name("type") else {
+                        continue;
+                    };
+                    let name = node_text(pattern, source);
+                    let declared_type = clean_ts_type_annotation(&node_text(type_node, source));
+                    if !name.is_empty() && !declared_type.is_empty() {
+                        locals.push(LocalBinding {
+                            function_qualified_name: function_qn.clone(),
+                            name,
+                            declared_type,
+                        });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_ts_locals(child, file_path, source, locals, enclosing);
     }
 }
 

@@ -21,6 +21,21 @@ pub struct CallSite {
     pub receiver: Option<String>,
 }
 
+/// A typed local variable binding inside a function body.
+///
+/// Consumed only by the call-site resolver as an in-memory extension
+/// of the type environment — no graph nodes are produced, so locals
+/// don't inflate the node count on large projects.
+#[derive(Debug, Clone)]
+pub struct LocalBinding {
+    /// Qualified name of the enclosing function or method.
+    pub function_qualified_name: String,
+    /// Local variable name as written in source.
+    pub name: String,
+    /// Source-level type expression (e.g. `Foo`, `Arc<Mutex<Bar>>`).
+    pub declared_type: String,
+}
+
 /// A field access extracted from the AST — `self.x`, `this.foo`, etc.
 ///
 /// Resolved later in the accesses phase into an ACCESSES edge from the
@@ -104,6 +119,15 @@ pub trait LanguageProvider: Send + Sync {
     /// `self`, `this`, or another receiver. Default returns empty so
     /// providers that haven't implemented this opt out cleanly.
     fn extract_accesses(&self, _file_path: &str, _content: &str) -> Vec<AccessSite> {
+        Vec::new()
+    }
+
+    /// Extract typed local variable bindings from function bodies.
+    ///
+    /// Only locals with an explicit type annotation are emitted;
+    /// inferred types would require flow analysis. Default returns
+    /// empty so untyped languages opt out cleanly.
+    fn extract_locals(&self, _file_path: &str, _content: &str) -> Vec<LocalBinding> {
         Vec::new()
     }
 

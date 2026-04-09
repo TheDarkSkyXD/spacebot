@@ -19,7 +19,7 @@
 //! `member_access_expression` (receiver.method), or a generic variant.
 
 use super::languages::SupportedLanguage;
-use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider, LocalBinding};
 use crate::codegraph::types::NodeLabel;
 
 pub struct CSharpProvider;
@@ -56,6 +56,18 @@ impl LanguageProvider for CSharpProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_accesses_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_locals(&self, file_path: &str, content: &str) -> Vec<LocalBinding> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_locals_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -641,6 +653,123 @@ fn walk_csharp_accesses(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_csharp_accesses(child, file_path, source, accesses, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_locals_tree_sitter(file_path: &str, content: &str) -> Vec<LocalBinding> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_c_sharp::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut locals = Vec::new();
+    walk_csharp_locals(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut locals,
+        &mut Vec::new(),
+    );
+    locals
+}
+
+#[cfg(feature = "codegraph")]
+fn walk_csharp_locals(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    locals: &mut Vec<LocalBinding>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "namespace_declaration"
+        | "file_scoped_namespace_declaration"
+        | "class_declaration"
+        | "struct_declaration"
+        | "record_declaration"
+        | "interface_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let outer = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(outer);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_csharp_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let fq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_csharp_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "local_declaration_statement" => {
+            // A local_declaration wraps one variable_declaration whose
+            // `type` field applies to all declarator children. `var` is
+            // skipped — resolving it needs flow analysis we don't run.
+            if let Some(function_qn) = enclosing.last() {
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    if child.kind() != "variable_declaration" {
+                        continue;
+                    }
+                    let declared_type = child
+                        .child_by_field_name("type")
+                        .map(|n| text(n, source))
+                        .unwrap_or_default();
+                    if declared_type.is_empty() || declared_type == "var" {
+                        continue;
+                    }
+                    let decl_cursor = &mut child.walk();
+                    for decl in child.children(decl_cursor) {
+                        if decl.kind() != "variable_declarator" {
+                            continue;
+                        }
+                        if let Some(name_node) = decl.child_by_field_name("name") {
+                            let name = text(name_node, source);
+                            if !name.is_empty() {
+                                locals.push(LocalBinding {
+                                    function_qualified_name: function_qn.clone(),
+                                    name,
+                                    declared_type: declared_type.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_csharp_locals(child, file_path, source, locals, enclosing);
     }
 }
 

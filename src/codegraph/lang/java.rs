@@ -15,7 +15,7 @@
 //! `name` field and optionally an `object` field (for `obj.method()` or
 //! `ClassName.method()`).
 
-use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider};
+use super::provider::{AccessSite, CallSite, ExtractedSymbol, LanguageProvider, LocalBinding};
 use super::languages::SupportedLanguage;
 use crate::codegraph::types::NodeLabel;
 
@@ -53,6 +53,18 @@ impl LanguageProvider for JavaProvider {
         #[cfg(feature = "codegraph")]
         {
             extract_accesses_tree_sitter(file_path, content)
+        }
+        #[cfg(not(feature = "codegraph"))]
+        {
+            let _ = (file_path, content);
+            Vec::new()
+        }
+    }
+
+    fn extract_locals(&self, file_path: &str, content: &str) -> Vec<LocalBinding> {
+        #[cfg(feature = "codegraph")]
+        {
+            extract_locals_tree_sitter(file_path, content)
         }
         #[cfg(not(feature = "codegraph"))]
         {
@@ -569,6 +581,107 @@ fn walk_java_accesses(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_java_accesses(child, file_path, source, accesses, enclosing);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn extract_locals_tree_sitter(file_path: &str, content: &str) -> Vec<LocalBinding> {
+    use tree_sitter::Parser;
+
+    let language: tree_sitter::Language = tree_sitter_java::LANGUAGE.into();
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut locals = Vec::new();
+    walk_java_locals(
+        tree.root_node(),
+        file_path,
+        content,
+        &mut locals,
+        &mut Vec::new(),
+    );
+    locals
+}
+
+#[cfg(feature = "codegraph")]
+fn walk_java_locals(
+    node: tree_sitter::Node,
+    file_path: &str,
+    source: &str,
+    locals: &mut Vec<LocalBinding>,
+    enclosing: &mut Vec<String>,
+) {
+    match node.kind() {
+        "class_declaration" | "interface_declaration" | "enum_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let outer = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(outer);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_java_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = text(name_node, source);
+                let fq = match enclosing.last() {
+                    Some(p) => format!("{p}::{name}"),
+                    None => format!("{file_path}::{name}"),
+                };
+                enclosing.push(fq);
+                let cursor = &mut node.walk();
+                for child in node.children(cursor) {
+                    walk_java_locals(child, file_path, source, locals, enclosing);
+                }
+                enclosing.pop();
+                return;
+            }
+        }
+        "local_variable_declaration" => {
+            if let Some(function_qn) = enclosing.last() {
+                let declared_type = node
+                    .child_by_field_name("type")
+                    .map(|n| text(n, source))
+                    .unwrap_or_default();
+                if !declared_type.is_empty() && declared_type != "var" {
+                    let cursor = &mut node.walk();
+                    for child in node.children(cursor) {
+                        if child.kind() == "variable_declarator"
+                            && let Some(name_node) = child.child_by_field_name("name")
+                        {
+                            let name = text(name_node, source);
+                            if !name.is_empty() {
+                                locals.push(LocalBinding {
+                                    function_qualified_name: function_qn.clone(),
+                                    name,
+                                    declared_type: declared_type.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        walk_java_locals(child, file_path, source, locals, enclosing);
     }
 }
 
