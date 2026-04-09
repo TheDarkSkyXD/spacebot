@@ -199,12 +199,16 @@ fn walk_dart_node(
                 } else {
                     NodeLabel::Function
                 };
+                let fn_qname = qname(file_path, parent_name, &name);
                 symbols.push(sym(file_path, parent_name, &name, label, &node));
+                collect_dart_params(node, source, &fn_qname, symbols);
             }
         }
         "method_signature" => {
             if let Some(name) = find_ident(node, source, &["name", "identifier"]) {
+                let method_qname = qname(file_path, parent_name, &name);
                 symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node));
+                collect_dart_params(node, source, &method_qname, symbols);
             }
         }
         "getter_signature" | "setter_signature" => {
@@ -219,6 +223,93 @@ fn walk_dart_node(
     for child in node.children(cursor) {
         walk_dart_node(child, file_path, source, symbols, parent_name);
     }
+}
+
+/// Collect Dart function/method parameters as Parameter symbols parented
+/// to the enclosing callable. Tree-sitter-dart nests params inside a
+/// `formal_parameter_list` with children of several related kinds
+/// (`formal_parameter`, `normal_formal_parameter`, `optional_formal_parameters`,
+/// `named_formal_parameters`, `required_formal_parameter`, and the
+/// constructor-field-init variants `this_formal_parameter` /
+/// `this_final_formal_parameter`). Rather than enumerate every grammar
+/// variant, we locate `formal_parameter_list` nodes inside the signature
+/// and emit one Parameter per direct parameter-like child, reading the
+/// first identifier descendant as the name.
+#[cfg(feature = "codegraph")]
+fn collect_dart_params(
+    signature_node: tree_sitter::Node,
+    source: &str,
+    fn_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let Some(list) = find_descendant_by_kind(signature_node, "formal_parameter_list") else {
+        return;
+    };
+    let cursor = &mut list.walk();
+    for child in list.children(cursor) {
+        let kind = child.kind();
+        // Skip literal punctuation children inside the list.
+        if kind == "(" || kind == ")" || kind == "," || kind == "[" || kind == "]"
+            || kind == "{" || kind == "}"
+        {
+            continue;
+        }
+        let pname = find_first_dart_identifier(child, source);
+        if pname.is_empty() {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name: pname.clone(),
+            qualified_name: format!("{fn_qname}::{pname}"),
+            label: NodeLabel::Parameter,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            parent: Some(fn_qname.to_string()),
+            import_source: None,
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata: std::collections::HashMap::new(),
+        });
+    }
+}
+
+/// Walk descendants looking for the first node of the given kind.
+/// Used to find `formal_parameter_list` inside a signature regardless
+/// of the grammar nesting.
+#[cfg(feature = "codegraph")]
+fn find_descendant_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        if let Some(found) = find_descendant_by_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Recursively find the first `identifier` node inside a Dart parameter
+/// node. Handles the various grammar shapes (typed / default / named /
+/// this.X constructor-field-init) without enumerating each.
+#[cfg(feature = "codegraph")]
+fn find_first_dart_identifier(node: tree_sitter::Node, source: &str) -> String {
+    if node.kind() == "identifier" {
+        return text(node, source);
+    }
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        let r = find_first_dart_identifier(child, source);
+        if !r.is_empty() {
+            return r;
+        }
+    }
+    String::new()
 }
 
 #[cfg(feature = "codegraph")]

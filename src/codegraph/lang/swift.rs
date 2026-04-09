@@ -202,7 +202,9 @@ fn walk_swift_node(
                 } else {
                     NodeLabel::Function
                 };
+                let fn_qname = qname(file_path, parent_name, &name);
                 symbols.push(sym(file_path, parent_name, &name, label, &node));
+                collect_swift_params(node, source, &fn_qname, symbols);
             }
         }
         _ => {}
@@ -211,6 +213,93 @@ fn walk_swift_node(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_swift_node(child, file_path, source, symbols, parent_name);
+    }
+}
+
+/// Collect Swift function/init parameters as Parameter symbols parented
+/// to the enclosing function. Tree-sitter-swift emits `parameter` nodes
+/// (inside the function's parameter list) that carry a `name` field
+/// holding the internal name (the one visible in the function body) and
+/// optionally an `external_name` field (the call-site label).
+///
+/// When both are present we prefer the internal name since that's what
+/// the body references. Swift's `_` wildcard external label is fine —
+/// we ignore it because we never emit external_name as a symbol.
+#[cfg(feature = "codegraph")]
+fn collect_swift_params(
+    fn_node: tree_sitter::Node,
+    source: &str,
+    fn_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    // Swift's grammar doesn't consistently name a parameter-list node,
+    // so we scan the function's direct descendants for `parameter` kinds.
+    let cursor = &mut fn_node.walk();
+    for child in fn_node.children(cursor) {
+        collect_swift_params_in(child, source, fn_qname, symbols);
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn collect_swift_params_in(
+    node: tree_sitter::Node,
+    source: &str,
+    fn_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    // Stop descending at nested functions/closures so their params
+    // don't leak up into the enclosing function's parameter set.
+    let kind = node.kind();
+    if kind == "function_declaration"
+        || kind == "init_declaration"
+        || kind == "deinit_declaration"
+        || kind == "lambda_literal"
+    {
+        return;
+    }
+
+    if kind == "parameter" {
+        let pname = node
+            .child_by_field_name("name")
+            .map(|n| text(n, source))
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                // Some grammar revisions expose the name only as a direct
+                // simple_identifier child. Fall back to the first one.
+                let cur = &mut node.walk();
+                for c in node.children(cur) {
+                    if c.kind() == "simple_identifier" || c.kind() == "identifier" {
+                        let t = text(c, source);
+                        if !t.is_empty() {
+                            return Some(t);
+                        }
+                    }
+                }
+                None
+            });
+        if let Some(pname) = pname
+            && pname != "_"
+        {
+            symbols.push(ExtractedSymbol {
+                name: pname.clone(),
+                qualified_name: format!("{fn_qname}::{pname}"),
+                label: NodeLabel::Parameter,
+                line_start: node.start_position().row as u32 + 1,
+                line_end: node.end_position().row as u32 + 1,
+                parent: Some(fn_qname.to_string()),
+                import_source: None,
+                extends: None,
+                implements: Vec::new(),
+                decorates: None,
+                metadata: std::collections::HashMap::new(),
+            });
+        }
+        return;
+    }
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        collect_swift_params_in(child, source, fn_qname, symbols);
     }
 }
 

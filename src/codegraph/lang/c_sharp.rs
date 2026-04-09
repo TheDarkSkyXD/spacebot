@@ -246,7 +246,11 @@ fn walk_csharp_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
+                    let method_qname = qname(file_path, parent_name, &name);
                     symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node));
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        collect_csharp_params(params, source, &method_qname, symbols);
+                    }
                 }
             }
         }
@@ -295,6 +299,46 @@ fn collect_field_names(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         collect_field_names(child, file_path, source, symbols, parent_name);
+    }
+}
+
+/// Collect C# method/constructor parameters as Parameter symbols parented
+/// to the enclosing method. Tree-sitter-c-sharp wraps them in a
+/// `parameter_list` containing `parameter` nodes (with a `name` field)
+/// plus occasional `_this_parameter` nodes for extension methods (which
+/// we skip — `this` is the receiver, already modeled via the class).
+#[cfg(feature = "codegraph")]
+fn collect_csharp_params(
+    params_node: tree_sitter::Node,
+    source: &str,
+    method_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let cursor = &mut params_node.walk();
+    for child in params_node.children(cursor) {
+        if child.kind() != "parameter" {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let pname = text(name_node, source);
+        if pname.is_empty() || pname == "this" {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name: pname.clone(),
+            qualified_name: format!("{method_qname}::{pname}"),
+            label: NodeLabel::Parameter,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            parent: Some(method_qname.to_string()),
+            import_source: None,
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata: std::collections::HashMap::new(),
+        });
     }
 }
 

@@ -175,7 +175,9 @@ fn walk_kotlin_node(
                 } else {
                     NodeLabel::Function
                 };
+                let fn_qname = qname(file_path, parent_name, &name);
                 symbols.push(sym(file_path, parent_name, &name, label, &node));
+                collect_kotlin_params(node, source, &fn_qname, symbols);
             }
         }
         "property_declaration" => {
@@ -191,6 +193,79 @@ fn walk_kotlin_node(
     for child in node.children(cursor) {
         walk_kotlin_node(child, file_path, source, symbols, parent_name);
     }
+}
+
+/// Collect Kotlin `function_declaration` parameters as Parameter symbols.
+/// The tree-sitter-kotlin-ng grammar nests params as:
+/// `function_declaration → function_value_parameters → function_value_parameter
+///   → parameter → simple_identifier` (roughly). Rather than chase the
+/// exact shape (which varies between grammar revisions), we search for
+/// the first `function_value_parameters` descendant and emit one
+/// Parameter per `function_value_parameter` child, reading the first
+/// simple_identifier we find inside.
+#[cfg(feature = "codegraph")]
+fn collect_kotlin_params(
+    fn_node: tree_sitter::Node,
+    source: &str,
+    fn_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let Some(params_node) = find_child_by_kind(fn_node, "function_value_parameters") else {
+        return;
+    };
+    let cursor = &mut params_node.walk();
+    for child in params_node.children(cursor) {
+        if child.kind() != "function_value_parameter" {
+            continue;
+        }
+        let pname = find_first_identifier_deep(child, source);
+        if pname.is_empty() {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name: pname.clone(),
+            qualified_name: format!("{fn_qname}::{pname}"),
+            label: NodeLabel::Parameter,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            parent: Some(fn_qname.to_string()),
+            import_source: None,
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata: std::collections::HashMap::new(),
+        });
+    }
+}
+
+/// Find the first direct child with the given kind. Non-recursive —
+/// we only look one level deep since `function_value_parameters` sits
+/// directly under `function_declaration` in this grammar.
+#[cfg(feature = "codegraph")]
+fn find_child_by_kind<'a>(
+    node: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let cursor = &mut node.walk();
+    node.children(cursor).find(|child| child.kind() == kind)
+}
+
+/// Recursively find the first `simple_identifier` or `identifier` under
+/// a parameter node. Used because the exact nesting of the param name
+/// (parameter → name field vs. direct child) varies by grammar version.
+#[cfg(feature = "codegraph")]
+fn find_first_identifier_deep(node: tree_sitter::Node, source: &str) -> String {
+    if node.kind() == "simple_identifier" || node.kind() == "identifier" {
+        return text(node, source);
+    }
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        let r = find_first_identifier_deep(child, source);
+        if !r.is_empty() {
+            return r;
+        }
+    }
+    String::new()
 }
 
 /// Find the first `simple_identifier` or `type_identifier` child,

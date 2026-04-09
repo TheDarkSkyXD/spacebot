@@ -257,7 +257,13 @@ fn walk_c_node(
                 } else {
                     NodeLabel::Function
                 };
+                let fn_qname = qname(file_path, parent_name, &name);
                 symbols.push(sym(file_path, parent_name, &name, label, &node));
+                if let Some(fn_declarator) = find_function_declarator(declarator)
+                    && let Some(params) = fn_declarator.child_by_field_name("parameters")
+                {
+                    collect_c_params(params, source, &fn_qname, symbols);
+                }
             }
         }
         "declaration" => {
@@ -266,7 +272,11 @@ fn walk_c_node(
                 && declarator.kind() == "function_declarator"
                 && let Some(name) = extract_function_name(declarator, source)
             {
+                let fn_qname = qname(file_path, parent_name, &name);
                 symbols.push(sym(file_path, parent_name, &name, NodeLabel::Function, &node));
+                if let Some(params) = declarator.child_by_field_name("parameters") {
+                    collect_c_params(params, source, &fn_qname, symbols);
+                }
             }
         }
         "type_definition" => {
@@ -292,6 +302,65 @@ fn walk_c_node(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         walk_c_node(child, file_path, source, symbols, parent_name);
+    }
+}
+
+/// Walk down through pointer/reference layers to find the underlying
+/// `function_declarator`. Returns `None` if the declarator isn't (and
+/// doesn't wrap) a function.
+#[cfg(feature = "codegraph")]
+fn find_function_declarator<'a>(node: tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>> {
+    match node.kind() {
+        "function_declarator" => Some(node),
+        "pointer_declarator" | "reference_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(find_function_declarator),
+        _ => None,
+    }
+}
+
+/// Collect C/C++ function parameters as Parameter symbols parented to
+/// the enclosing function. `params_node` must be a `parameter_list`.
+/// Each `parameter_declaration` carries a `declarator` field whose
+/// identifier is the parameter name (possibly wrapped in pointer /
+/// reference / array layers, which `extract_plain_name` unwinds).
+///
+/// We skip `parameter_declaration` nodes that are really just a type
+/// (`void foo(int)` — no name given), since there's nothing to link.
+#[cfg(feature = "codegraph")]
+fn collect_c_params(
+    params_node: tree_sitter::Node,
+    source: &str,
+    fn_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let cursor = &mut params_node.walk();
+    for child in params_node.children(cursor) {
+        if child.kind() != "parameter_declaration" {
+            continue;
+        }
+        let Some(declarator) = child.child_by_field_name("declarator") else {
+            continue;
+        };
+        let Some(pname) = extract_plain_name(declarator, source) else {
+            continue;
+        };
+        if pname.is_empty() {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name: pname.clone(),
+            qualified_name: format!("{fn_qname}::{pname}"),
+            label: NodeLabel::Parameter,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            parent: Some(fn_qname.to_string()),
+            import_source: None,
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata: std::collections::HashMap::new(),
+        });
     }
 }
 

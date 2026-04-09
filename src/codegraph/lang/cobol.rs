@@ -88,6 +88,39 @@ impl LanguageProvider for CobolProvider {
                         metadata: std::collections::HashMap::new(),
                     });
                 }
+                continue;
+            }
+
+            // PROCEDURE DIVISION USING <name>, <name>, ...
+            //
+            // COBOL's equivalent of function parameters — each data name
+            // after USING is a linkage-section item passed in by the
+            // caller at CALL time. We parent these Parameters to the
+            // enclosing PROGRAM-ID (Module) since sections/paragraphs
+            // don't have their own local parameters in COBOL.
+            if let Some(rest) = upper.strip_prefix("PROCEDURE DIVISION")
+                && let Some(using_clause) = rest
+                    .trim_start()
+                    .strip_prefix("USING")
+                    .map(str::trim_start)
+                && let Some(program) = current_program.as_ref()
+            {
+                let parent_qname = format!("{file_path}::{program}");
+                for pname in extract_cobol_using_names(using_clause) {
+                    symbols.push(ExtractedSymbol {
+                        name: pname.clone(),
+                        qualified_name: format!("{parent_qname}::{pname}"),
+                        label: NodeLabel::Parameter,
+                        line_start: line_num,
+                        line_end: line_num,
+                        parent: Some(parent_qname.clone()),
+                        import_source: None,
+                        extends: None,
+                        implements: Vec::new(),
+                        decorates: None,
+                        metadata: std::collections::HashMap::new(),
+                    });
+                }
             }
         }
 
@@ -199,6 +232,35 @@ fn extract_section_name(upper_line: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+/// Parse the data-name list following a `PROCEDURE DIVISION USING`
+/// clause. COBOL lets you separate names with whitespace, commas, or a
+/// trailing period, and may nest `BY REFERENCE` / `BY VALUE` /
+/// `BY CONTENT` modifiers before each group of names. We strip those
+/// modifiers and return only the bare identifiers.
+fn extract_cobol_using_names(clause: &str) -> Vec<String> {
+    let cleaned = clause
+        .trim()
+        .trim_end_matches('.')
+        .replace(',', " ");
+    let mut out = Vec::new();
+    for tok in cleaned.split_whitespace() {
+        let upper = tok.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "BY" | "REFERENCE" | "VALUE" | "CONTENT" | "OPTIONAL"
+        ) {
+            continue;
+        }
+        // The token is a COBOL identifier; reuse our extractor to reject
+        // anything that contains non-identifier punctuation.
+        let name = extract_cobol_identifier(tok);
+        if !name.is_empty() && name == tok {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// Extract the target of a COBOL `CALL "NAME"` or `CALL NAME` statement.

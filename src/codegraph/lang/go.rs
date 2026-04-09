@@ -126,7 +126,11 @@ fn walk_go_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
+                    let fn_qname = format!("{file_path}::{name}");
                     symbols.push(sym(file_path, None, &name, NodeLabel::Function, &node));
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        collect_go_params(params, source, &fn_qname, symbols);
+                    }
                 }
             }
         }
@@ -143,6 +147,10 @@ fn walk_go_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
+                    let method_qname = match parent_qname.as_deref() {
+                        Some(p) => format!("{p}::{name}"),
+                        None => format!("{file_path}::{name}"),
+                    };
                     symbols.push(sym(
                         file_path,
                         parent_qname.as_deref(),
@@ -150,6 +158,9 @@ fn walk_go_node(
                         NodeLabel::Method,
                         &node,
                     ));
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        collect_go_params(params, source, &method_qname, symbols);
+                    }
                 }
             }
         }
@@ -292,6 +303,56 @@ fn receiver_type_name(recv_node: tree_sitter::Node, source: &str) -> Option<Stri
         }
     }
     None
+}
+
+/// Collect Go function/method parameters as Parameter symbols parented
+/// to the enclosing function. Tree-sitter-go wraps them in a
+/// `parameter_list` containing `parameter_declaration` and
+/// `variadic_parameter_declaration` children. Each declaration node can
+/// carry multiple identifier children for `func f(a, b int)`-style
+/// grouped params — we emit one Parameter per identifier.
+///
+/// The receiver's parameter list is NOT extracted here — it's on a
+/// separate `receiver` field and represents the `this`-like binding,
+/// already modeled via the method's parent qname.
+#[cfg(feature = "codegraph")]
+fn collect_go_params(
+    params_node: tree_sitter::Node,
+    source: &str,
+    function_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let cursor = &mut params_node.walk();
+    for child in params_node.children(cursor) {
+        if child.kind() != "parameter_declaration"
+            && child.kind() != "variadic_parameter_declaration"
+        {
+            continue;
+        }
+        let id_cursor = &mut child.walk();
+        for c in child.children(id_cursor) {
+            if c.kind() != "identifier" {
+                continue;
+            }
+            let pname = text(c, source);
+            if pname.is_empty() || pname == "_" {
+                continue;
+            }
+            symbols.push(ExtractedSymbol {
+                name: pname.clone(),
+                qualified_name: format!("{function_qname}::{pname}"),
+                label: NodeLabel::Parameter,
+                line_start: c.start_position().row as u32 + 1,
+                line_end: c.end_position().row as u32 + 1,
+                parent: Some(function_qname.to_string()),
+                import_source: None,
+                extends: None,
+                implements: Vec::new(),
+                decorates: None,
+                metadata: std::collections::HashMap::new(),
+            });
+        }
+    }
 }
 
 #[cfg(feature = "codegraph")]

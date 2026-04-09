@@ -220,7 +220,11 @@ fn walk_php_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
+                    let fn_qname = qname(file_path, parent_name, &name);
                     symbols.push(sym(file_path, parent_name, &name, NodeLabel::Function, &node));
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        collect_php_params(params, source, &fn_qname, symbols);
+                    }
                 }
             }
         }
@@ -228,7 +232,11 @@ fn walk_php_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
+                    let method_qname = qname(file_path, parent_name, &name);
                     symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node));
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        collect_php_params(params, source, &method_qname, symbols);
+                    }
                 }
             }
         }
@@ -283,6 +291,53 @@ fn collect_property_names(
     let cursor = &mut node.walk();
     for child in node.children(cursor) {
         collect_property_names(child, file_path, source, symbols, parent_name);
+    }
+}
+
+/// Collect PHP function/method parameters as Parameter symbols parented
+/// to the enclosing callable. Tree-sitter-php wraps them in a
+/// `formal_parameters` node containing `simple_parameter`,
+/// `variadic_parameter`, and `property_promotion_parameter` (PHP 8
+/// constructor promotion) children. Each has a `name` field that points
+/// at a `variable_name` node whose text is the `$var` form — we strip the
+/// leading `$` so Parameter qnames don't carry the sigil.
+#[cfg(feature = "codegraph")]
+fn collect_php_params(
+    params_node: tree_sitter::Node,
+    source: &str,
+    function_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let cursor = &mut params_node.walk();
+    for child in params_node.children(cursor) {
+        let kind = child.kind();
+        if kind != "simple_parameter"
+            && kind != "variadic_parameter"
+            && kind != "property_promotion_parameter"
+        {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let raw = text(name_node, source);
+        let pname = raw.trim_start_matches('$').to_string();
+        if pname.is_empty() {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name: pname.clone(),
+            qualified_name: format!("{function_qname}::{pname}"),
+            label: NodeLabel::Parameter,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            parent: Some(function_qname.to_string()),
+            import_source: None,
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata: std::collections::HashMap::new(),
+        });
     }
 }
 

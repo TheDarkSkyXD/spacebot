@@ -176,7 +176,11 @@ fn walk_ruby_node(
                     } else {
                         NodeLabel::Function
                     };
+                    let method_qname = qname(file_path, parent_name, &name);
                     symbols.push(sym(file_path, parent_name, &name, label, &node));
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        collect_ruby_params(params, source, &method_qname, symbols);
+                    }
                 }
             }
         }
@@ -323,6 +327,69 @@ fn walk_ruby_calls(
     for child in node.children(cursor) {
         walk_ruby_calls(child, file_path, source, calls, enclosing);
     }
+}
+
+/// Collect Ruby method/singleton_method parameters as Parameter symbols.
+/// Tree-sitter-ruby wraps params in a `method_parameters` node containing:
+/// - `identifier` for plain `x`
+/// - `optional_parameter` (`x = 5`) — name lives in `name` field
+/// - `keyword_parameter` (`x:`) — name in `name` field
+/// - `splat_parameter` (`*args`) — first identifier child
+/// - `hash_splat_parameter` (`**kwargs`) — first identifier child
+/// - `block_parameter` (`&block`) — first identifier child
+///
+/// Every identifier that lands here is a real positional argument, so
+/// there's no self/this to skip the way Python has `self`/`cls`.
+#[cfg(feature = "codegraph")]
+fn collect_ruby_params(
+    params_node: tree_sitter::Node,
+    source: &str,
+    method_qname: &str,
+    symbols: &mut Vec<ExtractedSymbol>,
+) {
+    let cursor = &mut params_node.walk();
+    for child in params_node.children(cursor) {
+        let pname = match child.kind() {
+            "identifier" => Some(text(child, source)),
+            "optional_parameter" | "keyword_parameter" => child
+                .child_by_field_name("name")
+                .map(|n| text(n, source))
+                .or_else(|| first_identifier_child(child, source)),
+            "splat_parameter" | "hash_splat_parameter" | "block_parameter" => {
+                first_identifier_child(child, source)
+            }
+            _ => None,
+        };
+
+        let Some(pname) = pname else { continue };
+        if pname.is_empty() {
+            continue;
+        }
+        symbols.push(ExtractedSymbol {
+            name: pname.clone(),
+            qualified_name: format!("{method_qname}::{pname}"),
+            label: NodeLabel::Parameter,
+            line_start: child.start_position().row as u32 + 1,
+            line_end: child.end_position().row as u32 + 1,
+            parent: Some(method_qname.to_string()),
+            import_source: None,
+            extends: None,
+            implements: Vec::new(),
+            decorates: None,
+            metadata: std::collections::HashMap::new(),
+        });
+    }
+}
+
+#[cfg(feature = "codegraph")]
+fn first_identifier_child(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let cursor = &mut node.walk();
+    for c in node.children(cursor) {
+        if c.kind() == "identifier" {
+            return Some(text(c, source));
+        }
+    }
+    None
 }
 
 /// Collect all distinct `@instance_var` names referenced anywhere inside
