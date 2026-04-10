@@ -336,6 +336,39 @@ pub async fn resolve_calls(
                     }
                 }
             }
+
+            // ORM / database query detection — Django, SQLAlchemy,
+            // ActiveRecord, Eloquent, LINQ, raw SQL.
+            let is_query = match (site.callee_name.as_str(), site.receiver.as_deref()) {
+                ("filter" | "exclude" | "get" | "all" | "values" | "annotate" | "aggregate"
+                 | "select_related" | "prefetch_related" | "order_by" | "distinct",
+                 Some(r)) if r.ends_with("objects") || r.ends_with(".objects") => true,
+                ("query" | "execute" | "scalar" | "first" | "one" | "one_or_none",
+                 Some(r)) if r.contains("session") || r.contains("Session") || r.contains("db") => true,
+                ("where" | "find" | "find_by" | "create" | "update" | "destroy" | "pluck" | "select",
+                 Some(r)) if r.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) => true,
+                ("Where" | "Select" | "FirstOrDefault" | "ToList" | "Any" | "Count" | "Sum",
+                 Some(_)) => true,
+                ("execute" | "query" | "prepare" | "exec",
+                 Some(r)) if r.contains("conn") || r.contains("cursor") || r.contains("db") || r.contains("pool") => true,
+                _ => false,
+            };
+            if is_query {
+                let query_key = format!("QUERY:{}::{}", site.caller_qualified_name, site.line);
+                if seen_edges.insert(query_key) {
+                    let caller_escaped = cypher_escape(&site.caller_qualified_name);
+                    for src_label in &["Function", "Method"] {
+                        edge_stmts.push(format!(
+                            "MATCH (a:{src_label}) WHERE a.qualified_name = '{caller_escaped}' \
+                             AND a.project_id = '{pid}' \
+                             CREATE (a)-[:CodeRelation {{type: 'QUERIES', confidence: 0.75, \
+                             reason: '{callee}', step: {line}}}]->(a)",
+                            callee = cypher_escape(&format!("{}.{}", site.receiver.as_deref().unwrap_or(""), site.callee_name)),
+                            line = site.line,
+                        ));
+                    }
+                }
+            }
         }
 
         // --- Resolve self/this field accesses → ACCESSES edges ---

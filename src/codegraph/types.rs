@@ -121,6 +121,7 @@ pub enum EdgeType {
     EntryPointOf,
     HandlesRoute,
     Fetches,
+    Queries,
 }
 
 impl EdgeType {
@@ -147,6 +148,7 @@ impl EdgeType {
             Self::EntryPointOf => "ENTRY_POINT_OF",
             Self::HandlesRoute => "HANDLES_ROUTE",
             Self::Fetches => "FETCHES",
+            Self::Queries => "QUERIES",
         }
     }
 }

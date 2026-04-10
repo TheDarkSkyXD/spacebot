@@ -16,6 +16,7 @@ pub mod enriching;
 pub mod incremental;
 pub mod embeddings;
 pub mod routes;
+pub mod fts;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -470,6 +471,23 @@ async fn run_pipeline(
 
     update_progress(PipelinePhase::Enriching, 1.0, "Enrichment complete", &stats);
     phase_timings.insert("enriching".to_string(), phase_start.elapsed().as_secs_f64());
+    check_cancel!();
+
+    // ── FTS ─────────────────────────────────────────────────────────────
+    let phase_start = Instant::now();
+    match fts::build_fts_index(&project_id, &db).await {
+        Ok(fts_result) => {
+            tracing::info!(
+                project_id = %project_id,
+                indexed = fts_result.nodes_created,
+                "FTS index ready"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(%err, "FTS indexing failed, continuing without search index");
+        }
+    }
+    phase_timings.insert("fts".to_string(), phase_start.elapsed().as_secs_f64());
     check_cancel!();
 
     // ── Finalize ─────────────────────────────────────────────────────────

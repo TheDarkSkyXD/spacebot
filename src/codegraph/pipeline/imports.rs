@@ -189,21 +189,35 @@ pub async fn resolve_imports_scoped(
                      CREATE (s)-[:CodeRelation {{type: 'IMPORTS', confidence: 1.0, reason: 'import statement', step: 0}}]->(t)",
                 ));
 
-                // Symbol-level import edge: if the Import node carries a
-                // specific symbol name, try to find the matching symbol
-                // in the target file and emit File→Symbol alongside the
-                // File→File edge above. Wildcards and side-effect-only
-                // imports leave `name` empty or "*" and are skipped.
-                if !name.is_empty() && name != "*"
-                    && let Some((sym_qname, sym_label)) =
+                if !name.is_empty() && name != "*" {
+                    // Named import — resolve the specific symbol.
+                    if let Some((sym_qname, sym_label)) =
                         symbols_by_file_name.get(&(normalized.clone(), name.to_string()))
-                {
-                    let sym_escaped = cypher_escape(sym_qname);
-                    edge_stmts.push(format!(
-                        "MATCH (s:File), (t:{sym_label}) WHERE s.qualified_name = '{src_escaped}' \
-                         AND t.qualified_name = '{sym_escaped}' \
-                         CREATE (s)-[:CodeRelation {{type: 'IMPORTS', confidence: 0.95, reason: 'symbol import', step: 0}}]->(t)",
-                    ));
+                    {
+                        let sym_escaped = cypher_escape(sym_qname);
+                        edge_stmts.push(format!(
+                            "MATCH (s:File), (t:{sym_label}) WHERE s.qualified_name = '{src_escaped}' \
+                             AND t.qualified_name = '{sym_escaped}' \
+                             CREATE (s)-[:CodeRelation {{type: 'IMPORTS', confidence: 0.95, reason: 'symbol import', step: 0}}]->(t)",
+                        ));
+                    }
+                } else if name == "*" {
+                    // Wildcard import — synthesize per-symbol edges for
+                    // every exported symbol in the target file. This
+                    // expands Go whole-module imports, Python `from x
+                    // import *`, and C++ `using namespace` into the same
+                    // File→Symbol edges that named imports produce.
+                    for ((sf, sym_name), (sym_qname, sym_label)) in &symbols_by_file_name {
+                        if sf == &normalized {
+                            let sym_escaped = cypher_escape(sym_qname);
+                            edge_stmts.push(format!(
+                                "MATCH (s:File), (t:{sym_label}) WHERE s.qualified_name = '{src_escaped}' \
+                                 AND t.qualified_name = '{sym_escaped}' \
+                                 CREATE (s)-[:CodeRelation {{type: 'IMPORTS', confidence: 0.80, reason: 'wildcard import', step: 0}}]->(t)",
+                            ));
+                            let _ = sym_name; // suppress unused warning
+                        }
+                    }
                 }
 
                 // Record in import map for call resolution
