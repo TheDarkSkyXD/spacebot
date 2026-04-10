@@ -109,7 +109,36 @@ pub async fn parse_files(
                 .to_string_lossy(),
         );
 
-        let symbols = provider.extract_symbols(&relative, &content);
+        let mut symbols = provider.extract_symbols(&relative, &content);
+
+        // Link each Decorator to the nearest decoratable symbol
+        // (Function, Method, or Class) that starts at or after the
+        // decorator's last line. This is a line-proximity heuristic
+        // that works across all languages without provider-specific
+        // knowledge of the decoration AST shape.
+        for i in 0..symbols.len() {
+            if symbols[i].label != crate::codegraph::types::NodeLabel::Decorator
+                || symbols[i].decorates.is_some()
+            {
+                continue;
+            }
+            let dec_end = symbols[i].line_end;
+            let target_qn = symbols
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.label,
+                        crate::codegraph::types::NodeLabel::Function
+                            | crate::codegraph::types::NodeLabel::Method
+                            | crate::codegraph::types::NodeLabel::Class
+                    ) && s.line_start >= dec_end
+                })
+                .min_by_key(|s| s.line_start)
+                .map(|s| s.qualified_name.clone());
+            if let Some(qn) = target_qn {
+                symbols[i].decorates = Some(qn);
+            }
+        }
 
         tracing::trace!(
             file = %relative,
@@ -177,8 +206,6 @@ pub async fn parse_files(
                     .map(|s| s.label.as_str())
                     .unwrap_or("Class");
 
-                // Parameters get HAS_PARAMETER rather than the generic
-                // CONTAINS so downstream queries can distinguish them.
                 let edge_type = match sym.label {
                     crate::codegraph::types::NodeLabel::Method => "HAS_METHOD",
                     crate::codegraph::types::NodeLabel::Variable => "HAS_PROPERTY",
@@ -191,6 +218,24 @@ pub async fn parse_files(
                      WHERE p.qualified_name = '{parent_escaped}' AND p.project_id = '{pid}' \
                      AND c.qualified_name = '{qname}' AND c.project_id = '{pid}' \
                      CREATE (p)-[:CodeRelation {{type: '{edge_type}', confidence: 1.0, reason: '', step: 0}}]->(c)",
+                ));
+            }
+
+            // Decorator → decorated symbol (Function/Method/Class).
+            // The target was resolved by line-proximity above.
+            if let Some(ref target_qn) = sym.decorates {
+                let target_escaped = cypher_escape(target_qn);
+                let target_label = symbols
+                    .iter()
+                    .find(|s| s.qualified_name == *target_qn)
+                    .map(|s| s.label.as_str())
+                    .unwrap_or("Function");
+
+                edge_stmts.push(format!(
+                    "MATCH (d:Decorator), (t:{target_label}) \
+                     WHERE d.qualified_name = '{qname}' AND d.project_id = '{pid}' \
+                     AND t.qualified_name = '{target_escaped}' AND t.project_id = '{pid}' \
+                     CREATE (d)-[:CodeRelation {{type: 'DECORATES', confidence: 1.0, reason: 'line-proximity', step: 0}}]->(t)",
                 ));
             }
         }
