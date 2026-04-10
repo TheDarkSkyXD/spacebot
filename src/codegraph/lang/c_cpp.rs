@@ -610,6 +610,24 @@ fn walk_c_calls(
             }
             // Fall through for nested calls.
         }
+        "new_expression" => {
+            // `new Foo(...)` — the `type` field holds the class/struct.
+            if let Some(caller) = enclosing.last()
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                let name = text(type_node, source);
+                let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                if !leaf.is_empty() {
+                    calls.push(CallSite {
+                        caller_qualified_name: caller.clone(),
+                        callee_name: leaf,
+                        line: node.start_position().row as u32 + 1,
+                        is_method_call: false,
+                        receiver: None,
+                    });
+                }
+            }
+        }
         _ => {}
     }
 

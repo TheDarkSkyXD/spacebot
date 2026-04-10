@@ -617,7 +617,6 @@ fn walk_rust_calls(
             // Fall through to recurse into nested calls
         }
         "macro_invocation" => {
-            // Capture macro calls like `println!(...)`, `vec![...]`
             if let Some(caller) = enclosing.last()
                 && let Some(macro_node) = node.child_by_field_name("macro")
             {
@@ -626,6 +625,26 @@ fn walk_rust_calls(
                     calls.push(CallSite {
                         caller_qualified_name: caller.clone(),
                         callee_name: name,
+                        line: node.start_position().row as u32 + 1,
+                        is_method_call: false,
+                        receiver: None,
+                    });
+                }
+            }
+        }
+        "struct_expression" => {
+            // `Foo { x: 1 }` — struct literal instantiation. The `name`
+            // field is either an identifier or a scoped_type_identifier;
+            // take the leaf to match class/struct names in the resolver.
+            if let Some(caller) = enclosing.last()
+                && let Some(name_node) = node.child_by_field_name("name")
+            {
+                let raw = text(name_node, source);
+                let leaf = raw.rsplit("::").next().unwrap_or(&raw).to_string();
+                if !leaf.is_empty() {
+                    calls.push(CallSite {
+                        caller_qualified_name: caller.clone(),
+                        callee_name: leaf,
                         line: node.start_position().row as u32 + 1,
                         is_method_call: false,
                         receiver: None,

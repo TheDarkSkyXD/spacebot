@@ -440,7 +440,41 @@ pub async fn resolve_calls(
             // --- Name-based tiered resolution ---
             let entries = match symbols_by_name.get(&site.callee_name) {
                 Some(e) => e,
-                None => continue,
+                None => {
+                    // No Function/Method with this name exists. If the
+                    // name matches a class/struct, treat it as a
+                    // constructor call and emit a USES edge from the
+                    // caller to the class. Covers `new Foo()`, struct
+                    // literals, and Python-style `Foo()` constructors.
+                    if !site.is_method_call
+                        && let Some(class_entries) = classes_by_name.get(&site.callee_name)
+                    {
+                        for (class_qn, _sf) in class_entries.iter().take(3) {
+                            let edge_key = format!("INST:{}->{}", site.caller_qualified_name, class_qn);
+                            if seen_edges.insert(edge_key) {
+                                push_uses_edge(
+                                    &mut edge_stmts,
+                                    "Function",
+                                    &site.caller_qualified_name,
+                                    class_qn,
+                                    &pid,
+                                    0.85,
+                                    "instantiation",
+                                );
+                                push_uses_edge(
+                                    &mut edge_stmts,
+                                    "Method",
+                                    &site.caller_qualified_name,
+                                    class_qn,
+                                    &pid,
+                                    0.85,
+                                    "instantiation",
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
             };
 
             // Tier 1: same-file (0.95)
@@ -579,6 +613,37 @@ pub async fn resolve_calls(
                         &target.label,
                         &pid,
                     );
+                }
+            }
+
+            // If the callee also matches a class name, emit an
+            // additional USES edge for the instantiation relationship
+            // regardless of which CALLS tier handled the method/function.
+            if !site.is_method_call
+                && let Some(class_entries) = classes_by_name.get(&site.callee_name)
+            {
+                for (class_qn, _sf) in class_entries.iter().take(3) {
+                    let edge_key = format!("INST:{}->{}", site.caller_qualified_name, class_qn);
+                    if seen_edges.insert(edge_key) {
+                        push_uses_edge(
+                            &mut edge_stmts,
+                            "Function",
+                            &site.caller_qualified_name,
+                            class_qn,
+                            &pid,
+                            0.85,
+                            "instantiation",
+                        );
+                        push_uses_edge(
+                            &mut edge_stmts,
+                            "Method",
+                            &site.caller_qualified_name,
+                            class_qn,
+                            &pid,
+                            0.85,
+                            "instantiation",
+                        );
+                    }
                 }
             }
         }

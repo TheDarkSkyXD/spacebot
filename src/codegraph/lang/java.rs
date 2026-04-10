@@ -488,7 +488,23 @@ fn walk_java_calls(
                     });
                 }
             }
-            // Fall through — walk children to capture nested calls.
+        }
+        "object_creation_expression" => {
+            // `new Foo(...)` — the `type` field holds the class name.
+            if let Some(caller) = enclosing.last()
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                let name = text(type_node, source);
+                if !name.is_empty() {
+                    calls.push(CallSite {
+                        caller_qualified_name: caller.clone(),
+                        callee_name: name,
+                        line: node.start_position().row as u32 + 1,
+                        is_method_call: false,
+                        receiver: None,
+                    });
+                }
+            }
         }
         _ => {}
     }

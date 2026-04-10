@@ -871,10 +871,19 @@ fn walk_ts_calls(
             // Fall through to recurse into nested calls
         }
         "new_expression" => {
+            // `new Foo(...)` or `new a.b.Foo(...)` — extract the leaf
+            // class name from identifier or member_expression.
             if let Some(caller) = enclosing.last()
-                && let Some(ctor_node) = node.child_by_field_name("constructor")
+                && let Some(ctor) = node.child_by_field_name("constructor")
             {
-                let name = node_text(ctor_node, source);
+                let name = match ctor.kind() {
+                    "identifier" => node_text(ctor, source),
+                    "member_expression" => ctor
+                        .child_by_field_name("property")
+                        .map(|n| node_text(n, source))
+                        .unwrap_or_default(),
+                    _ => node_text(ctor, source),
+                };
                 if !name.is_empty() {
                     calls.push(CallSite {
                         caller_qualified_name: caller.clone(),
