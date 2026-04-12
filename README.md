@@ -83,7 +83,7 @@ Five process types. Each does one job.
 
 **The Compactor** is a programmatic monitor (not an LLM) that watches context size per channel and triggers compaction before the channel fills up. Compaction workers run alongside without blocking.
 
-**The Cortex** sees across all channels, workers, and branches simultaneously. It generates the memory bulletin, a periodically refreshed briefing of the agent's knowledge injected into every conversation. It supervises processes, maintains the memory graph, detects patterns, and provides an admin chat with full tool access.
+**The Cortex** sees across all channels, workers, and branches simultaneously. It maintains the agent's working memory — a layered context assembly system that gives every conversation structured awareness of what's happening across the agent. Events are recorded as they happen; intra-day synthesis compresses them into narrative; daily summaries roll up at midnight; knowledge synthesis regenerates when the memory graph changes. The cortex supervises processes and maintains the memory graph.
 
 ```
 User sends message
@@ -123,13 +123,13 @@ State lives in tasks. Progress notes go on the task itself. After a crash, the n
 
 ### Memory
 
-Spacebot's memory is a typed, graph-connected knowledge system in SQLite and LanceDB. Every memory has a type, an importance score, and graph edges to related memories. The agent distinguishes facts from decisions, preferences from goals. That structure lets the cortex synthesize a useful briefing rather than dumping raw search results into context.
+Spacebot's memory is a typed, graph-connected knowledge system in SQLite and LanceDB. Every memory has a type, an importance score, and graph edges to related memories. The agent distinguishes facts from decisions, preferences from goals.
 
 - **Eight memory types** — Fact, Preference, Decision, Identity, Event, Observation, Goal, Todo
 - **Graph edges** — RelatedTo, Updates, Contradicts, CausedBy, PartOf
 - **Hybrid recall** — vector similarity + full-text search merged via Reciprocal Rank Fusion
 - **Memory import** — drop files into `ingest/` and Spacebot extracts structured memories automatically. Supports text, markdown, and PDF.
-- **Memory bulletin** — the cortex generates a periodic knowledge briefing injected into every conversation
+- **Working memory** — a five-layer context assembly system. Identity context, a structured event log, cross-channel activity map, participant awareness, and change-driven knowledge synthesis. Most layers are programmatic — no LLM calls to stay current
 
 ### Skills
 
