@@ -408,27 +408,6 @@ pub struct ProjectMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Project memory (Layer 1 with project_id tag)
-// ---------------------------------------------------------------------------
-
-/// A project-scoped memory in the centralized store.
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ProjectMemory {
-    pub id: String,
-    pub project_id: String,
-    pub memory_type: crate::memory::MemoryType,
-    pub content: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub created_at: DateTime<Utc>,
-    pub last_verified_at: DateTime<Utc>,
-    /// Relevance score (0.0–1.0), updated by stale eviction.
-    pub relevance_score: f32,
-    /// Who created this: `"indexer"`, `"cortex"`, `"agent"`, or `"user"`.
-    pub source: String,
-}
-
-// ---------------------------------------------------------------------------
 // Staleness check
 // ---------------------------------------------------------------------------
 

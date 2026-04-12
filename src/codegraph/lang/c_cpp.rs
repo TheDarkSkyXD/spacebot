@@ -153,6 +153,7 @@ impl LanguageProvider for CppProvider {
             NodeLabel::Enum,
             NodeLabel::Namespace,
             NodeLabel::TypeAlias,
+            NodeLabel::Template,
             NodeLabel::Variable,
             NodeLabel::Import,
         ]
@@ -323,6 +324,36 @@ fn walk_c_node(
                 let name = text(declarator, source);
                 if !name.is_empty() {
                     symbols.push(sym(file_path, parent_name, &name, NodeLabel::TypeAlias, &node));
+                }
+            }
+        }
+        "template_declaration" => {
+            // C++ template — extract a Template node wrapping the inner
+            // class/function/struct declaration. The inner declaration is
+            // still walked normally via the default recursion so its
+            // symbols land in the graph as children of the template.
+            let inner = (0..node.child_count())
+                .filter_map(|i| node.child(i))
+                .find(|c| matches!(
+                    c.kind(),
+                    "class_specifier" | "struct_specifier" | "function_definition"
+                        | "declaration" | "alias_declaration"
+                ));
+            if let Some(inner_node) = inner {
+                let name = inner_node
+                    .child_by_field_name("name")
+                    .map(|n| text(n, source))
+                    .or_else(|| {
+                        inner_node
+                            .child_by_field_name("declarator")
+                            .and_then(|d| extract_function_name(d, source))
+                    });
+                if let Some(name) = name
+                    && !name.is_empty()
+                {
+                    symbols.push(sym(
+                        file_path, parent_name, &name, NodeLabel::Template, &node,
+                    ));
                 }
             }
         }

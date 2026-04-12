@@ -1,4 +1,4 @@
-//! Phase 2: Build structural nodes (Folder, File, Package, Module, Project).
+//! Build structural nodes (Folder, File, Package, Module, Project).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -195,6 +195,81 @@ pub async fn build_structure(
 
     if !edge_stmts.is_empty() {
         let batch = db.execute_batch(edge_stmts).await?;
+        result.edges_created += batch.success;
+        result.errors += batch.errors;
+    }
+
+    // ── Create Package nodes ────────────────────────────────────────────
+    // Detect package manifests and create a Package node for each.
+    // The Package CONTAINS the manifest File node so graph queries can
+    // walk from Package → File → symbols.
+    let manifest_names: &[&str] = &[
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "pyproject.toml",
+        "setup.py",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "pubspec.yaml",
+        "Gemfile",
+        "composer.json",
+        "Package.swift",
+    ];
+
+    let mut pkg_node_stmts: Vec<String> = Vec::new();
+    let mut pkg_edge_stmts: Vec<String> = Vec::new();
+
+    for file in files {
+        let file_name = file
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if !manifest_names.contains(&file_name) {
+            continue;
+        }
+        if let Ok(relative) = file.strip_prefix(root_path) {
+            let rel_str = normalize_path(&relative.to_string_lossy());
+            let rel_escaped = cypher_escape(&rel_str);
+            let file_qname = format!("{pid}::{rel_escaped}");
+
+            // Package name: use the parent directory name, or project
+            // name for root-level manifests.
+            let pkg_dir = relative
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or(project_name);
+            let pkg_name = cypher_escape(pkg_dir);
+            let pkg_qname = format!("{pid}::package::{rel_escaped}");
+            let pkg_qname_escaped = cypher_escape(&pkg_qname);
+
+            pkg_node_stmts.push(format!(
+                "CREATE (:Package {{qualified_name: '{pkg_qname_escaped}', name: '{pkg_name}', \
+                 project_id: '{pid}', source_file: '{rel_escaped}', \
+                 line_start: 0, line_end: 0, source: 'pipeline', written_by: 'pipeline', \
+                 extends_type: '', import_source: '{file_name_escaped}', declared_type: ''}})",
+                file_name_escaped = cypher_escape(file_name),
+            ));
+
+            // Package → manifest File edge.
+            pkg_edge_stmts.push(format!(
+                "MATCH (p:Package), (f:File) WHERE p.qualified_name = '{pkg_qname_escaped}' \
+                 AND f.qualified_name = '{file_qname}' \
+                 CREATE (p)-[:CodeRelation {{type: 'CONTAINS', confidence: 1.0, reason: 'manifest', step: 0}}]->(f)",
+            ));
+        }
+    }
+
+    if !pkg_node_stmts.is_empty() {
+        let batch = db.execute_batch(pkg_node_stmts).await?;
+        result.nodes_created += batch.success;
+        result.errors += batch.errors;
+    }
+    if !pkg_edge_stmts.is_empty() {
+        let batch = db.execute_batch(pkg_edge_stmts).await?;
         result.edges_created += batch.success;
         result.errors += batch.errors;
     }

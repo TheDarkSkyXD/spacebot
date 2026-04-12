@@ -17,8 +17,6 @@ use super::pipeline;
 use super::pipeline::incremental;
 use super::types::{CodeGraphConfig, IndexStatus, RegisteredProject};
 use super::watcher::{self, ChangeBatch, WatcherHandle};
-use crate::llm::LlmManager;
-use crate::memory::EmbeddingModel;
 
 /// Broadcast capacity for code graph events.
 const EVENT_BUS_CAPACITY: usize = 256;
@@ -36,12 +34,6 @@ struct Inner {
     registry: RwLock<HashMap<String, RegisteredProject>>,
     event_tx: broadcast::Sender<CodeGraphEvent>,
     config: RwLock<Arc<CodeGraphConfig>>,
-    /// Optional LLM + embedding services — populated by `set_llm_manager` /
-    /// `set_embedding_model` from `main.rs` once those services exist. The
-    /// pipeline reads them lazily, so the code graph can still index
-    /// projects before (or without) LLM/embedding services being available.
-    llm_manager: RwLock<Option<Arc<LlmManager>>>,
-    embedding_model: RwLock<Option<Arc<EmbeddingModel>>>,
 }
 
 /// Central manager for all code graph operations.
@@ -67,22 +59,8 @@ impl CodeGraphManager {
                 registry: RwLock::new(HashMap::new()),
                 event_tx,
                 config: RwLock::new(Arc::new(CodeGraphConfig::default())),
-                llm_manager: RwLock::new(None),
-                embedding_model: RwLock::new(None),
             }),
         }
-    }
-
-    /// Wire in the shared LLM manager so the enriching phase can call out
-    /// to a model. Called once from `main.rs` after both managers exist.
-    pub async fn set_llm_manager(&self, llm: Arc<LlmManager>) {
-        *self.inner.llm_manager.write().await = Some(llm);
-    }
-
-    /// Wire in the shared fastembed model so the embeddings phase can
-    /// generate vectors for code symbols. Called once from `main.rs`.
-    pub async fn set_embedding_model(&self, embedder: Arc<EmbeddingModel>) {
-        *self.inner.embedding_model.write().await = Some(embedder);
     }
 
     /// Accessor for the base path so helpers that work on the codegraph
@@ -313,11 +291,6 @@ impl CodeGraphManager {
             tracing::debug!(project_id = %project_id, "purged stale graph data before indexing");
         }
 
-        // Snapshot the optional LLM + embedding services once per run so
-        // the pipeline never has to take the RwLock again mid-phase.
-        let llm_manager = self.inner.llm_manager.read().await.clone();
-        let embedding_model = self.inner.embedding_model.read().await.clone();
-
         // Start the pipeline.
         let handle = pipeline::start_full_pipeline(
             project_id.to_string(),
@@ -325,8 +298,6 @@ impl CodeGraphManager {
             db.clone(),
             config.clone(),
             self.inner.event_tx.clone(),
-            llm_manager,
-            embedding_model,
         );
 
         // Spawn a progress-forwarder that reads from the watch channel and
@@ -547,9 +518,94 @@ impl CodeGraphManager {
         *config = Arc::new(new_config);
     }
 
-    /// Get the database for a project.
+    /// Get the database for a project (only if already open).
     pub async fn get_db(&self, project_id: &str) -> Option<SharedCodeGraphDb> {
         self.inner.databases.read().await.get(project_id).cloned()
+    }
+
+    /// Get the database for a project, opening it lazily if needed.
+    ///
+    /// Unlike `get_db` which only returns already-open handles, this will
+    /// open the database from disk if the project is registered but the
+    /// DB hasn't been loaded yet (e.g., after a server restart).
+    pub async fn get_or_open_db(&self, project_id: &str) -> Result<SharedCodeGraphDb> {
+        self.ensure_db(project_id).await
+    }
+
+    /// Build index log entries from `meta.json` and the live registry.
+    pub async fn get_index_log(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<super::types::IndexLogEntry>> {
+        let mut entries = Vec::new();
+
+        // Read meta.json for the last completed run.
+        let meta_path = self
+            .inner
+            .base_path
+            .join("codegraph")
+            .join(project_id)
+            .join("meta.json");
+
+        if let Ok(data) = tokio::fs::read_to_string(&meta_path).await
+            && let Ok(meta) = serde_json::from_str::<super::types::ProjectMeta>(&data)
+        {
+            entries.push(super::types::IndexLogEntry {
+                run_id: meta
+                    .last_commit
+                    .clone()
+                    .unwrap_or_else(|| "initial".to_string()),
+                status: meta.status,
+                started_at: meta.created_at,
+                completed_at: meta.last_indexed_at,
+                current_phase: Some(super::types::PipelinePhase::Complete),
+                progress: None,
+                stats: meta.stats,
+                error: None,
+            });
+        }
+
+        // Check if there's a currently in-progress run.
+        let registry = self.inner.registry.read().await;
+        if let Some(project) = registry.get(project_id) {
+            if project.status == super::types::IndexStatus::Indexing {
+                if let Some(progress) = &project.progress {
+                    entries.insert(
+                        0,
+                        super::types::IndexLogEntry {
+                            run_id: "current".to_string(),
+                            status: super::types::IndexStatus::Indexing,
+                            started_at: project.updated_at,
+                            completed_at: None,
+                            current_phase: Some(progress.phase),
+                            progress: Some(progress.clone()),
+                            stats: Some(progress.stats.clone()),
+                            error: None,
+                        },
+                    );
+                }
+            } else if project.status == super::types::IndexStatus::Error {
+                // If the most recent state is an error and meta.json shows
+                // a previous successful run, add the error as the newest entry.
+                if !entries.is_empty() && entries[0].status != super::types::IndexStatus::Error {
+                    entries.insert(
+                        0,
+                        super::types::IndexLogEntry {
+                            run_id: "error".to_string(),
+                            status: super::types::IndexStatus::Error,
+                            started_at: project.updated_at,
+                            completed_at: Some(project.updated_at),
+                            current_phase: None,
+                            progress: None,
+                            stats: project.last_index_stats.clone(),
+                            error: project.error_message.clone(),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Restart watchers for all indexed projects on startup.
@@ -806,19 +862,12 @@ async fn trigger_full_reindex(
         .ok();
     }
 
-    // Pull the LLM + embedding services so the full-re-index fallback
-    // can still enrich + embed on its way through.
-    let llm_manager = inner.llm_manager.read().await.clone();
-    let embedding_model = inner.embedding_model.read().await.clone();
-
     let handle = pipeline::start_full_pipeline(
         project_id.clone(),
         root_path,
         db,
         config,
         inner.event_tx.clone(),
-        llm_manager,
-        embedding_model,
     );
 
     match handle.wait().await {

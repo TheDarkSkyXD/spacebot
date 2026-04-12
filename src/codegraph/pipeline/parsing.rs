@@ -26,6 +26,30 @@ fn normalize_path(s: &str) -> String {
     s.replace('\\', "/")
 }
 
+/// Extract a code snippet from file content between line_start and line_end.
+/// Returns an empty string if the range is invalid. Caps at 2000 chars.
+fn extract_snippet(content: &str, line_start: u32, line_end: u32) -> String {
+    if line_start == 0 || line_end == 0 || line_end < line_start {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let start = (line_start as usize).saturating_sub(1);
+    let end = (line_end as usize).min(lines.len());
+    if start >= lines.len() {
+        return String::new();
+    }
+    let mut snippet = lines[start..end].join("\n");
+    if snippet.len() > 2000 {
+        // Find a valid UTF-8 char boundary at or before byte 2000.
+        let mut boundary = 2000;
+        while boundary > 0 && !snippet.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        snippet.truncate(boundary);
+    }
+    snippet
+}
+
 /// Parse all source files with tree-sitter and extract symbol nodes.
 ///
 /// For each file, determines the language, parses the AST, and extracts
@@ -132,6 +156,8 @@ pub async fn parse_files(
         );
 
         let mut symbols = provider.extract_symbols(&relative, &content);
+        let test_qnames: std::collections::HashSet<String> =
+            provider.extract_tests(&relative, &content).into_iter().collect();
 
         // Link each Decorator to the nearest decoratable symbol
         // (Function, Method, or Class) that starts at or after the
@@ -216,13 +242,19 @@ pub async fn parse_files(
                     .unwrap_or(""),
             );
 
+            // Extract code snippet for the `content` column (capped at
+            // 2000 chars to avoid bloating the DB with huge functions).
+            let snippet = extract_snippet(&content, sym.line_start, sym.line_end);
+            let snippet_escaped = cypher_escape(&snippet);
+
             node_stmts.push(format!(
                 "CREATE (:{label} {{qualified_name: '{qname}', name: '{name}', \
                  project_id: '{pid}', source_file: '{rel_escaped}', \
                  line_start: {ls}, line_end: {le}, \
                  source: 'pipeline', written_by: 'pipeline', \
                  extends_type: '{extends_val}', import_source: '{import_src}', \
-                 declared_type: '{declared_type}'}})",
+                 declared_type: '{declared_type}', \
+                 content: '{snippet_escaped}', description: ''}})",
                 ls = sym.line_start,
                 le = sym.line_end,
             ));
@@ -273,6 +305,54 @@ pub async fn parse_files(
                      CREATE (d)-[:CodeRelation {{type: 'DECORATES', confidence: 1.0, reason: 'line-proximity', step: 0}}]->(t)",
                 ));
             }
+        }
+
+        // Create Test nodes for functions identified as tests by the
+        // language provider. Each Test mirrors the Function/Method it
+        // wraps and gets a TESTED_BY edge pointing from the test back
+        // to the original symbol.
+        for sym in &symbols {
+            let sym_qn = &sym.qualified_name;
+            if !test_qnames.contains(sym_qn) {
+                continue;
+            }
+            if !matches!(
+                sym.label,
+                crate::codegraph::types::NodeLabel::Function
+                    | crate::codegraph::types::NodeLabel::Method
+            ) {
+                continue;
+            }
+
+            let test_name = cypher_escape(&sym.name);
+            let test_qname = cypher_escape(&format!("{}::test", sym.qualified_name));
+            let sym_label = sym.label.as_str();
+
+            node_stmts.push(format!(
+                "CREATE (:Test {{qualified_name: '{test_qname}', name: '{test_name}', \
+                 project_id: '{pid}', source_file: '{rel_escaped}', \
+                 line_start: {ls}, line_end: {le}, \
+                 source: 'pipeline', written_by: 'pipeline', \
+                 extends_type: '', import_source: '', declared_type: ''}})",
+                ls = sym.line_start,
+                le = sym.line_end,
+            ));
+
+            // File DEFINES Test.
+            edge_stmts.push(format!(
+                "MATCH (f:File), (t:Test) WHERE f.qualified_name = '{file_qname}' \
+                 AND t.qualified_name = '{test_qname}' AND t.project_id = '{pid}' \
+                 CREATE (f)-[:CodeRelation {{type: 'DEFINES', confidence: 1.0, reason: '', step: 0}}]->(t)",
+            ));
+
+            // Function/Method TESTED_BY Test.
+            let sym_escaped = cypher_escape(sym_qn);
+            edge_stmts.push(format!(
+                "MATCH (s:{sym_label}), (t:Test) \
+                 WHERE s.qualified_name = '{sym_escaped}' AND s.project_id = '{pid}' \
+                 AND t.qualified_name = '{test_qname}' AND t.project_id = '{pid}' \
+                 CREATE (s)-[:CodeRelation {{type: 'TESTED_BY', confidence: 1.0, reason: 'test-attribute', step: 0}}]->(t)",
+            ));
         }
 
         result.files_parsed += 1;

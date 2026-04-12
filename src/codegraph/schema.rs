@@ -98,6 +98,11 @@ pub fn schema_ddl() -> Vec<String> {
                 // resolver in pipeline/calls.rs reads this to bind
                 // receivers to their class qnames for method lookup.
                 ("declared_type", "STRING"),
+                // Raw source code snippet (line_start..line_end).
+                // Used for FTS indexing and display.
+                ("content", "STRING"),
+                // LLM-generated or heuristic summary.
+                ("description", "STRING"),
             ],
         ));
     }

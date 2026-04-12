@@ -1,4 +1,4 @@
-//! Code Graph Memory System — Spacebot-native rebuild of GitNexus.
+//! Code Graph Memory System.
 //!
 //! A Layer 2 memory layer that indexes codebases into queryable knowledge
 //! graphs. When a project is added, a 10-phase AST parsing and graph
@@ -7,9 +7,11 @@
 //! execution flow, stored in LadybugDB.
 
 pub mod db;
+pub mod embeddings_table;
 pub mod events;
 pub mod eviction;
-pub mod languages;
+pub mod graph_queries;
+pub mod lang;
 pub mod manager;
 pub mod pipeline;
 pub mod schema;
@@ -21,5 +23,5 @@ pub use manager::CodeGraphManager;
 pub use types::{
     CodeGraphConfig, CommunityInfo, FilesForTaskResult, GraphEdge, GraphNode, GraphSearchResult,
     ImpactResult, IndexLogEntry, IndexStatus, NodeLabel, PipelinePhase, PipelineProgress,
-    PipelineStats, ProcessInfo, ProjectMemory, RegisteredProject,
+    PipelineStats, ProcessInfo, RegisteredProject,
 };

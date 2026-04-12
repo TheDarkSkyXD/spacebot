@@ -1,4 +1,4 @@
-//! Phase 6: Resolve extends/implements/inherits relationships.
+//! Resolve extends/implements/inherits relationships.
 
 use std::collections::HashMap;
 

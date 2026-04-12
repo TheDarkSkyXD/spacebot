@@ -406,10 +406,20 @@ fn walk_ts_node(
         "type_alias_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(name_node, source);
+                // Generic type declarations (`type Result<T, E> = ...`)
+                // get the Type label; plain aliases use TypeAlias.
+                let has_type_params = node
+                    .child_by_field_name("type_parameters")
+                    .is_some();
+                let label = if has_type_params {
+                    NodeLabel::Type
+                } else {
+                    NodeLabel::TypeAlias
+                };
                 symbols.push(ExtractedSymbol {
                     name: name.clone(),
                     qualified_name: qualified_name(file_path, parent_name, &name),
-                    label: NodeLabel::TypeAlias,
+                    label,
                     line_start: node.start_position().row as u32 + 1,
                     line_end: node.end_position().row as u32 + 1,
                     parent: parent_name.map(String::from),
@@ -1206,8 +1216,10 @@ fn extract_fallback(file_path: &str, content: &str) -> Vec<ExtractedSymbol> {
         } else if let Some(name) = extract_simple_pattern(trimmed, "type ")
             && (name.contains('=') || name.contains('<'))
         {
+            let has_type_params = name.contains('<');
+            let label = if has_type_params { NodeLabel::Type } else { NodeLabel::TypeAlias };
             let clean = name.split(['=', '<']).next().unwrap_or(&name).trim();
-            symbols.push(simple_symbol(file_path, clean, NodeLabel::TypeAlias, line_num));
+            symbols.push(simple_symbol(file_path, clean, label, line_num));
         }
     }
     symbols

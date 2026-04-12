@@ -1,9 +1,8 @@
-//! Phase 7: Weighted Louvain community detection (Wave 4).
+//! Weighted Louvain community detection.
 //!
-//! Replaces the old connected-components approach with a single-level
-//! Louvain modularity-optimization pass. Edges are weighted by relationship
-//! type (CALLS stronger than IMPORTS, etc.) which drives clusters toward
-//! functional cohesion rather than pure reachability.
+//! Single-level Louvain modularity-optimization pass. Edges are weighted
+//! by relationship type (CALLS stronger than IMPORTS, etc.) which drives
+//! clusters toward functional cohesion rather than pure reachability.
 //!
 //! For each surviving community we compute and persist:
 //! - `density`  — the fraction of possible internal edges that exist.

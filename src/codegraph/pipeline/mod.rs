@@ -32,8 +32,6 @@ pub type ProgressFn = Arc<dyn Fn(f32, &str, &PhaseResult) + Send + Sync>;
 use super::db::SharedCodeGraphDb;
 use super::events::CodeGraphEvent;
 use super::types::{CodeGraphConfig, PipelinePhase, PipelineProgress, PipelineStats};
-use crate::llm::LlmManager;
-use crate::memory::EmbeddingModel;
 
 /// A handle to a running pipeline, allowing progress monitoring and cancellation.
 pub struct PipelineHandle {
@@ -62,14 +60,8 @@ impl PipelineHandle {
 /// Start a full indexing pipeline for a project.
 ///
 /// Returns a `PipelineHandle` for monitoring progress and cancellation.
-///
-/// Two optional integrations:
-/// - `llm_manager` unlocks LLM-driven label generation in the enriching phase.
-/// - `embedding_model` unlocks semantic vector embeddings for
-///   Function/Method/Class nodes.
-///
-/// Both are optional — when `None`, the corresponding phases no-op so
-/// the pipeline still completes end-to-end.
+/// The pipeline is fully deterministic — every phase runs against
+/// LadybugDB only, no model is invoked, and no network call is made.
 #[allow(clippy::too_many_arguments)]
 pub fn start_full_pipeline(
     project_id: String,
@@ -77,8 +69,6 @@ pub fn start_full_pipeline(
     db: SharedCodeGraphDb,
     config: Arc<CodeGraphConfig>,
     event_tx: tokio::sync::broadcast::Sender<CodeGraphEvent>,
-    llm_manager: Option<Arc<LlmManager>>,
-    embedding_model: Option<Arc<EmbeddingModel>>,
 ) -> PipelineHandle {
     let initial_progress = PipelineProgress {
         phase: PipelinePhase::Extracting,
@@ -99,8 +89,6 @@ pub fn start_full_pipeline(
         progress_tx,
         cancel_rx,
         event_tx,
-        llm_manager,
-        embedding_model,
     ));
 
     PipelineHandle {
@@ -119,8 +107,6 @@ async fn run_pipeline(
     progress_tx: Arc<watch::Sender<PipelineProgress>>,
     cancel_rx: watch::Receiver<bool>,
     event_tx: tokio::sync::broadcast::Sender<CodeGraphEvent>,
-    llm_manager: Option<Arc<LlmManager>>,
-    embedding_model: Option<Arc<EmbeddingModel>>,
 ) -> Result<PipelineStats> {
     let pipeline_start = Instant::now();
     let mut stats = PipelineStats::default();
@@ -398,77 +384,19 @@ async fn run_pipeline(
     check_cancel!();
 
     // ── Enriching ────────────────────────────────────────────────────────
-    // Two orthogonal optional passes: LLM labels for Community nodes and
-    // vector embeddings for Function/Method/Class nodes. Both gated on
-    // service availability and the node-count threshold.
+    // Deterministic enrichment hook. Runs against the LadybugDB graph
+    // only — no model is invoked, no network call is made. Both calls
+    // are no-ops today (community labels are produced inline by
+    // `communities.rs`); the wiring is preserved so future deterministic
+    // enrichment work has a stable hook.
     let phase_start = Instant::now();
-    // Both passes share the same node-count ceiling because their cost
-    // (token spend for the LLM, CPU + memory for embeddings) scales
-    // with graph size. Any project bigger than the threshold gets
-    // skipped on both fronts to keep enrichment from blowing up the
-    // budget on monorepos.
-    let enrichment_eligible =
-        config.llm_enrichment && stats.nodes_created <= config.node_embedding_skip_threshold;
-
-    if enrichment_eligible {
-        if let Some(ref llm) = llm_manager {
-            update_progress(PipelinePhase::Enriching, 0.0, "Enriching with LLM labels", &stats);
-            if let Err(err) = enriching::enrich(&project_id, &db, llm).await {
-                tracing::warn!(%err, "LLM enrichment failed, continuing without labels");
-            }
-            update_progress(PipelinePhase::Enriching, 0.5, "Label enrichment complete", &stats);
-        } else {
-            update_progress(
-                PipelinePhase::Enriching,
-                0.5,
-                "LLM enrichment skipped — no llm_manager wired",
-                &stats,
-            );
-        }
-    } else {
-        let reason = if stats.nodes_created > config.node_embedding_skip_threshold {
-            format!(
-                "Skipping LLM enrichment ({} nodes exceeds {} threshold)",
-                stats.nodes_created, config.node_embedding_skip_threshold
-            )
-        } else {
-            "LLM enrichment disabled".to_string()
-        };
-        update_progress(PipelinePhase::Enriching, 0.5, &reason, &stats);
+    update_progress(PipelinePhase::Enriching, 0.0, "Enriching graph", &stats);
+    if let Err(err) = enriching::enrich(&project_id, &db).await {
+        tracing::warn!(%err, "enrichment pass failed, continuing");
     }
-
-    // Vector embeddings — shares the node-count threshold with the LLM
-    // pass so large projects skip both and avoid runaway cost.
-    if let Some(ref embedder) = embedding_model {
-        if stats.nodes_created <= config.node_embedding_skip_threshold {
-            update_progress(
-                PipelinePhase::Enriching,
-                0.55,
-                "Generating code embeddings",
-                &stats,
-            );
-            match embeddings::generate_embeddings(&project_id, &root_path, &db, embedder).await {
-                Ok(embed_stats) => {
-                    tracing::info!(
-                        project_id = %project_id,
-                        symbols = embed_stats.embedded,
-                        "code embeddings generated"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "code embeddings phase failed, continuing");
-                }
-            }
-        } else {
-            tracing::info!(
-                project_id = %project_id,
-                nodes = stats.nodes_created,
-                threshold = config.node_embedding_skip_threshold,
-                "skipping embeddings (node count exceeds threshold)"
-            );
-        }
+    if let Err(err) = embeddings::generate_embeddings(&project_id, &root_path, &db).await {
+        tracing::warn!(%err, "embeddings pass failed, continuing");
     }
-
     update_progress(PipelinePhase::Enriching, 1.0, "Enrichment complete", &stats);
     phase_timings.insert("enriching".to_string(), phase_start.elapsed().as_secs_f64());
     check_cancel!();

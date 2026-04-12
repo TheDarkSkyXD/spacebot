@@ -1,8 +1,8 @@
-//! Incremental re-indexing pipeline (Wave 3).
+//! Incremental re-indexing pipeline.
 //!
 //! Given a set of changed files from the watcher, surgically rebuild the
 //! graph for just those files (and their direct dependents) instead of
-//! purging and re-running the full 10-phase pipeline.
+//! purging and re-running the full pipeline.
 //!
 //! Execution order:
 //! 1. Classify changed files → `still_exist` vs `deleted`.

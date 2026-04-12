@@ -79,6 +79,7 @@ impl LanguageProvider for RustProvider {
             NodeLabel::Function,
             NodeLabel::Method,
             NodeLabel::Macro,
+            NodeLabel::Type,
             NodeLabel::TypeAlias,
             NodeLabel::Const,
             NodeLabel::Variable,
@@ -261,7 +262,17 @@ fn walk_rust_node(
         "type_item" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::TypeAlias, &node));
+                // Generic type items (`type Result<T> = ...`) get the
+                // Type label; plain aliases use TypeAlias.
+                let has_type_params = node
+                    .child_by_field_name("type_parameters")
+                    .is_some();
+                let label = if has_type_params {
+                    NodeLabel::Type
+                } else {
+                    NodeLabel::TypeAlias
+                };
+                symbols.push(sym(file_path, parent_name, &name, label, &node));
             }
         }
         "const_item" | "static_item" => {

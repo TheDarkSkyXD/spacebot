@@ -1,4 +1,4 @@
-//! Phase 1: Filesystem walk with .gitignore / .spacebotignore respect.
+//! Filesystem walk with .gitignore / .spacebotignore respect.
 
 use std::path::{Path, PathBuf};
 
