@@ -19,7 +19,7 @@ import {
 import { useSigma } from "./useSigma";
 import {
 	filterGraphByDepth, getNodeColor,
-	applySolarLayout, applyRadialLayout, applyHierarchyLayout,
+	applySolarLayout, applyRadialLayout,
 	type SigmaNodeAttributes, type SigmaEdgeAttributes, type LayoutMode,
 } from "./graphAdapter";
 import type { BulkNode } from "./types";
@@ -35,7 +35,6 @@ function applyLayout(
 	switch (mode) {
 		case "solar": applySolarLayout(graph); break;
 		case "radial": applyRadialLayout(graph); break;
-		case "hierarchy": applyHierarchyLayout(graph); break;
 	}
 }
 

@@ -442,7 +442,7 @@ export const filterGraphByDepth = (
 // Layout modes — reposition nodes without rebuilding the graph.
 // ---------------------------------------------------------------------------
 
-export type LayoutMode = "force" | "solar" | "radial" | "hierarchy" | "mermaid";
+export type LayoutMode = "force" | "solar" | "radial" | "mermaid";
 
 // Ring assignments for Solar layout. Inner rings = structural, outer = symbols.
 const SOLAR_RING: Record<string, number> = {
@@ -545,41 +545,3 @@ export const applyRadialLayout = (
 	});
 };
 
-/** Hierarchy layout — horizontal swim lanes by label type. Folders at
- *  top, Files below, Classes/Structs next, Functions/Methods at bottom.
- *  Within each lane nodes are sorted by source file path. */
-export const applyHierarchyLayout = (
-	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
-): void => {
-	// Assign each label to a lane.
-	const LANE: Record<string, number> = {
-		Project: 0, Package: 0, Module: 0, Namespace: 0,
-		Folder: 1,
-		File: 2,
-		Class: 3, Interface: 3, Struct: 3, Trait: 3, Enum: 3, Record: 3,
-		Function: 4, Method: 4, Impl: 4, Const: 4, MacroDef: 4,
-	};
-
-	const lanes: { id: string; path: string }[][] = [[], [], [], [], [], []];
-	graph.forEachNode((nodeId, attrs) => {
-		if (attrs.hidden) return;
-		const lane = LANE[attrs.nodeType] ?? 5;
-		lanes[lane].push({ id: nodeId, path: attrs.sourceFile ?? attrs.label ?? "" });
-	});
-
-	// Sort within each lane by file path for locality.
-	lanes.forEach((lane) => lane.sort((a, b) => a.path.localeCompare(b.path)));
-
-	const xSpacing = 10;
-	const ySpacing = Math.sqrt(graph.order) * 8;
-
-	lanes.forEach((lane, laneIdx) => {
-		const y = laneIdx * ySpacing;
-		const totalWidth = lane.length * xSpacing;
-		const offsetX = -totalWidth / 2;
-		lane.forEach((node, i) => {
-			graph.setNodeAttribute(node.id, "x", offsetX + i * xSpacing);
-			graph.setNodeAttribute(node.id, "y", y);
-		});
-	});
-};

@@ -27,7 +27,6 @@ const LAYOUT_MODES: { key: LayoutMode; label: string }[] = [
 	{ key: "force", label: "Force" },
 	{ key: "solar", label: "Solar" },
 	{ key: "radial", label: "Radial" },
-	{ key: "hierarchy", label: "Hierarchy" },
 	{ key: "mermaid", label: "Mermaid" },
 ];
 

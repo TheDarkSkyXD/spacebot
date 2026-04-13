@@ -115,9 +115,15 @@ function ensureMermaidInit() {
 }
 
 export function MermaidView({ nodes, edges }: Props) {
-	const containerRef = useRef<HTMLDivElement>(null);
+	const svgRef = useRef<HTMLDivElement>(null);
+	const viewportRef = useRef<HTMLDivElement>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [copied, setCopied] = useState(false);
+
+	// Zoom + pan state.
+	const [scale, setScale] = useState(1);
+	const [translate, setTranslate] = useState({ x: 0, y: 0 });
+	const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
 
 	const { code, truncated } = useMemo(
 		() => generateMermaid(nodes, edges),
@@ -125,7 +131,7 @@ export function MermaidView({ nodes, edges }: Props) {
 	);
 
 	useEffect(() => {
-		if (!containerRef.current) return;
+		if (!svgRef.current) return;
 		ensureMermaidInit();
 
 		let cancelled = false;
@@ -133,9 +139,12 @@ export function MermaidView({ nodes, edges }: Props) {
 			try {
 				const id = `mermaid-${Date.now()}`;
 				const { svg } = await mermaid.render(id, code);
-				if (!cancelled && containerRef.current) {
-					containerRef.current.innerHTML = svg;
+				if (!cancelled && svgRef.current) {
+					svgRef.current.innerHTML = svg;
 					setError(null);
+					// Reset zoom/pan on new render.
+					setScale(1);
+					setTranslate({ x: 0, y: 0 });
 				}
 			} catch (err) {
 				if (!cancelled) {
@@ -148,11 +157,58 @@ export function MermaidView({ nodes, edges }: Props) {
 		return () => { cancelled = true; };
 	}, [code]);
 
+	// Mouse wheel zoom.
+	useEffect(() => {
+		const viewport = viewportRef.current;
+		if (!viewport) return;
+		const onWheel = (e: WheelEvent) => {
+			e.preventDefault();
+			const delta = e.deltaY > 0 ? 0.9 : 1.1;
+			setScale((s) => Math.max(0.1, Math.min(s * delta, 5)));
+		};
+		viewport.addEventListener("wheel", onWheel, { passive: false });
+		return () => viewport.removeEventListener("wheel", onWheel);
+	}, []);
+
+	// Mouse drag pan.
+	const onMouseDown = (e: React.MouseEvent) => {
+		if (e.button !== 0) return;
+		dragRef.current = {
+			startX: e.clientX,
+			startY: e.clientY,
+			originX: translate.x,
+			originY: translate.y,
+		};
+	};
+
+	useEffect(() => {
+		const onMouseMove = (e: MouseEvent) => {
+			const d = dragRef.current;
+			if (!d) return;
+			setTranslate({
+				x: d.originX + (e.clientX - d.startX),
+				y: d.originY + (e.clientY - d.startY),
+			});
+		};
+		const onMouseUp = () => { dragRef.current = null; };
+		window.addEventListener("mousemove", onMouseMove);
+		window.addEventListener("mouseup", onMouseUp);
+		return () => {
+			window.removeEventListener("mousemove", onMouseMove);
+			window.removeEventListener("mouseup", onMouseUp);
+		};
+	}, []);
+
 	const handleCopy = () => {
 		navigator.clipboard.writeText(code).then(() => {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 2000);
 		});
+	};
+
+	const handleResetView = () => {
+		setScale(1);
+		setTranslate({ x: 0, y: 0 });
 	};
 
 	return (
@@ -164,7 +220,16 @@ export function MermaidView({ nodes, edges }: Props) {
 						Diagram truncated to {MAX_NODES} nodes
 					</span>
 				)}
+				<span className="text-[10px] text-ink-faint">
+					{Math.round(scale * 100)}%
+				</span>
 				<div className="ml-auto flex items-center gap-2">
+					<button
+						onClick={handleResetView}
+						className="rounded px-2.5 py-1 text-[11px] text-ink-faint transition-colors hover:bg-app-hover hover:text-ink"
+					>
+						Reset View
+					</button>
 					<button
 						onClick={handleCopy}
 						className="rounded px-2.5 py-1 text-[11px] text-ink-faint transition-colors hover:bg-app-hover hover:text-ink"
@@ -174,7 +239,7 @@ export function MermaidView({ nodes, edges }: Props) {
 				</div>
 			</div>
 
-			{/* Diagram */}
+			{/* Diagram with zoom/pan */}
 			{error ? (
 				<div className="flex flex-1 items-center justify-center p-8">
 					<div className="max-w-md text-center">
@@ -184,9 +249,19 @@ export function MermaidView({ nodes, edges }: Props) {
 				</div>
 			) : (
 				<div
-					ref={containerRef}
-					className="flex-1 overflow-auto p-6 [&_svg]:mx-auto [&_svg]:max-w-full"
-				/>
+					ref={viewportRef}
+					className="flex-1 cursor-grab overflow-hidden active:cursor-grabbing"
+					onMouseDown={onMouseDown}
+				>
+					<div
+						ref={svgRef}
+						className="origin-center p-6 [&_svg]:mx-auto"
+						style={{
+							transform: `translate(${translate.x}px, ${translate.y}px) scale(${scale})`,
+							transformOrigin: "center center",
+						}}
+					/>
+				</div>
 			)}
 		</div>
 	);
