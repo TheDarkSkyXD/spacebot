@@ -40,6 +40,13 @@ export interface SigmaEdgeAttributes {
 	type?: string;
 }
 
+/** Format bytes into a human-readable string (e.g. 1.2 KB, 3.4 MB). */
+const formatFileSize = (bytes: number): string => {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
 const STRUCTURAL_LABELS = new Set<NodeLabel>([
 	"Project",
 	"Package",
@@ -227,12 +234,19 @@ export const buildGraph = (
 			? getCommunityColor(community!)
 			: getNodeColor(label, colorOverrides);
 
+		// File labels show the file size so users can gauge weight at a
+		// glance (e.g. "server.rs (12.3 KB)").
+		const displayLabel =
+			label === "File" && node.file_size
+				? `${node.name} (${formatFileSize(node.file_size)})`
+				: node.name;
+
 		graph.addNode(id, {
 			x,
 			y,
 			size: scaledSize,
 			color,
-			label: node.name,
+			label: displayLabel,
 			nodeType: label,
 			sourceFile: node.source_file ?? null,
 			lineStart: (node.line_start ?? null) as number | null,

@@ -185,6 +185,13 @@ function Header({ node, onClose, colorOverrides }: { node: BulkNode; onClose: ()
 	const label = node.label as NodeLabel;
 	const color = getNodeColor(label, colorOverrides);
 	const fileName = node.source_file?.split("/").pop() ?? node.name;
+	const fileSize = node.file_size
+		? node.file_size < 1024
+			? `${node.file_size} B`
+			: node.file_size < 1024 * 1024
+			? `${(node.file_size / 1024).toFixed(1)} KB`
+			: `${(node.file_size / (1024 * 1024)).toFixed(1)} MB`
+		: null;
 	return (
 		<div className="flex items-center gap-2 border-b border-app-line bg-app/50 px-3 py-2.5">
 			<HugeiconsIcon icon={CodeIcon} className="h-4 w-4 text-cyan-400" />
@@ -194,7 +201,10 @@ function Header({ node, onClose, colorOverrides }: { node: BulkNode; onClose: ()
 			>
 				{label}
 			</span>
-			<span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">{fileName}</span>
+			<span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">
+				{fileName}
+				{fileSize && <span className="ml-1.5 text-ink-faint">({fileSize})</span>}
+			</span>
 			<button
 				onClick={onClose}
 				className="rounded p-1 text-ink-faint transition-colors hover:bg-app-hover hover:text-ink"

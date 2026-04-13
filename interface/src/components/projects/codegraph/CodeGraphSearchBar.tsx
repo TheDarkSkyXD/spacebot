@@ -158,7 +158,18 @@ export function CodeGraphSearchBar({
 												className="h-2.5 w-2.5 flex-shrink-0 rounded-full"
 												style={{ backgroundColor: color }}
 											/>
-											<span className="flex-1 truncate text-sm font-medium">{node.name}</span>
+											<span className="flex-1 truncate text-sm font-medium">
+												{node.name}
+												{node.file_size != null && (
+													<span className="ml-1.5 text-xs font-normal text-ink-faint">
+														({node.file_size < 1024
+															? `${node.file_size} B`
+															: node.file_size < 1024 * 1024
+															? `${(node.file_size / 1024).toFixed(1)} KB`
+															: `${(node.file_size / (1024 * 1024)).toFixed(1)} MB`})
+													</span>
+												)}
+											</span>
 											<span className="rounded bg-app px-1.5 py-0.5 text-[10px] text-ink-faint">
 												{node.label}
 											</span>

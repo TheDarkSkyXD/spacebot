@@ -1483,6 +1483,7 @@ export interface CodeGraphNodeSummary {
 	source_file?: string;
 	line_start?: number;
 	line_end?: number;
+	file_size?: number;
 }
 
 export interface CodeGraphNodeFull extends CodeGraphNodeSummary {

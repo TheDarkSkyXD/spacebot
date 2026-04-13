@@ -151,6 +151,9 @@ pub(super) struct NodeSummary {
     source_file: Option<String>,
     line_start: Option<u32>,
     line_end: Option<u32>,
+    /// File size in bytes (only set for File nodes in the bulk endpoint).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_size: Option<u64>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -631,6 +634,7 @@ pub(super) async fn list_nodes(
             source_file: n.source_file,
             line_start: n.line_start,
             line_end: n.line_end,
+            file_size: None,
         })
         .collect();
 
@@ -858,9 +862,26 @@ pub(super) async fn get_bulk_nodes(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // Resolve the project root so we can stat File nodes for their sizes.
+    let project_root = manager
+        .get_project(&project_id)
+        .await
+        .map(|p| p.root_path.clone());
+
     let nodes = queried
         .into_iter()
-        .map(|n| NodeSummary {
+        .map(|n| {
+            // For File nodes, stat the file to get its size in bytes.
+            let file_size = if n.label == "File" {
+                n.source_file.as_ref().and_then(|sf| {
+                    project_root.as_ref().and_then(|root| {
+                        std::fs::metadata(root.join(sf)).ok().map(|m| m.len())
+                    })
+                })
+            } else {
+                None
+            };
+            NodeSummary {
             id: n.id,
             qualified_name: n.qualified_name,
             name: n.name,
@@ -868,7 +889,8 @@ pub(super) async fn get_bulk_nodes(
             source_file: n.source_file,
             line_start: n.line_start,
             line_end: n.line_end,
-        })
+            file_size,
+        }})
         .collect();
 
     Ok(Json(BulkNodesResponse {
