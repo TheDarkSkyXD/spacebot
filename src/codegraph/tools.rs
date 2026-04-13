@@ -565,3 +565,205 @@ pub async fn detect_changes(
         summary,
     })
 }
+
+// ---------------------------------------------------------------------------
+// 4. Cypher — raw graph query
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CypherResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub row_count: usize,
+}
+
+/// Execute a raw Cypher query against the code graph and return results
+/// as a JSON table. The query is read-only — mutations are rejected.
+pub async fn cypher_query(
+    db: &SharedCodeGraphDb,
+    query: &str,
+) -> Result<CypherResult> {
+    // Safety: reject mutations.
+    let upper = query.trim().to_uppercase();
+    if upper.starts_with("CREATE")
+        || upper.starts_with("DELETE")
+        || upper.starts_with("SET")
+        || upper.starts_with("MERGE")
+        || upper.starts_with("DROP")
+        || upper.starts_with("DETACH")
+    {
+        anyhow::bail!("Mutation queries are not allowed — use read-only queries only.");
+    }
+
+    let rows = db.query(query).await?;
+
+    let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    for row in &rows {
+        let json_row: Vec<serde_json::Value> = row
+            .iter()
+            .map(|v| match v {
+                lbug::Value::String(s) => serde_json::Value::String(s.clone()),
+                lbug::Value::Int64(n) => serde_json::json!(n),
+                lbug::Value::Int32(n) => serde_json::json!(n),
+                lbug::Value::Int16(n) => serde_json::json!(n),
+                lbug::Value::Double(n) => serde_json::json!(n),
+                lbug::Value::Float(n) => serde_json::json!(n),
+                lbug::Value::Bool(b) => serde_json::Value::Bool(*b),
+                _ => serde_json::Value::Null,
+            })
+            .collect();
+        result_rows.push(json_row);
+    }
+
+    let row_count = result_rows.len();
+    Ok(CypherResult {
+        columns: Vec::new(), // LadybugDB doesn't expose column names in the result
+        rows: result_rows,
+        row_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 5. Rename — multi-file coordinated rename
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameEdit {
+    pub file_path: String,
+    pub line: u32,
+    pub old_text: String,
+    pub new_text: String,
+    pub confidence: String, // "graph" or "text_search"
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RenameResult {
+    pub old_name: String,
+    pub new_name: String,
+    pub files_affected: usize,
+    pub total_edits: usize,
+    pub graph_edits: usize,
+    pub text_search_edits: usize,
+    pub changes: Vec<RenameEdit>,
+    pub applied: bool,
+}
+
+/// Find all references to a symbol via graph + text search and optionally
+/// apply the rename. Returns a preview by default (dry_run = true).
+pub async fn rename_symbol(
+    db: &SharedCodeGraphDb,
+    project_id: &str,
+    root_path: &Path,
+    symbol_name: &str,
+    new_name: &str,
+    file_path: Option<&str>,
+    dry_run: bool,
+) -> Result<Option<RenameResult>> {
+    // Resolve the symbol via context.
+    let ctx = symbol_context(db, project_id, symbol_name, file_path).await?;
+    let ctx = match ctx {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let mut edits: Vec<RenameEdit> = Vec::new();
+
+    // 1. Definition location — the symbol itself.
+    if let Some(ref sf) = ctx.symbol.source_file {
+        if let Some(ls) = ctx.symbol.line_start {
+            edits.push(RenameEdit {
+                file_path: sf.clone(),
+                line: ls,
+                old_text: symbol_name.to_string(),
+                new_text: new_name.to_string(),
+                confidence: "graph".to_string(),
+            });
+        }
+    }
+
+    // 2. Graph-based references — all incoming edges that reference this symbol.
+    let mut graph_files: HashSet<String> = HashSet::new();
+    if let Some(ref sf) = ctx.symbol.source_file {
+        graph_files.insert(sf.clone());
+    }
+    for refs in ctx.incoming.values() {
+        for r in refs {
+            if let Some(ref sf) = r.source_file {
+                if let Some(ls) = r.line_start {
+                    if graph_files.insert(sf.clone()) || true {
+                        edits.push(RenameEdit {
+                            file_path: sf.clone(),
+                            line: ls,
+                            old_text: symbol_name.to_string(),
+                            new_text: new_name.to_string(),
+                            confidence: "graph".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let graph_edits = edits.len();
+
+    // 3. Text search — find references the graph missed using grep.
+    let grep_output = std::process::Command::new("grep")
+        .args(["-rn", "--include=*.rs", "--include=*.ts", "--include=*.tsx",
+               "--include=*.js", "--include=*.py", "--include=*.go",
+               "-w", symbol_name])
+        .current_dir(root_path)
+        .output();
+
+    if let Ok(output) = grep_output {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            // Format: "file:line:content"
+            let parts: Vec<&str> = line.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                let file = parts[0].to_string();
+                let line_num: u32 = parts[1].parse().unwrap_or(0);
+                if line_num > 0 && !graph_files.contains(&file) {
+                    edits.push(RenameEdit {
+                        file_path: file,
+                        line: line_num,
+                        old_text: symbol_name.to_string(),
+                        new_text: new_name.to_string(),
+                        confidence: "text_search".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let text_search_edits = edits.len() - graph_edits;
+
+    // Collect unique files.
+    let files_affected: HashSet<&str> = edits.iter().map(|e| e.file_path.as_str()).collect();
+
+    let mut result = RenameResult {
+        old_name: symbol_name.to_string(),
+        new_name: new_name.to_string(),
+        files_affected: files_affected.len(),
+        total_edits: edits.len(),
+        graph_edits,
+        text_search_edits,
+        changes: edits,
+        applied: false,
+    };
+
+    // Apply edits if not dry_run.
+    if !dry_run {
+        for edit in &result.changes {
+            let full_path = root_path.join(&edit.file_path);
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
+                let updated = content.replace(&edit.old_text, &edit.new_text);
+                if updated != content {
+                    std::fs::write(&full_path, updated).ok();
+                }
+            }
+        }
+        result.applied = true;
+    }
+
+    Ok(Some(result))
+}

@@ -516,3 +516,162 @@ impl Tool for CodeGraphDetectChangesTool {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// codegraph_cypher — raw Cypher query
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct CodeGraphCypherTool {
+    manager: Arc<CodeGraphManager>,
+}
+
+impl CodeGraphCypherTool {
+    pub fn new(manager: Arc<CodeGraphManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("codegraph_cypher failed: {0}")]
+pub struct CodeGraphCypherError(String);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeGraphCypherArgs {
+    /// Cypher query to execute (read-only — CREATE/DELETE/SET are rejected).
+    pub query: String,
+    /// Project ID (used to open the correct database).
+    pub project_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CodeGraphCypherOutput {
+    pub result: Value,
+}
+
+impl Tool for CodeGraphCypherTool {
+    const NAME: &'static str = "codegraph_cypher";
+    type Error = CodeGraphCypherError;
+    type Args = CodeGraphCypherArgs;
+    type Output = CodeGraphCypherOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Execute a raw read-only Cypher query against the code knowledge graph. Use for complex structural queries that the other codegraph tools don't cover. Node labels: File, Folder, Function, Class, Method, Interface, Struct, Enum, Trait, Impl, Type, etc. Edge type stored as CodeRelation.type property (CALLS, IMPORTS, EXTENDS, IMPLEMENTS, CONTAINS, DEFINES, HAS_METHOD, MEMBER_OF, STEP_IN_PROCESS).".to_string(),
+            parameters: schemars::schema_for!(CodeGraphCypherArgs).to_value(),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let db = self
+            .manager
+            .get_db(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphCypherError(format!("project '{}' not found", args.project_id)))?;
+
+        let result = cg_tools::cypher_query(&db, &args.query)
+            .await
+            .map_err(|e| CodeGraphCypherError(e.to_string()))?;
+
+        Ok(CodeGraphCypherOutput {
+            result: serde_json::to_value(result).unwrap_or_default(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codegraph_rename — multi-file coordinated rename
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct CodeGraphRenameTool {
+    manager: Arc<CodeGraphManager>,
+}
+
+impl CodeGraphRenameTool {
+    pub fn new(manager: Arc<CodeGraphManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("codegraph_rename failed: {0}")]
+pub struct CodeGraphRenameError(String);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeGraphRenameArgs {
+    /// Current name of the symbol to rename.
+    pub symbol_name: String,
+    /// New name for the symbol.
+    pub new_name: String,
+    /// Project ID to search within.
+    pub project_id: String,
+    /// Optional file path to disambiguate symbols with the same name.
+    pub file_path: Option<String>,
+    /// Preview edits without applying (default: true). Set to false to apply.
+    #[serde(default = "default_dry_run")]
+    pub dry_run: bool,
+}
+
+fn default_dry_run() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct CodeGraphRenameOutput {
+    pub found: bool,
+    pub result: Value,
+}
+
+impl Tool for CodeGraphRenameTool {
+    const NAME: &'static str = "codegraph_rename";
+    type Error = CodeGraphRenameError;
+    type Args = CodeGraphRenameArgs;
+    type Output = CodeGraphRenameOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Rename a code symbol across all files using the knowledge graph + text search. Graph-based edits are high confidence; text_search edits need manual review. Defaults to dry_run=true (preview only). Set dry_run=false to apply the rename.".to_string(),
+            parameters: schemars::schema_for!(CodeGraphRenameArgs).to_value(),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let project = self
+            .manager
+            .get_project(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphRenameError(format!("project '{}' not found", args.project_id)))?;
+
+        let db = self
+            .manager
+            .get_db(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphRenameError("database not available".to_string()))?;
+
+        let result = cg_tools::rename_symbol(
+            &db,
+            &args.project_id,
+            &project.root_path,
+            &args.symbol_name,
+            &args.new_name,
+            args.file_path.as_deref(),
+            args.dry_run,
+        )
+        .await
+        .map_err(|e| CodeGraphRenameError(e.to_string()))?;
+
+        match result {
+            Some(r) => Ok(CodeGraphRenameOutput {
+                found: true,
+                result: serde_json::to_value(r).unwrap_or_default(),
+            }),
+            None => Ok(CodeGraphRenameOutput {
+                found: false,
+                result: serde_json::json!({"error": format!("Symbol '{}' not found", args.symbol_name)}),
+            }),
+        }
+    }
+}

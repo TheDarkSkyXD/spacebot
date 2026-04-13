@@ -82,8 +82,9 @@ pub use browser::{
 };
 pub use cancel::{CancelArgs, CancelError, CancelOutput, CancelTool};
 pub use codegraph::{
-    CodeGraphContextTool, CodeGraphDetectChangesTool, CodeGraphGetFilesForTaskTool,
-    CodeGraphImpactTool, CodeGraphListProjectsTool, CodeGraphQueryTool,
+    CodeGraphContextTool, CodeGraphCypherTool, CodeGraphDetectChangesTool,
+    CodeGraphGetFilesForTaskTool, CodeGraphImpactTool, CodeGraphListProjectsTool,
+    CodeGraphQueryTool, CodeGraphRenameTool,
 };
 pub use channel_recall::{
     ChannelRecallArgs, ChannelRecallError, ChannelRecallOutput, ChannelRecallTool,
@@ -438,6 +439,12 @@ pub async fn add_channel_tools(
         handle
             .add_tool(CodeGraphDetectChangesTool::new(cg_manager.clone()))
             .await?;
+        handle
+            .add_tool(CodeGraphCypherTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphRenameTool::new(cg_manager.clone()))
+            .await?;
     }
     // Add attachment recall tool when save_attachments is enabled
     if state
@@ -667,7 +674,9 @@ pub fn create_worker_tool_server(
             .tool(CodeGraphGetFilesForTaskTool::new(cg.clone()))
             .tool(CodeGraphContextTool::new(cg.clone()))
             .tool(CodeGraphImpactTool::new(cg.clone()))
-            .tool(CodeGraphDetectChangesTool::new(cg.clone()));
+            .tool(CodeGraphDetectChangesTool::new(cg.clone()))
+            .tool(CodeGraphCypherTool::new(cg.clone()))
+            .tool(CodeGraphRenameTool::new(cg.clone()));
     }
 
     for mcp_tool in mcp_tools {
@@ -779,7 +788,9 @@ pub fn create_cortex_chat_tool_server(
             .tool(CodeGraphGetFilesForTaskTool::new(cg.clone()))
             .tool(CodeGraphContextTool::new(cg.clone()))
             .tool(CodeGraphImpactTool::new(cg.clone()))
-            .tool(CodeGraphDetectChangesTool::new(cg.clone()));
+            .tool(CodeGraphDetectChangesTool::new(cg.clone()))
+            .tool(CodeGraphCypherTool::new(cg.clone()))
+            .tool(CodeGraphRenameTool::new(cg.clone()));
     }
 
     server.run()
