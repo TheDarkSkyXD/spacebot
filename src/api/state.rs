@@ -282,6 +282,20 @@ pub enum ApiEvent {
         content: String,
         tool_calls: Option<Vec<crate::agent::cortex_chat::CortexChatToolCall>>,
     },
+    /// Code graph is stale — files changed, incremental update starting.
+    CodeGraphStale {
+        project_id: String,
+        changed_files: Vec<String>,
+    },
+    /// Code graph incremental update completed — graph data changed.
+    CodeGraphChanged {
+        project_id: String,
+        changed_files: Vec<String>,
+    },
+    /// Code graph full indexing completed.
+    CodeGraphIndexed {
+        project_id: String,
+    },
 }
 
 impl ApiState {
@@ -751,6 +765,11 @@ impl ApiState {
     /// Set the global task store.
     pub fn set_task_store(&self, store: Arc<TaskStore>) {
         self.task_store.store(Arc::new(Some(store)));
+    }
+
+    /// Set the code graph manager.
+    pub fn set_codegraph_manager(&self, manager: Arc<CodeGraphManager>) {
+        self.codegraph_manager.store(Arc::new(Some(manager)));
     }
 
     /// Set the project stores for all agents.

@@ -27,7 +27,7 @@ mod server;
 mod settings;
 mod skills;
 pub(crate) mod ssh;
-mod state;
+pub mod state;
 mod system;
 mod tasks;
 mod tools;

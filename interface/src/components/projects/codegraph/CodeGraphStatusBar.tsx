@@ -5,6 +5,7 @@ interface Props {
 	nodeCount: number;
 	edgeCount: number;
 	isLayoutRunning: boolean;
+	isUpdating?: boolean;
 	truncated: boolean;
 }
 
@@ -12,6 +13,7 @@ export function CodeGraphStatusBar({
 	nodeCount,
 	edgeCount,
 	isLayoutRunning,
+	isUpdating,
 	truncated,
 }: Props) {
 	return (
@@ -28,7 +30,13 @@ export function CodeGraphStatusBar({
 				)}
 			</div>
 			<div className="flex items-center gap-2">
-				{isLayoutRunning && (
+				{isUpdating && (
+					<>
+						<span className="h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />
+						<span className="text-blue-400">Updating graph...</span>
+					</>
+				)}
+				{isLayoutRunning && !isUpdating && (
 					<>
 						<span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-500" />
 						<span className="text-emerald-400">Layout optimizing...</span>

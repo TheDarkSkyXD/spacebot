@@ -59,6 +59,35 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 
 	const canvasRef = useRef<GraphCanvasHandle>(null);
 	const queryClient = useQueryClient();
+	const [isUpdating, setIsUpdating] = useState(false);
+
+	// Subscribe to SSE for real-time graph updates. When files change in
+	// the project, the watcher fires GraphStale → incremental pipeline →
+	// GraphChanged. We invalidate queries so the graph refreshes.
+	useEffect(() => {
+		const source = new EventSource(api.getEventsUrl());
+		source.addEventListener("message", (e) => {
+			try {
+				const event = JSON.parse(e.data);
+				if (event.type === "code_graph_stale" && event.project_id === projectId) {
+					setIsUpdating(true);
+				}
+				if (event.type === "code_graph_changed" && event.project_id === projectId) {
+					setIsUpdating(false);
+					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-nodes", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-edges", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["codegraph-project", projectId] });
+				}
+				if (event.type === "code_graph_indexed" && event.project_id === projectId) {
+					setIsUpdating(false);
+					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-nodes", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-edges", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["codegraph-project", projectId] });
+				}
+			} catch { /* ignore parse errors */ }
+		});
+		return () => source.close();
+	}, [projectId, queryClient]);
 
 	// Piggyback on ProjectDetail's existing project query — it owns the
 	// polling schedule during indexing. We just read the cached status to
@@ -262,6 +291,7 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 				nodeCount={nodes.length}
 				edgeCount={edges.length}
 				isLayoutRunning={isLayoutRunning}
+				isUpdating={isUpdating}
 				truncated={truncated}
 			/>
 		</div>

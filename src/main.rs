@@ -1604,6 +1604,54 @@ async fn run(
     );
     api_state.auth_token = config.api.auth_token.clone();
     api_state.set_task_store(global_task_store.clone());
+
+    // Initialize the Code Graph Manager.
+    let codegraph_manager = Arc::new(spacebot::codegraph::CodeGraphManager::new(
+        config.instance_dir.clone(),
+    ));
+    if let Err(err) = codegraph_manager.load_registry().await {
+        tracing::warn!(%err, "failed to load code graph project registry");
+    }
+    api_state.set_codegraph_manager(codegraph_manager.clone());
+
+    // Bridge codegraph events → API SSE stream so the frontend gets
+    // real-time graph updates (stale, changed, indexed).
+    {
+        let mut cg_rx = codegraph_manager.subscribe();
+        let api_tx = api_state.event_tx.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = cg_rx.recv().await {
+                let api_event = match &event {
+                    spacebot::codegraph::events::CodeGraphEvent::GraphStale {
+                        project_id,
+                        stale_files,
+                    } => Some(spacebot::api::state::ApiEvent::CodeGraphStale {
+                        project_id: project_id.clone(),
+                        changed_files: stale_files.clone(),
+                    }),
+                    spacebot::codegraph::events::CodeGraphEvent::GraphChanged {
+                        project_id,
+                        changed_files,
+                        ..
+                    } => Some(spacebot::api::state::ApiEvent::CodeGraphChanged {
+                        project_id: project_id.clone(),
+                        changed_files: changed_files.clone(),
+                    }),
+                    spacebot::codegraph::events::CodeGraphEvent::GraphIndexed {
+                        project_id,
+                        ..
+                    } => Some(spacebot::api::state::ApiEvent::CodeGraphIndexed {
+                        project_id: project_id.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(evt) = api_event {
+                    let _ = api_tx.send(evt);
+                }
+            }
+        });
+    }
+
     let api_state = Arc::new(api_state);
 
     // Keep the secrets API available in setup mode so encrypted stores can be
@@ -1729,6 +1777,9 @@ async fn run(
     api_state.set_instance_dir(config.instance_dir.clone());
     api_state.set_llm_manager(llm_manager.clone()).await;
     api_state.set_embedding_model(embedding_model.clone()).await;
+    // Codegraph indexing is fully deterministic and LadybugDB-only — it
+    // does not consume the LLM or embedding services, so it has no
+    // wiring here. Agents read the graph via the MCP layer.
     api_state.set_prompt_engine(prompt_engine.clone()).await;
     api_state.set_defaults_config(config.defaults.clone()).await;
     api_state.set_agent_links((**agent_links.load()).clone());
@@ -2765,7 +2816,7 @@ async fn initialize_agents(
             ),
             injection_tx: injection_tx.clone(),
             working_memory,
-            codegraph_manager: None, // Initialized after the agent loop if needed.
+            codegraph_manager: api_state.codegraph_manager.load().as_ref().clone(),
         };
 
         let agent = spacebot::Agent {
