@@ -437,3 +437,176 @@ export const filterGraphByDepth = (
 		graph.setNodeAttribute(nodeId, "hidden", !labelOk || !inRange.has(nodeId));
 	});
 };
+
+// ---------------------------------------------------------------------------
+// Layout modes — reposition nodes without rebuilding the graph.
+// ---------------------------------------------------------------------------
+
+export type LayoutMode = "force" | "solar" | "cluster" | "tree";
+
+// Ring assignments for Solar layout. Inner rings = structural, outer = symbols.
+const SOLAR_RING: Record<string, number> = {
+	Project: 0, Package: 0, Module: 0, Namespace: 0,
+	Folder: 1,
+	File: 2,
+};
+// Everything else goes to ring 3 (outermost).
+
+/** Solar layout — 4 concentric rings by structural level. */
+export const applySolarLayout = (
+	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
+): void => {
+	// Bucket nodes into rings.
+	const rings: string[][] = [[], [], [], []];
+	graph.forEachNode((nodeId, attrs) => {
+		if (attrs.hidden) return;
+		const ring = SOLAR_RING[attrs.nodeType] ?? 3;
+		rings[ring].push(nodeId);
+	});
+
+	const baseRadius = Math.sqrt(graph.order) * 8;
+	const ringRadii = [baseRadius * 0.3, baseRadius * 0.6, baseRadius * 1.0, baseRadius * 1.6];
+
+	for (let r = 0; r < rings.length; r++) {
+		const nodes = rings[r];
+		const radius = ringRadii[r];
+		nodes.forEach((nodeId, i) => {
+			const angle = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
+			// Small jitter to avoid perfect overlaps.
+			const jitter = radius * 0.05 * (Math.random() - 0.5);
+			graph.setNodeAttribute(nodeId, "x", (radius + jitter) * Math.cos(angle));
+			graph.setNodeAttribute(nodeId, "y", (radius + jitter) * Math.sin(angle));
+		});
+	}
+};
+
+/** Cluster layout — nodes grouped by community in a grid of clusters. */
+export const applyClusterLayout = (
+	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
+): void => {
+	// Group visible nodes by community.
+	const clusters = new Map<number, string[]>();
+	const unclustered: string[] = [];
+
+	graph.forEachNode((nodeId, attrs) => {
+		if (attrs.hidden) return;
+		if (attrs.community !== undefined && attrs.community !== null) {
+			if (!clusters.has(attrs.community)) clusters.set(attrs.community, []);
+			clusters.get(attrs.community)!.push(nodeId);
+		} else {
+			unclustered.push(nodeId);
+		}
+	});
+
+	const clusterCount = clusters.size + (unclustered.length > 0 ? 1 : 0);
+	const spread = Math.sqrt(graph.order) * 12;
+	const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+
+	// Position each cluster in a spiral.
+	let clusterIdx = 0;
+	const positionCluster = (nodes: string[]) => {
+		const angle = clusterIdx * goldenAngle;
+		const radius = spread * Math.sqrt((clusterIdx + 1) / Math.max(clusterCount, 1));
+		const cx = radius * Math.cos(angle);
+		const cy = radius * Math.sin(angle);
+		const clusterRadius = Math.sqrt(nodes.length) * 4;
+		nodes.forEach((nodeId, i) => {
+			const a = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
+			const r = clusterRadius * Math.sqrt((i + 1) / nodes.length);
+			graph.setNodeAttribute(nodeId, "x", cx + r * Math.cos(a));
+			graph.setNodeAttribute(nodeId, "y", cy + r * Math.sin(a));
+		});
+		clusterIdx++;
+	};
+
+	for (const nodes of clusters.values()) {
+		positionCluster(nodes);
+	}
+	if (unclustered.length > 0) {
+		positionCluster(unclustered);
+	}
+};
+
+/** Tree layout — hierarchical top-down by CONTAINS/DEFINES edges. */
+export const applyTreeLayout = (
+	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
+): void => {
+	// Build parent → children from hierarchy edges.
+	const children = new Map<string, string[]>();
+	const hasParent = new Set<string>();
+
+	graph.forEachEdge((_edge, attrs, source, target) => {
+		const rel = attrs.relationType;
+		if (rel === "CONTAINS" || rel === "DEFINES") {
+			if (!children.has(source)) children.set(source, []);
+			children.get(source)!.push(target);
+			hasParent.add(target);
+		}
+	});
+
+	// Find roots (nodes with no parent in the hierarchy).
+	const roots: string[] = [];
+	graph.forEachNode((nodeId, attrs) => {
+		if (!attrs.hidden && !hasParent.has(nodeId)) {
+			roots.push(nodeId);
+		}
+	});
+
+	const levelSpacing = 80;
+	const leafSpacing = 8;
+	let leafIndex = 0;
+
+	// BFS to assign depth and horizontal position.
+	const visited = new Set<string>();
+	const queue: { id: string; depth: number }[] = roots.map((id) => ({ id, depth: 0 }));
+
+	while (queue.length > 0) {
+		const { id, depth } = queue.shift()!;
+		if (visited.has(id)) continue;
+		visited.add(id);
+
+		const kids = children.get(id) ?? [];
+		const hasKids = kids.length > 0;
+
+		// Leaf nodes get sequential x positions; branch nodes will be
+		// centered over their children after the traversal.
+		if (!hasKids) {
+			graph.setNodeAttribute(id, "x", leafIndex * leafSpacing);
+			graph.setNodeAttribute(id, "y", depth * levelSpacing);
+			leafIndex++;
+		} else {
+			// Placeholder — will center after children are placed.
+			graph.setNodeAttribute(id, "y", depth * levelSpacing);
+			for (const kid of kids) {
+				if (!visited.has(kid)) {
+					queue.push({ id: kid, depth: depth + 1 });
+				}
+			}
+		}
+	}
+
+	// Second pass: center branch nodes over their children (bottom-up).
+	const centerParents = (nodeId: string): number => {
+		const kids = (children.get(nodeId) ?? []).filter((k) => visited.has(k));
+		if (kids.length === 0) {
+			return graph.getNodeAttribute(nodeId, "x") as number;
+		}
+		const childXs = kids.map((k) => centerParents(k));
+		const cx = childXs.reduce((a, b) => a + b, 0) / childXs.length;
+		graph.setNodeAttribute(nodeId, "x", cx);
+		return cx;
+	};
+
+	for (const root of roots) {
+		centerParents(root);
+	}
+
+	// Place any orphan nodes not reached by the tree walk.
+	graph.forEachNode((nodeId) => {
+		if (!visited.has(nodeId)) {
+			graph.setNodeAttribute(nodeId, "x", leafIndex * leafSpacing);
+			graph.setNodeAttribute(nodeId, "y", 0);
+			leafIndex++;
+		}
+	});
+};

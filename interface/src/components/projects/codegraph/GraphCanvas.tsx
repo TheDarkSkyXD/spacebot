@@ -5,7 +5,7 @@
 // Ported from reference/GitNexus/gitnexus-web/src/components/GraphCanvas.tsx
 // with all AI features (query highlights, blast radius, chat FAB) removed.
 
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
 	PlusSignIcon,
@@ -17,7 +17,10 @@ import {
 	Cancel01Icon,
 } from "@hugeicons/core-free-icons";
 import { useSigma } from "./useSigma";
-import { filterGraphByDepth, getNodeColor, type SigmaNodeAttributes, type SigmaEdgeAttributes } from "./graphAdapter";
+import {
+	filterGraphByDepth, getNodeColor, applySolarLayout, applyClusterLayout, applyTreeLayout,
+	type SigmaNodeAttributes, type SigmaEdgeAttributes, type LayoutMode,
+} from "./graphAdapter";
 import type { BulkNode } from "./types";
 import type { EdgeType, NodeLabel } from "./constants";
 import { nodeKey } from "./graphAdapter";
@@ -36,6 +39,7 @@ interface Props {
 	visibleEdgeTypes: EdgeType[];
 	depthFilter: number | null;
 	colorOverrides?: Record<string, string>;
+	layoutMode: LayoutMode;
 	/** Notified whenever the FA2 worker starts or stops running. */
 	onLayoutRunningChange?: (running: boolean) => void;
 }
@@ -50,6 +54,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 		visibleEdgeTypes,
 		depthFilter,
 		colorOverrides,
+		layoutMode,
 		onLayoutRunningChange,
 	},
 	ref,
@@ -100,11 +105,46 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 	});
 
 	// Push the incoming graph into sigma whenever it changes. This also
-	// kicks off a fresh ForceAtlas2 layout run.
+	// kicks off a fresh ForceAtlas2 layout run (only in force mode).
 	useEffect(() => {
 		if (!graph) return;
 		pushGraph(graph);
+		// If initial mode isn't force, apply the correct layout immediately.
+		if (layoutMode !== "force") {
+			stopLayout();
+			const sigmaGraph = sigmaRef.current?.getGraph() as Graph<SigmaNodeAttributes, SigmaEdgeAttributes> | undefined;
+			if (sigmaGraph && sigmaGraph.order > 0) {
+				if (layoutMode === "solar") applySolarLayout(sigmaGraph);
+				else if (layoutMode === "cluster") applyClusterLayout(sigmaGraph);
+				else if (layoutMode === "tree") applyTreeLayout(sigmaGraph);
+				sigmaRef.current?.refresh();
+				sigmaRef.current?.getCamera().animate({ x: 0.5, y: 0.5, ratio: 0.6, angle: 0 }, { duration: 300 });
+			}
+		}
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [graph, pushGraph]);
+
+	// Apply layout when mode changes.
+	const prevLayoutModeRef = useRef(layoutMode);
+	useEffect(() => {
+		if (prevLayoutModeRef.current === layoutMode) return;
+		prevLayoutModeRef.current = layoutMode;
+		const sigma = sigmaRef.current;
+		if (!sigma || !graph) return;
+		const g = sigma.getGraph() as Graph<SigmaNodeAttributes, SigmaEdgeAttributes>;
+		if (g.order === 0) return;
+
+		if (layoutMode === "force") {
+			startLayout();
+		} else {
+			stopLayout();
+			if (layoutMode === "solar") applySolarLayout(g);
+			else if (layoutMode === "cluster") applyClusterLayout(g);
+			else if (layoutMode === "tree") applyTreeLayout(g);
+			sigma.refresh();
+			sigma.getCamera().animate({ x: 0.5, y: 0.5, ratio: 0.6, angle: 0 }, { duration: 400 });
+		}
+	}, [layoutMode, graph, startLayout, stopLayout, sigmaRef]);
 
 	// Relay the layout-running flag to the parent so the status bar can
 	// show it. Done via an effect so we don't spam during renders.

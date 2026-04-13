@@ -6,7 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { clsx } from "clsx";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Search01Icon, RefreshIcon } from "@hugeicons/core-free-icons";
-import { getNodeColor } from "./graphAdapter";
+import { getNodeColor, type LayoutMode } from "./graphAdapter";
 import type { BulkNode } from "./types";
 
 interface Props {
@@ -19,7 +19,16 @@ interface Props {
 	onReindex?: () => void;
 	isReindexing?: boolean;
 	colorOverrides?: Record<string, string>;
+	layoutMode: LayoutMode;
+	onLayoutModeChange: (mode: LayoutMode) => void;
 }
+
+const LAYOUT_MODES: { key: LayoutMode; label: string }[] = [
+	{ key: "force", label: "Force" },
+	{ key: "solar", label: "Solar" },
+	{ key: "cluster", label: "Cluster" },
+	{ key: "tree", label: "Tree" },
+];
 
 const MAX_RESULTS = 12;
 
@@ -33,6 +42,8 @@ export function CodeGraphSearchBar({
 	onReindex,
 	isReindexing,
 	colorOverrides,
+	layoutMode,
+	onLayoutModeChange,
 }: Props) {
 	const [query, setQuery] = useState("");
 	const [open, setOpen] = useState(false);
@@ -180,6 +191,24 @@ export function CodeGraphSearchBar({
 						)}
 					</div>
 				)}
+			</div>
+
+			{/* Layout mode tabs */}
+			<div className="flex shrink-0 items-center gap-1 rounded-lg border border-app-line bg-app p-0.5">
+				{LAYOUT_MODES.map((mode) => (
+					<button
+						key={mode.key}
+						onClick={() => onLayoutModeChange(mode.key)}
+						className={clsx(
+							"rounded-md px-2.5 py-1 text-[11px] font-medium transition-colors",
+							layoutMode === mode.key
+								? "bg-accent/20 text-accent"
+								: "text-ink-faint hover:text-ink-dull",
+						)}
+					>
+						{mode.label}
+					</button>
+				))}
 			</div>
 
 			{/* Stats + Re-index — pushed to far right */}

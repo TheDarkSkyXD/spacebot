@@ -33,6 +33,7 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 	const [visibleEdgeTypes, setVisibleEdgeTypes] = useState<EdgeType[]>(DEFAULT_VISIBLE_EDGES);
 	const [depthFilter, setDepthFilter] = useState<number | null>(null);
 	const [isLayoutRunning, setIsLayoutRunning] = useState(false);
+	const [layoutMode, setLayoutMode] = useState<import("./codegraph/graphAdapter").LayoutMode>("force");
 	const [colorOverrides, setColorOverrides] = useState<Record<string, string>>(() => {
 		try {
 			const saved = localStorage.getItem("spacebot.codegraph.colorOverrides");
@@ -243,6 +244,8 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 				onReindex={() => reindexMutation.mutate()}
 				isReindexing={reindexMutation.isPending}
 				colorOverrides={colorOverrides}
+				layoutMode={layoutMode}
+				onLayoutModeChange={setLayoutMode}
 			/>
 
 			<div className="flex min-h-0 flex-1">
@@ -273,6 +276,7 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 						visibleEdgeTypes={visibleEdgeTypes}
 						depthFilter={depthFilter}
 						colorOverrides={colorOverrides}
+						layoutMode={layoutMode}
 						onLayoutRunningChange={setIsLayoutRunning}
 					/>
 				</div>
