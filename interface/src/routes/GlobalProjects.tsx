@@ -234,8 +234,20 @@ function CreateProjectDialog({
 	const queryClient = useQueryClient();
 	const { isTauri } = useServer();
 	const [name, setName] = useState("");
+	const [nameManuallyEdited, setNameManuallyEdited] = useState(false);
 	const [rootPath, setRootPath] = useState("");
 	const [showBrowser, setShowBrowser] = useState(false);
+
+	// Auto-fill the project name from the folder name when a path is
+	// selected, unless the user has manually typed a custom name.
+	const updateRootPath = (path: string) => {
+		setRootPath(path);
+		if (!nameManuallyEdited) {
+			const segments = path.replace(/[\\/]+$/, "").split(/[\\/]/);
+			const folderName = segments[segments.length - 1] || "";
+			setName(folderName);
+		}
+	};
 
 	const mutation = useMutation({
 		mutationFn: () => api.codegraphCreateProject(name, rootPath),
@@ -246,6 +258,7 @@ function CreateProjectDialog({
 			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
 			onOpenChange(false);
 			setName("");
+			setNameManuallyEdited(false);
 			setRootPath("");
 			setShowBrowser(false);
 		},
@@ -254,7 +267,7 @@ function CreateProjectDialog({
 	const handleBrowse = async () => {
 		if (isTauri) {
 			const selected = await openNativeFolderDialog();
-			if (selected) setRootPath(selected);
+			if (selected) updateRootPath(selected);
 		} else {
 			setShowBrowser((prev) => !prev);
 		}
@@ -275,7 +288,10 @@ function CreateProjectDialog({
 						<Input
 							id="project-name"
 							value={name}
-							onChange={(e) => setName(e.target.value)}
+							onChange={(e) => {
+								setName(e.target.value);
+								setNameManuallyEdited(true);
+							}}
 							placeholder="my-project"
 						/>
 					</div>
@@ -285,7 +301,7 @@ function CreateProjectDialog({
 							<Input
 								id="root-path"
 								value={rootPath}
-								onChange={(e) => setRootPath(e.target.value)}
+								onChange={(e) => updateRootPath(e.target.value)}
 								placeholder="/path/to/project"
 								className="flex-1 font-mono"
 							/>
@@ -302,7 +318,7 @@ function CreateProjectDialog({
 							<div className="mt-2">
 								<DirectoryBrowser
 									onSelect={(path) => {
-										setRootPath(path);
+										updateRootPath(path);
 										setShowBrowser(false);
 									}}
 									onClose={() => setShowBrowser(false)}
