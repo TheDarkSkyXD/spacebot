@@ -17,6 +17,7 @@ use crate::projects::ProjectStore;
 use crate::prompts::PromptEngine;
 use crate::tasks::TaskStore;
 use crate::update::SharedUpdateStatus;
+use crate::codegraph::CodeGraphManager;
 use crate::{ProcessEvent, ProcessId};
 
 use arc_swap::ArcSwap;
@@ -84,6 +85,8 @@ pub struct ApiState {
     pub cron_schedulers: arc_swap::ArcSwap<HashMap<String, Arc<Scheduler>>>,
     /// Instance-level global task store shared across all agents.
     pub task_store: ArcSwap<Option<Arc<TaskStore>>>,
+    /// Instance-level code graph manager shared across all agents.
+    pub codegraph_manager: ArcSwap<Option<Arc<CodeGraphManager>>>,
     /// Per-agent project stores for project/repo/worktree CRUD operations.
     pub project_stores: arc_swap::ArcSwap<HashMap<String, Arc<ProjectStore>>>,
     /// Per-agent RuntimeConfig for reading live hot-reloaded configuration.
@@ -279,6 +282,20 @@ pub enum ApiEvent {
         content: String,
         tool_calls: Option<Vec<crate::agent::cortex_chat::CortexChatToolCall>>,
     },
+    /// Code graph is stale — files changed, incremental update starting.
+    CodeGraphStale {
+        project_id: String,
+        changed_files: Vec<String>,
+    },
+    /// Code graph incremental update completed — graph data changed.
+    CodeGraphChanged {
+        project_id: String,
+        changed_files: Vec<String>,
+    },
+    /// Code graph full indexing completed.
+    CodeGraphIndexed {
+        project_id: String,
+    },
 }
 
 impl ApiState {
@@ -307,6 +324,7 @@ impl ApiState {
             cron_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             cron_schedulers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             task_store: ArcSwap::from_pointee(None),
+            codegraph_manager: ArcSwap::from_pointee(None),
             project_stores: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             runtime_configs: ArcSwap::from_pointee(HashMap::new()),
             mcp_managers: ArcSwap::from_pointee(HashMap::new()),
@@ -747,6 +765,11 @@ impl ApiState {
     /// Set the global task store.
     pub fn set_task_store(&self, store: Arc<TaskStore>) {
         self.task_store.store(Arc::new(Some(store)));
+    }
+
+    /// Set the code graph manager.
+    pub fn set_codegraph_manager(&self, manager: Arc<CodeGraphManager>) {
+        self.codegraph_manager.store(Arc::new(Some(manager)));
     }
 
     /// Set the project stores for all agents.

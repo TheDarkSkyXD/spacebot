@@ -33,6 +33,7 @@ pub mod branch_tool;
 pub mod browser;
 pub mod cancel;
 pub mod channel_recall;
+pub mod codegraph;
 pub mod config_inspect;
 pub mod cron;
 pub mod email_search;
@@ -80,6 +81,12 @@ pub use browser::{
     register_browser_tools,
 };
 pub use cancel::{CancelArgs, CancelError, CancelOutput, CancelTool};
+pub use codegraph::{
+    CodeGraphApiImpactTool, CodeGraphContextTool, CodeGraphCypherTool,
+    CodeGraphDetectChangesTool, CodeGraphGetFilesForTaskTool, CodeGraphImpactTool,
+    CodeGraphListProjectsTool, CodeGraphQueryTool, CodeGraphRenameTool,
+    CodeGraphRouteMapTool, CodeGraphToolMapTool,
+};
 pub use channel_recall::{
     ChannelRecallArgs, ChannelRecallError, ChannelRecallOutput, ChannelRecallTool,
 };
@@ -413,6 +420,42 @@ pub async fn add_channel_tools(
             state.deps.agent_id.to_string(),
         ))
         .await?;
+    // Add codegraph tools when the manager is available
+    if let Some(ref cg_manager) = state.deps.codegraph_manager {
+        handle
+            .add_tool(CodeGraphQueryTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphListProjectsTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphGetFilesForTaskTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphContextTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphImpactTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphDetectChangesTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphCypherTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphRenameTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphRouteMapTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphToolMapTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphApiImpactTool::new(cg_manager.clone()))
+            .await?;
+    }
     // Add attachment recall tool when save_attachments is enabled
     if state
         .deps
@@ -601,6 +644,7 @@ pub fn create_worker_tool_server(
     sandbox: Arc<Sandbox>,
     mcp_tools: Vec<McpToolAdapter>,
     runtime_config: Arc<RuntimeConfig>,
+    codegraph_manager: Option<Arc<crate::codegraph::CodeGraphManager>>,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(ShellTool::new(workspace.clone(), sandbox.clone()))
@@ -632,6 +676,22 @@ pub fn create_worker_tool_server(
         server = server.tool(WebSearchTool::new(key));
     }
 
+    // Code graph tools — available when a codegraph manager exists.
+    if let Some(ref cg) = codegraph_manager {
+        server = server
+            .tool(CodeGraphQueryTool::new(cg.clone()))
+            .tool(CodeGraphListProjectsTool::new(cg.clone()))
+            .tool(CodeGraphGetFilesForTaskTool::new(cg.clone()))
+            .tool(CodeGraphContextTool::new(cg.clone()))
+            .tool(CodeGraphImpactTool::new(cg.clone()))
+            .tool(CodeGraphDetectChangesTool::new(cg.clone()))
+            .tool(CodeGraphCypherTool::new(cg.clone()))
+            .tool(CodeGraphRenameTool::new(cg.clone()))
+            .tool(CodeGraphRouteMapTool::new(cg.clone()))
+            .tool(CodeGraphToolMapTool::new(cg.clone()))
+            .tool(CodeGraphApiImpactTool::new(cg.clone()));
+    }
+
     for mcp_tool in mcp_tools {
         server = server.tool(mcp_tool);
     }
@@ -641,8 +701,7 @@ pub fn create_worker_tool_server(
 
 /// Create a ToolServer for the cortex process.
 ///
-/// Retained for potential future use. The compactor no longer uses this
-/// (Phase 5b removed compactor memory_save).
+/// Retained for potential future use. The compactor no longer uses this.
 #[allow(dead_code)]
 pub fn create_cortex_tool_server(
     agent_id: AgentId,
@@ -686,6 +745,7 @@ pub fn create_cortex_chat_tool_server(
     cortex_ctx: Option<crate::tools::spawn_worker::CortexChatContext>,
 ) -> ToolServerHandle {
     let logs_dir = workspace.join(".spacebot").join("logs");
+    let cg_manager = deps.codegraph_manager.clone();
 
     let spawn_tool = {
         let tool = DetachedSpawnWorkerTool::new(deps, screenshot_dir.clone(), logs_dir);
@@ -731,6 +791,22 @@ pub fn create_cortex_chat_tool_server(
 
     if let Some(key) = brave_search_key {
         server = server.tool(WebSearchTool::new(key));
+    }
+
+    // Code graph tools for the cortex chat.
+    if let Some(ref cg) = cg_manager {
+        server = server
+            .tool(CodeGraphQueryTool::new(cg.clone()))
+            .tool(CodeGraphListProjectsTool::new(cg.clone()))
+            .tool(CodeGraphGetFilesForTaskTool::new(cg.clone()))
+            .tool(CodeGraphContextTool::new(cg.clone()))
+            .tool(CodeGraphImpactTool::new(cg.clone()))
+            .tool(CodeGraphDetectChangesTool::new(cg.clone()))
+            .tool(CodeGraphCypherTool::new(cg.clone()))
+            .tool(CodeGraphRenameTool::new(cg.clone()))
+            .tool(CodeGraphRouteMapTool::new(cg.clone()))
+            .tool(CodeGraphToolMapTool::new(cg.clone()))
+            .tool(CodeGraphApiImpactTool::new(cg.clone()));
     }
 
     server.run()
