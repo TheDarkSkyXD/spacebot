@@ -732,11 +732,20 @@ pub struct CompactionConfig {
 /// Spawns a silent branch every N messages to recall existing memories and save
 /// new ones from the recent conversation. Runs without blocking the channel and
 /// the result is never injected into channel history.
+///
+/// Legacy note: active working-memory persistence triggers are now configured in
+/// `WorkingMemoryConfig` (`persistence_message_threshold`,
+/// `persistence_time_threshold_secs`, `persistence_event_density_threshold`).
+/// Keep these values in sync only if you intentionally preserve this legacy
+/// branch cadence.
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryPersistenceConfig {
     /// Whether auto memory persistence branches are enabled.
     pub enabled: bool,
-    /// Number of user messages between automatic memory persistence branches.
+    /// Legacy branch cadence in user messages.
+    ///
+    /// Runtime checks now use the working-memory thresholds in
+    /// `WorkingMemoryConfig`.
     pub message_interval: usize,
 }
 

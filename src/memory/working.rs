@@ -39,6 +39,10 @@ pub enum WorkingMemoryEventType {
     MemorySaved,
     /// A decision was made (extracted from conversation).
     Decision,
+    /// The user corrected prior instructions or assumptions.
+    UserCorrection,
+    /// A prior decision was revised.
+    DecisionRevised,
     /// An error or failure occurred.
     Error,
     /// A task was created or updated.
@@ -62,6 +66,8 @@ impl WorkingMemoryEventType {
             Self::CronExecuted => "cron_executed",
             Self::MemorySaved => "memory_saved",
             Self::Decision => "decision",
+            Self::UserCorrection => "user_correction",
+            Self::DecisionRevised => "decision_revised",
             Self::Error => "error",
             Self::TaskUpdate => "task_update",
             Self::AgentMessage => "agent_message",
@@ -79,6 +85,8 @@ impl WorkingMemoryEventType {
             "cron_executed" => Some(Self::CronExecuted),
             "memory_saved" => Some(Self::MemorySaved),
             "decision" => Some(Self::Decision),
+            "user_correction" => Some(Self::UserCorrection),
+            "decision_revised" => Some(Self::DecisionRevised),
             "error" => Some(Self::Error),
             "task_update" => Some(Self::TaskUpdate),
             "agent_message" => Some(Self::AgentMessage),
@@ -818,6 +826,8 @@ fn format_event_line(event: &WorkingMemoryEvent, current_channel_id: &str) -> St
         WorkingMemoryEventType::CronExecuted => "Cron executed",
         WorkingMemoryEventType::MemorySaved => "Memory saved",
         WorkingMemoryEventType::Decision => "Decision",
+        WorkingMemoryEventType::UserCorrection => "User correction",
+        WorkingMemoryEventType::DecisionRevised => "Decision revised",
         WorkingMemoryEventType::Error => "Error",
         WorkingMemoryEventType::TaskUpdate => "Task update",
         WorkingMemoryEventType::AgentMessage => "Agent message",
@@ -1156,6 +1166,8 @@ mod tests {
             WorkingMemoryEventType::CronExecuted,
             WorkingMemoryEventType::MemorySaved,
             WorkingMemoryEventType::Decision,
+            WorkingMemoryEventType::UserCorrection,
+            WorkingMemoryEventType::DecisionRevised,
             WorkingMemoryEventType::Error,
             WorkingMemoryEventType::TaskUpdate,
             WorkingMemoryEventType::AgentMessage,
@@ -1178,7 +1190,7 @@ mod tests {
         }
 
         let events = store.get_events_for_day(&today).await.unwrap();
-        assert_eq!(events.len(), 12);
+        assert_eq!(events.len(), 14);
 
         // Verify all types survived the roundtrip.
         let types: Vec<WorkingMemoryEventType> = events.iter().map(|e| e.event_type).collect();
