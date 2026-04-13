@@ -627,6 +627,7 @@ pub fn create_worker_tool_server(
     sandbox: Arc<Sandbox>,
     mcp_tools: Vec<McpToolAdapter>,
     runtime_config: Arc<RuntimeConfig>,
+    codegraph_manager: Option<Arc<crate::codegraph::CodeGraphManager>>,
 ) -> ToolServerHandle {
     let mut server = ToolServer::new()
         .tool(ShellTool::new(workspace.clone(), sandbox.clone()))
@@ -656,6 +657,17 @@ pub fn create_worker_tool_server(
 
     if let Some(key) = brave_search_key {
         server = server.tool(WebSearchTool::new(key));
+    }
+
+    // Code graph tools — available when a codegraph manager exists.
+    if let Some(ref cg) = codegraph_manager {
+        server = server
+            .tool(CodeGraphQueryTool::new(cg.clone()))
+            .tool(CodeGraphListProjectsTool::new(cg.clone()))
+            .tool(CodeGraphGetFilesForTaskTool::new(cg.clone()))
+            .tool(CodeGraphContextTool::new(cg.clone()))
+            .tool(CodeGraphImpactTool::new(cg.clone()))
+            .tool(CodeGraphDetectChangesTool::new(cg.clone()));
     }
 
     for mcp_tool in mcp_tools {
@@ -711,6 +723,7 @@ pub fn create_cortex_chat_tool_server(
     cortex_ctx: Option<crate::tools::spawn_worker::CortexChatContext>,
 ) -> ToolServerHandle {
     let logs_dir = workspace.join(".spacebot").join("logs");
+    let cg_manager = deps.codegraph_manager.clone();
 
     let spawn_tool = {
         let tool = DetachedSpawnWorkerTool::new(deps, screenshot_dir.clone(), logs_dir);
@@ -756,6 +769,17 @@ pub fn create_cortex_chat_tool_server(
 
     if let Some(key) = brave_search_key {
         server = server.tool(WebSearchTool::new(key));
+    }
+
+    // Code graph tools for the cortex chat.
+    if let Some(ref cg) = cg_manager {
+        server = server
+            .tool(CodeGraphQueryTool::new(cg.clone()))
+            .tool(CodeGraphListProjectsTool::new(cg.clone()))
+            .tool(CodeGraphGetFilesForTaskTool::new(cg.clone()))
+            .tool(CodeGraphContextTool::new(cg.clone()))
+            .tool(CodeGraphImpactTool::new(cg.clone()))
+            .tool(CodeGraphDetectChangesTool::new(cg.clone()));
     }
 
     server.run()
