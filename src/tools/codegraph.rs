@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::codegraph::CodeGraphManager;
+use crate::codegraph::tools as cg_tools;
 
 // ---------------------------------------------------------------------------
 // codegraph_query — search the code graph
@@ -258,9 +259,260 @@ impl Tool for CodeGraphGetFilesForTaskTool {
 
         Ok(CodeGraphGetFilesOutput {
             primary_files,
-            secondary_files: Vec::new(), // Will be populated via graph traversal later.
+            secondary_files: Vec::new(),
             community,
             confidence,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codegraph_context — 360° symbol view
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct CodeGraphContextTool {
+    manager: Arc<CodeGraphManager>,
+}
+
+impl CodeGraphContextTool {
+    pub fn new(manager: Arc<CodeGraphManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("codegraph_context failed: {0}")]
+pub struct CodeGraphContextError(String);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeGraphContextArgs {
+    /// Symbol name to look up (e.g. "start_indexing", "CodeGraphManager").
+    pub name: String,
+    /// Project ID to search within.
+    pub project_id: String,
+    /// Optional file path to disambiguate symbols with the same name.
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CodeGraphContextOutput {
+    pub found: bool,
+    pub context: Value,
+}
+
+impl Tool for CodeGraphContextTool {
+    const NAME: &'static str = "codegraph_context";
+    type Error = CodeGraphContextError;
+    type Args = CodeGraphContextArgs;
+    type Output = CodeGraphContextOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Get a 360-degree view of a code symbol — all callers, callees, inheritance, which processes it participates in, and its file location. Use this to understand how a function/class connects to the rest of the codebase.".to_string(),
+            parameters: schemars::schema_for!(CodeGraphContextArgs).to_value(),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let db = self
+            .manager
+            .get_db(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphContextError(format!("project '{}' not found", args.project_id)))?;
+
+        let result = cg_tools::symbol_context(
+            &db,
+            &args.project_id,
+            &args.name,
+            args.file_path.as_deref(),
+        )
+        .await
+        .map_err(|e| CodeGraphContextError(e.to_string()))?;
+
+        match result {
+            Some(ctx) => Ok(CodeGraphContextOutput {
+                found: true,
+                context: serde_json::to_value(ctx).unwrap_or_default(),
+            }),
+            None => Ok(CodeGraphContextOutput {
+                found: false,
+                context: serde_json::json!({"error": format!("Symbol '{}' not found", args.name)}),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codegraph_impact — blast radius analysis
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct CodeGraphImpactTool {
+    manager: Arc<CodeGraphManager>,
+}
+
+impl CodeGraphImpactTool {
+    pub fn new(manager: Arc<CodeGraphManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("codegraph_impact failed: {0}")]
+pub struct CodeGraphImpactError(String);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeGraphImpactArgs {
+    /// Name of the function, class, or method to analyze.
+    pub target: String,
+    /// Project ID to search within.
+    pub project_id: String,
+    /// Direction: "upstream" (what depends on this) or "downstream" (what this depends on).
+    #[serde(default = "default_upstream")]
+    pub direction: String,
+    /// Maximum traversal depth (default: 3).
+    #[serde(default = "default_depth")]
+    pub max_depth: u32,
+}
+
+fn default_upstream() -> String {
+    "upstream".to_string()
+}
+
+fn default_depth() -> u32 {
+    3
+}
+
+#[derive(Debug, Serialize)]
+pub struct CodeGraphImpactOutput {
+    pub found: bool,
+    pub impact: Value,
+}
+
+impl Tool for CodeGraphImpactTool {
+    const NAME: &'static str = "codegraph_impact";
+    type Error = CodeGraphImpactError;
+    type Args = CodeGraphImpactArgs;
+    type Output = CodeGraphImpactOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Analyze the blast radius of changing a code symbol. Shows what would break at each depth level (d=1: direct callers WILL BREAK, d=2: indirect deps LIKELY AFFECTED, d=3: transitive MAY NEED TESTING), affected execution flows, and risk level (LOW/MEDIUM/HIGH/CRITICAL). Run this BEFORE modifying any function or class.".to_string(),
+            parameters: schemars::schema_for!(CodeGraphImpactArgs).to_value(),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let db = self
+            .manager
+            .get_db(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphImpactError(format!("project '{}' not found", args.project_id)))?;
+
+        let result = cg_tools::impact_analysis(
+            &db,
+            &args.project_id,
+            &args.target,
+            &args.direction,
+            args.max_depth,
+        )
+        .await
+        .map_err(|e| CodeGraphImpactError(e.to_string()))?;
+
+        match result {
+            Some(impact) => Ok(CodeGraphImpactOutput {
+                found: true,
+                impact: serde_json::to_value(impact).unwrap_or_default(),
+            }),
+            None => Ok(CodeGraphImpactOutput {
+                found: false,
+                impact: serde_json::json!({"error": format!("Symbol '{}' not found", args.target)}),
+            }),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codegraph_detect_changes — map git diff to affected graph
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct CodeGraphDetectChangesTool {
+    manager: Arc<CodeGraphManager>,
+}
+
+impl CodeGraphDetectChangesTool {
+    pub fn new(manager: Arc<CodeGraphManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("codegraph_detect_changes failed: {0}")]
+pub struct CodeGraphDetectChangesError(String);
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CodeGraphDetectChangesArgs {
+    /// Project ID to analyze.
+    pub project_id: String,
+    /// What to analyze: "unstaged" (default), "staged", "all", or "compare".
+    #[serde(default = "default_scope")]
+    pub scope: String,
+    /// Branch/commit for "compare" scope (e.g. "main").
+    pub base_ref: Option<String>,
+}
+
+fn default_scope() -> String {
+    "unstaged".to_string()
+}
+
+#[derive(Debug, Serialize)]
+pub struct CodeGraphDetectChangesOutput {
+    pub result: Value,
+}
+
+impl Tool for CodeGraphDetectChangesTool {
+    const NAME: &'static str = "codegraph_detect_changes";
+    type Error = CodeGraphDetectChangesError;
+    type Args = CodeGraphDetectChangesArgs;
+    type Output = CodeGraphDetectChangesOutput;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: "Analyze uncommitted git changes and find affected code graph symbols and execution flows. Maps git diff to indexed symbols, then traces which processes are impacted. Use this to understand the scope of your changes before committing.".to_string(),
+            parameters: schemars::schema_for!(CodeGraphDetectChangesArgs).to_value(),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let project = self
+            .manager
+            .get_project(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphDetectChangesError(format!("project '{}' not found", args.project_id)))?;
+
+        let db = self
+            .manager
+            .get_db(&args.project_id)
+            .await
+            .ok_or_else(|| CodeGraphDetectChangesError("database not available".to_string()))?;
+
+        let result = cg_tools::detect_changes(
+            &db,
+            &args.project_id,
+            &project.root_path,
+            &args.scope,
+            args.base_ref.as_deref(),
+        )
+        .await
+        .map_err(|e| CodeGraphDetectChangesError(e.to_string()))?;
+
+        Ok(CodeGraphDetectChangesOutput {
+            result: serde_json::to_value(result).unwrap_or_default(),
         })
     }
 }

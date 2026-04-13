@@ -16,6 +16,7 @@ pub mod manager;
 pub mod pipeline;
 pub mod schema;
 pub mod search;
+pub mod tools;
 pub mod types;
 pub mod watcher;
 

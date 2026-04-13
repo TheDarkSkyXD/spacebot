@@ -82,7 +82,8 @@ pub use browser::{
 };
 pub use cancel::{CancelArgs, CancelError, CancelOutput, CancelTool};
 pub use codegraph::{
-    CodeGraphGetFilesForTaskTool, CodeGraphListProjectsTool, CodeGraphQueryTool,
+    CodeGraphContextTool, CodeGraphDetectChangesTool, CodeGraphGetFilesForTaskTool,
+    CodeGraphImpactTool, CodeGraphListProjectsTool, CodeGraphQueryTool,
 };
 pub use channel_recall::{
     ChannelRecallArgs, ChannelRecallError, ChannelRecallOutput, ChannelRecallTool,
@@ -428,6 +429,15 @@ pub async fn add_channel_tools(
         handle
             .add_tool(CodeGraphGetFilesForTaskTool::new(cg_manager.clone()))
             .await?;
+        handle
+            .add_tool(CodeGraphContextTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphImpactTool::new(cg_manager.clone()))
+            .await?;
+        handle
+            .add_tool(CodeGraphDetectChangesTool::new(cg_manager.clone()))
+            .await?;
     }
     // Add attachment recall tool when save_attachments is enabled
     if state
@@ -657,8 +667,7 @@ pub fn create_worker_tool_server(
 
 /// Create a ToolServer for the cortex process.
 ///
-/// Retained for potential future use. The compactor no longer uses this
-/// (Phase 5b removed compactor memory_save).
+/// Retained for potential future use. The compactor no longer uses this.
 #[allow(dead_code)]
 pub fn create_cortex_tool_server(
     agent_id: AgentId,
