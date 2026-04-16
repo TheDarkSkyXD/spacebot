@@ -428,32 +428,36 @@ impl TaskStore {
             .await
             .context("failed to open worker task update transaction")?;
 
-        let row = sqlx::query(&format!(
-            "{SELECT_COLUMNS} FROM tasks WHERE worker_id = ? ORDER BY updated_at DESC LIMIT 1"
+        let exact_row = sqlx::query(&format!(
+            "{SELECT_COLUMNS} FROM tasks WHERE worker_id = ? AND task_number = ?"
         ))
         .bind(worker_id)
+        .bind(task_number)
         .fetch_optional(&mut *tx)
         .await
-        .context("failed to fetch task by worker id for update")?;
+        .context("failed to fetch worker task by id and number for update")?;
 
-        let Some(row) = row else {
+        let Some(row) = exact_row else {
+            let assigned_task_number = sqlx::query_scalar::<_, i64>(
+                "SELECT task_number FROM tasks WHERE worker_id = ? ORDER BY task_number DESC LIMIT 1",
+            )
+            .bind(worker_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("failed to fetch any task by worker id for update")?;
+
             tx.commit()
                 .await
-                .context("failed to commit empty worker task update transaction")?;
+                .context("failed to commit unmatched worker task update transaction")?;
+            if let Some(assigned_task_number) = assigned_task_number {
+                return Ok(WorkerTaskUpdateResult::WrongTask {
+                    assigned_task_number,
+                });
+            }
             return Ok(WorkerTaskUpdateResult::NotAssigned);
         };
 
         let current = task_from_row(row)?;
-        if current.task_number != task_number {
-            let assigned_task_number = current.task_number;
-            tx.commit()
-                .await
-                .context("failed to commit rejected worker task update transaction")?;
-            return Ok(WorkerTaskUpdateResult::WrongTask {
-                assigned_task_number,
-            });
-        }
-
         let previous_status = current.status;
         let task = Self::update_current_in_tx(&mut tx, task_number, current, input).await?;
 
@@ -926,6 +930,59 @@ mod tests {
 
         assert_eq!(result.previous_status, TaskStatus::InProgress);
         assert_eq!(result.task.status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn update_worker_task_prefers_exact_match_with_duplicate_worker_bindings() {
+        let store = setup_store().await;
+        let first = store
+            .create(self_assigned_input("first task", TaskStatus::InProgress))
+            .await
+            .expect("first task should be created");
+        let second = store
+            .create(self_assigned_input("second task", TaskStatus::InProgress))
+            .await
+            .expect("second task should be created");
+
+        let shared_worker_id = "worker-shared";
+        store
+            .update(
+                first.task_number,
+                UpdateTaskInput {
+                    worker_id: Some(shared_worker_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first worker binding should update");
+        store
+            .update(
+                second.task_number,
+                UpdateTaskInput {
+                    worker_id: Some(shared_worker_id.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("second worker binding should update");
+
+        let result = store
+            .update_worker_task(
+                shared_worker_id,
+                first.task_number,
+                UpdateTaskInput {
+                    metadata: Some(serde_json::json!({"target": "first"})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("worker-scoped update should succeed");
+
+        let WorkerTaskUpdateResult::Updated(result) = result else {
+            panic!("expected exact task update despite duplicate worker bindings");
+        };
+        assert_eq!(result.task.task_number, first.task_number);
+        assert_eq!(result.task.metadata["target"], "first");
     }
 
     #[tokio::test]

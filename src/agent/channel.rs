@@ -98,6 +98,7 @@ const CHANGE_COMPARISON_VERBS: &[&str] = &[
     "proceed with ",
 ];
 const BRANCH_CANCELLED_PREFIX: &str = "Branch cancelled:";
+const BRANCH_CANCELLED_SENTENCE: &str = "Branch cancelled.";
 
 async fn recv_channel_event(
     event_rx: &mut broadcast::Receiver<ProcessEvent>,
@@ -196,7 +197,7 @@ fn truncate_working_memory_summary(summary: &str) -> String {
 fn branch_working_memory_event_summary(
     conclusion: &str,
 ) -> (crate::memory::WorkingMemoryEventType, String) {
-    if let Some(reason) = conclusion.strip_prefix(BRANCH_CANCELLED_PREFIX) {
+    if let Some(reason) = parse_branch_cancellation_reason(conclusion) {
         let reason = truncate_working_memory_summary(reason.trim());
         let summary = if reason.is_empty() {
             "Branch cancelled".to_string()
@@ -215,6 +216,17 @@ fn branch_working_memory_event_summary(
         event_type,
         format_conversational_event_summary(event_type, "Branch", &event_summary),
     )
+}
+
+fn parse_branch_cancellation_reason(conclusion: &str) -> Option<&str> {
+    let trimmed = conclusion.trim();
+    if let Some(rest) = trimmed.strip_prefix(BRANCH_CANCELLED_PREFIX) {
+        return Some(rest);
+    }
+    if let Some(rest) = trimmed.strip_prefix(BRANCH_CANCELLED_SENTENCE) {
+        return Some(rest);
+    }
+    None
 }
 
 fn sentence_contains_decision_marker(sentence: &str) -> bool {
@@ -530,9 +542,9 @@ impl ChannelState {
 
         let reason = crate::summarize_first_non_empty_line(reason, crate::EVENT_SUMMARY_MAX_CHARS);
         let conclusion = if reason.is_empty() {
-            "Branch cancelled.".to_string()
+            BRANCH_CANCELLED_SENTENCE.to_string()
         } else {
-            format!("Branch cancelled: {reason}")
+            format!("{BRANCH_CANCELLED_PREFIX} {reason}")
         };
         self.process_run_logger
             .log_branch_completed(branch_id, &conclusion);
@@ -3299,7 +3311,7 @@ impl Channel {
                     // Regular branch: accumulate result for the next retrigger.
                     // The result text will be embedded directly in the retrigger
                     // message so the LLM knows exactly which process produced it.
-                    let branch_success = !conclusion.starts_with(BRANCH_CANCELLED_PREFIX);
+                    let branch_success = parse_branch_cancellation_reason(conclusion).is_none();
                     self.pending_results.push(PendingResult {
                         process_type: "branch",
                         process_id: branch_id.to_string(),
@@ -4324,6 +4336,14 @@ mod tests {
 
         assert_eq!(event_type, WorkingMemoryEventType::Error);
         assert_eq!(summary, "Branch cancelled: superseded by user request");
+    }
+
+    #[test]
+    fn branch_working_memory_event_records_sentence_cancellation_as_error() {
+        let (event_type, summary) = branch_working_memory_event_summary("Branch cancelled.");
+
+        assert_eq!(event_type, WorkingMemoryEventType::Error);
+        assert_eq!(summary, "Branch cancelled");
     }
 
     #[test]
