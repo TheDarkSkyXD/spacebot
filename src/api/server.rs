@@ -2,9 +2,9 @@
 
 use super::state::ApiState;
 use super::{
-    agents, bindings, channels, config, cortex, cron, factory, fs, ingest, links, mcp, memories,
-    messaging, models, opencode_proxy, projects, providers, secrets, settings, skills, ssh, system,
-    tasks, tools, webchat, workers,
+    agents, bindings, channels, codegraph, config, cortex, cron, factory, fs, ingest, links, mcp,
+    memories, messaging, models, opencode_proxy, projects, providers, secrets, settings, skills,
+    ssh, system, tasks, tools, webchat, workers,
 };
 
 use axum::Json;
@@ -16,6 +16,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
 use rust_embed::Embed;
 use serde_json::json;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -226,6 +227,29 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(links::update_group, links::delete_group))
         .routes(routes!(links::list_humans, links::create_human))
         .routes(routes!(links::update_human, links::delete_human))
+        // Code Graph routes
+        .routes(routes!(
+            codegraph::list_projects,
+            codegraph::create_project
+        ))
+        .routes(routes!(
+            codegraph::get_project,
+            codegraph::delete_project
+        ))
+        .routes(routes!(codegraph::reindex_project))
+        .routes(routes!(codegraph::get_communities))
+        .routes(routes!(codegraph::get_processes))
+        .routes(routes!(codegraph::search_graph))
+        .routes(routes!(codegraph::get_index_log))
+        .routes(routes!(codegraph::get_remove_info))
+        .routes(routes!(codegraph::list_nodes))
+        .routes(routes!(codegraph::get_node))
+        .routes(routes!(codegraph::get_node_edges))
+        .routes(routes!(codegraph::get_graph_stats))
+        .routes(routes!(codegraph::get_bulk_nodes))
+        .routes(routes!(codegraph::get_bulk_edges))
+        // Filesystem routes (OpenAPI-documented)
+        .routes(routes!(fs::read_file))
         // Factory routes
         .routes(routes!(factory::list_presets))
         .routes(routes!(factory::get_preset))
@@ -295,12 +319,18 @@ pub async fn start_http_server(
     #[cfg(feature = "metrics")]
     let protected_routes = protected_routes.layer(middleware::from_fn(metrics_middleware));
 
+    // Gzip-compress large JSON responses. The code graph bulk endpoints
+    // ship multi-MB payloads that shrink 5–10x under gzip. Small responses
+    // skip compression automatically via the built-in size predicate.
+    let compression = CompressionLayer::new().gzip(true);
+
     // Build the main application router
     let app = Router::new()
         // Mount all protected routes
         .merge(protected_routes)
         // Static file handler for frontend (unprotected)
         .fallback(static_handler)
+        .layer(compression)
         .layer(cors)
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MiB
         .with_state(state);

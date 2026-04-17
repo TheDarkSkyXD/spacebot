@@ -7,6 +7,7 @@
 pub mod agents;
 mod bindings;
 mod channels;
+mod codegraph;
 mod config;
 mod cortex;
 mod cron;
@@ -26,7 +27,7 @@ mod server;
 mod settings;
 mod skills;
 pub(crate) mod ssh;
-mod state;
+pub mod state;
 mod system;
 mod tasks;
 mod tools;

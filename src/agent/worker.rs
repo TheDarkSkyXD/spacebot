@@ -312,6 +312,7 @@ impl Worker {
             self.deps.sandbox.clone(),
             mcp_tools,
             self.deps.runtime_config.clone(),
+            self.deps.codegraph_manager.clone(),
         );
 
         let routing = self.deps.runtime_config.routing.load();
