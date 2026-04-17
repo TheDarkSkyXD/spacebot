@@ -7,9 +7,72 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use super::schema;
+
+/// Truncate a `&str` to at most `max` bytes without splitting a multi-byte
+/// UTF-8 character. Used for log-line previews of Cypher statements that
+/// may contain emoji or other non-ASCII text — a naive `&s[..max]` panics
+/// when `max` lands inside a code point.
+fn truncate_for_log(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Remove a LadybugDB database at `path`, handling both the single-file
+/// format (file + optional `.wal` sibling) and the directory-based format.
+/// Retries up to 5 times with escalating delays because Windows holds file
+/// handles briefly after native Kuzu code releases them.
+async fn retry_remove_db(path: &Path) -> bool {
+    let wal = path.with_extension("wal");
+    const DELAYS_MS: &[u64] = &[100, 200, 400, 800];
+    for attempt in 0..5 {
+        if !path.exists() {
+            tokio::fs::remove_file(&wal).await.ok();
+            return true;
+        }
+        let is_file = tokio::fs::metadata(path)
+            .await
+            .map_or(false, |m| m.is_file());
+
+        let result = if is_file {
+            let r = tokio::fs::remove_file(path).await;
+            if r.is_ok() {
+                tokio::fs::remove_file(&wal).await.ok();
+            }
+            r
+        } else {
+            let r = tokio::fs::remove_dir_all(path).await;
+            if r.is_ok() {
+                tokio::fs::remove_file(&wal).await.ok();
+            }
+            r
+        };
+
+        match result {
+            Ok(()) => return true,
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    attempt,
+                    err = %e,
+                    "database removal failed, retrying"
+                );
+                if let Some(&delay) = DELAYS_MS.get(attempt) {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+    !path.exists()
+}
 
 /// The LadybugDB database handle, wrapped in an Arc for shared ownership.
 /// `lbug::Database` is `Send + Sync`, and `Connection::new` is cheap,
@@ -29,27 +92,47 @@ pub struct CodeGraphDb {
 impl CodeGraphDb {
     /// Open or create a LadybugDB instance for a project.
     ///
-    /// If the directory exists but is empty or corrupt (e.g. after a cascade
-    /// delete), it is removed and recreated so LadybugDB can initialize fresh.
+    /// Checks the schema version on an existing DB. If stale, the entire
+    /// database directory is deleted and recreated from scratch. This
+    /// avoids Cypher DROP operations that can crash LadybugDB's native
+    /// code when FTS/vector extensions hold references to tables.
     pub async fn open(project_id: &str, base_path: &Path) -> Result<Self> {
         let db_path = base_path
             .join("codegraph")
             .join(project_id)
             .join("lbug");
 
-        // If the directory exists but is empty or missing catalog files,
-        // remove it so LadybugDB can initialize a fresh database.
+        // Track whether we cleaned up stale data so we can skip the schema
+        // version check on a freshly created database (no tables to nuke).
+        let mut freshly_cleaned = false;
+
+        // If an empty directory sits at db_path, remove it so LadybugDB
+        // can initialize a fresh database. Files (single-file DB format)
+        // are left for Database::new to open directly.
         if db_path.exists() {
-            let is_empty_or_corrupt = match tokio::fs::read_dir(&db_path).await {
-                Ok(mut entries) => entries.next_entry().await.ok().flatten().is_none(),
-                Err(_) => true,
-            };
-            if is_empty_or_corrupt {
-                tracing::info!(
-                    path = %db_path.display(),
-                    "removing empty/corrupt LadybugDB directory before re-creation"
-                );
-                tokio::fs::remove_dir_all(&db_path).await.ok();
+            let is_dir = tokio::fs::metadata(&db_path)
+                .await
+                .map_or(false, |m| m.is_dir());
+
+            if is_dir {
+                let is_empty_or_corrupt = match tokio::fs::read_dir(&db_path).await {
+                    Ok(mut entries) => entries.next_entry().await.ok().flatten().is_none(),
+                    Err(_) => true,
+                };
+                if is_empty_or_corrupt {
+                    tracing::info!(
+                        path = %db_path.display(),
+                        "removing empty/corrupt LadybugDB directory before re-creation"
+                    );
+                    if !retry_remove_db(&db_path).await {
+                        bail!(
+                            "cannot remove corrupt LadybugDB directory at {} — \
+                             another process may hold file locks",
+                            db_path.display()
+                        );
+                    }
+                    freshly_cleaned = true;
+                }
             }
         }
 
@@ -69,62 +152,104 @@ impl CodeGraphDb {
             lbug::Database::new(&path_clone, lbug::SystemConfig::default())
         })
         .await
-        .context("LadybugDB open task panicked")?
-        .with_context(|| format!("opening LadybugDB at {}", db_path.display()))?;
+        .context("LadybugDB open task panicked")?;
+
+        // If the DB is corrupted (e.g. leftover WAL files from a previous
+        // incomplete nuke on Windows), delete the directory and retry once.
+        let database = match database {
+            Ok(db) => db,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Corrupted") || msg.contains("wal") || msg.contains("WAL") {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        err = %msg,
+                        "corrupted database detected — nuking and retrying"
+                    );
+                    if !retry_remove_db(&db_path).await {
+                        bail!(
+                            "cannot remove corrupted LadybugDB at {} after retries",
+                            db_path.display()
+                        );
+                    }
+                    freshly_cleaned = true;
+                    if let Some(parent) = db_path.parent() {
+                        tokio::fs::create_dir_all(parent).await.ok();
+                    }
+                    let path_clone = db_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        lbug::Database::new(&path_clone, lbug::SystemConfig::default())
+                    })
+                    .await
+                    .context("LadybugDB retry open task panicked")?
+                    .with_context(|| format!("reopening LadybugDB at {} after nuke", db_path.display()))?
+                } else {
+                    return Err(e).with_context(|| format!("opening LadybugDB at {}", db_path.display()));
+                }
+            }
+        };
+
+        // Skip the version check when we just cleaned up stale data — the
+        // DB is guaranteed fresh with no tables, so nuking would pointlessly
+        // fight Windows file handles on a database we just created.
+        let (database, needs_nuke) = if freshly_cleaned {
+            (Arc::new(database), false)
+        } else {
+            Self::check_schema_version_static(Arc::new(database), project_id).await
+        };
+
+        let database = if needs_nuke {
+            tracing::info!(
+                project_id = %project_id,
+                expected = schema::SCHEMA_VERSION,
+                "schema stale — nuking database directory and starting fresh"
+            );
+            // Drop FTS/vector indexes before closing the database so Kuzu
+            // releases internal file handles (critical for Windows deletion).
+            Self::drop_extension_indexes_static(&database).await;
+            drop(database);
+
+            if !retry_remove_db(&db_path).await {
+                bail!(
+                    "cannot remove stale LadybugDB at {} — file handles still held",
+                    db_path.display()
+                );
+            }
+            if let Some(parent) = db_path.parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+
+            let path_clone = db_path.clone();
+            let fresh = tokio::task::spawn_blocking(move || {
+                lbug::Database::new(&path_clone, lbug::SystemConfig::default())
+            })
+            .await
+            .context("LadybugDB reopen task panicked")?
+            .with_context(|| format!("reopening LadybugDB at {}", db_path.display()))?;
+            Arc::new(fresh)
+        } else {
+            database
+        };
 
         Ok(Self {
             db_path,
             project_id: project_id.to_string(),
-            database: Arc::new(database),
+            database,
             schema_initialized: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     /// Initialize the graph schema if not already done.
     ///
-    /// Checks a `_SchemaVersion` sentinel table in the DB. If the
-    /// stored version doesn't match `SCHEMA_VERSION` in the code,
-    /// all tables are dropped and recreated so new columns are
-    /// available. This forces a re-index but avoids silent node
-    /// creation failures from column mismatches.
+    /// On a fresh DB (after nuke or first creation) this runs all CREATE
+    /// statements. On an existing DB with matching schema version, it's
+    /// a no-op thanks to IF NOT EXISTS.
     pub async fn ensure_schema(&self) -> Result<()> {
         if self
             .schema_initialized
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Ok(());
-        }
-
-        let needs_rebuild = self.check_schema_version().await;
-
-        if needs_rebuild {
-            tracing::info!(
-                project_id = %self.project_id,
-                expected = schema::SCHEMA_VERSION,
-                "schema version mismatch — dropping and recreating all tables"
-            );
-            let drop_stmts = schema::schema_drop_ddl();
-            let db = self.database.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn =
-                    lbug::Connection::new(&db).context("creating connection for schema drop")?;
-                for stmt in &drop_stmts {
-                    if let Err(e) = conn.query(stmt) {
-                        // "does not exist" is fine — the table may not
-                        // have been created in a partially-initialized DB.
-                        let msg = e.to_string();
-                        if !msg.contains("does not exist")
-                            && !msg.contains("not found")
-                            && !msg.contains("not exist")
-                        {
-                            tracing::warn!(ddl = %stmt, err = %msg, "drop statement failed");
-                        }
-                    }
-                }
-                Ok(())
-            })
-            .await
-            .context("schema drop task panicked")??;
         }
 
         tracing::info!(
@@ -175,10 +300,13 @@ impl CodeGraphDb {
         Ok(())
     }
 
-    /// Read the `_SchemaVersion` sentinel. Returns `true` when the DB
-    /// needs a full rebuild (version missing or doesn't match code).
-    async fn check_schema_version(&self) -> bool {
-        let db = self.database.clone();
+    /// Check schema version using a temporary Arc. Used during `open()`
+    /// before the struct is constructed. The Arc is unwrapped afterward
+    /// so ownership returns to the caller.
+    async fn check_schema_version_static(database: Arc<lbug::Database>, project_id: &str) -> (Arc<lbug::Database>, bool) {
+        let db = database.clone();
+        let pid = project_id.to_string();
+
         let result = tokio::task::spawn_blocking(move || -> Option<u32> {
             let conn = lbug::Connection::new(&db).ok()?;
             let mut result = conn
@@ -195,25 +323,40 @@ impl CodeGraphDb {
         .ok()
         .flatten();
 
-        match result {
+        let needs_rebuild = match result {
             Some(v) if v == schema::SCHEMA_VERSION => false,
             Some(v) => {
                 tracing::info!(
-                    project_id = %self.project_id,
+                    project_id = %pid,
                     stored = v,
                     expected = schema::SCHEMA_VERSION,
                     "schema version stale"
                 );
                 true
             }
-            None => {
-                // No sentinel — either a truly fresh DB or a pre-sentinel
-                // database that predates the migration system. Drop is
-                // harmless on an empty DB (all DROP IF EXISTS) and
-                // necessary on a stale one.
-                true
+            None => true,
+        };
+
+        (database, needs_rebuild)
+    }
+
+    /// Best-effort cleanup of FTS and vector indexes before a directory nuke.
+    /// Releasing these lets Kuzu close internal file handles so Windows
+    /// `remove_dir_all` can succeed on the first attempt.
+    async fn drop_extension_indexes_static(database: &Arc<lbug::Database>) {
+        let db = database.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let conn = match lbug::Connection::new(&db) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let _ = conn.query("LOAD EXTENSION fts");
+            for label in schema::ALL_NODE_LABELS {
+                let idx = format!("{}_fts", label.to_lowercase());
+                let _ = conn.query(&format!("CALL DROP_FTS_INDEX('{label}', '{idx}')"));
             }
-        }
+        })
+        .await;
     }
 
     /// Execute a single Cypher statement (DDL or DML), ignoring results.
@@ -223,7 +366,7 @@ impl CodeGraphDb {
         tokio::task::spawn_blocking(move || {
             let conn = lbug::Connection::new(&db).context("creating connection")?;
             conn.query(&cypher)
-                .with_context(|| format!("executing: {}", &cypher[..cypher.len().min(120)]))?;
+                .with_context(|| format!("executing: {}", truncate_for_log(&cypher, 120)))?;
             Ok(())
         })
         .await
@@ -244,7 +387,7 @@ impl CodeGraphDb {
                 match conn.query(stmt) {
                     Ok(_) => success += 1,
                     Err(e) => {
-                        tracing::debug!(err = %e, stmt = %&stmt[..stmt.len().min(100)], "batch statement failed");
+                        tracing::debug!(err = %e, stmt = %truncate_for_log(stmt, 100), "batch statement failed");
                         errors += 1;
                     }
                 }
@@ -263,7 +406,7 @@ impl CodeGraphDb {
             let conn = lbug::Connection::new(&db).context("creating connection")?;
             let mut result = conn
                 .query(&cypher)
-                .with_context(|| format!("querying: {}", &cypher[..cypher.len().min(120)]))?;
+                .with_context(|| format!("querying: {}", truncate_for_log(&cypher, 120)))?;
             let rows: Vec<Vec<lbug::Value>> = result.by_ref().collect();
             Ok(rows)
         })
@@ -285,6 +428,80 @@ impl CodeGraphDb {
             });
         }
         Ok(None)
+    }
+
+    /// Install and load the LadybugDB FTS extension. Safe to call
+    /// multiple times; silently succeeds if already loaded. Returns
+    /// `Ok(true)` when the extension is ready or `Ok(false)` if loading
+    /// failed (e.g. Windows extension compatibility).
+    pub async fn load_fts_extension(&self) -> Result<bool> {
+        let db = self.database.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = lbug::Connection::new(&db)
+                .context("creating connection for FTS extension")?;
+
+            let install = conn.query("INSTALL fts");
+            if let Err(e) = &install {
+                let msg = e.to_string();
+                if !msg.contains("already installed")
+                    && !msg.contains("already exists")
+                    && !msg.contains("already loaded")
+                {
+                    tracing::warn!(err = %msg, "FTS extension install failed");
+                    return Ok(false);
+                }
+            }
+
+            let load = conn.query("LOAD EXTENSION fts");
+            if let Err(e) = &load {
+                let msg = e.to_string();
+                if !msg.contains("already loaded") {
+                    tracing::warn!(err = %msg, "FTS extension load failed");
+                    return Ok(false);
+                }
+            }
+
+            tracing::debug!("FTS extension ready");
+            Ok(true)
+        })
+        .await
+        .context("FTS extension task panicked")?
+    }
+
+    /// Install and load the LadybugDB vector extension for HNSW
+    /// similarity search. Same pattern as `load_fts_extension`.
+    pub async fn load_vector_extension(&self) -> Result<bool> {
+        let db = self.database.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool> {
+            let conn = lbug::Connection::new(&db)
+                .context("creating connection for vector extension")?;
+
+            let install = conn.query("INSTALL vector");
+            if let Err(e) = &install {
+                let msg = e.to_string();
+                if !msg.contains("already installed")
+                    && !msg.contains("already exists")
+                    && !msg.contains("already loaded")
+                {
+                    tracing::warn!(err = %msg, "vector extension install failed");
+                    return Ok(false);
+                }
+            }
+
+            let load = conn.query("LOAD EXTENSION vector");
+            if let Err(e) = &load {
+                let msg = e.to_string();
+                if !msg.contains("already loaded") {
+                    tracing::warn!(err = %msg, "vector extension load failed");
+                    return Ok(false);
+                }
+            }
+
+            tracing::debug!("vector extension ready");
+            Ok(true)
+        })
+        .await
+        .context("vector extension task panicked")?
     }
 
     /// Destroy the database files on disk (used during cascade delete).
