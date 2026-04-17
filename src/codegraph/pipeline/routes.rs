@@ -77,6 +77,7 @@ pub async fn detect_routes(
         );
 
         detect_nextjs_routes(&relative, &content, &mut routes);
+        detect_expo_routes(&relative, &mut routes);
         detect_decorator_routes(&relative, &content, &mut routes);
         detect_tool_definitions(&relative, &content, &mut tools);
     }
@@ -145,22 +146,35 @@ pub async fn detect_routes(
         }
     }
 
-    // HANDLES_TOOL edges: link handler functions to their tool names.
-    // Tool definitions don't get their own node type — the tool name
-    // is stored in the edge reason field, keeping the schema compact.
+    // Tool nodes + HANDLES_TOOL edges: same pattern as Route nodes.
+    let mut seen_tools: HashSet<String> = HashSet::new();
     for tool in &tools {
-        if !known_symbols.contains(&tool.handler_qname) {
+        let tool_qname = format!("{pid}::tool::{}", cypher_escape(&tool.name));
+        if !seen_tools.insert(tool_qname.clone()) {
             continue;
         }
-        let handler_escaped = cypher_escape(&tool.handler_qname);
+
+        let tool_qname_escaped = cypher_escape(&tool_qname);
         let tool_name_escaped = cypher_escape(&tool.name);
-        for label in &["Function", "Method"] {
-            edge_stmts.push(format!(
-                "MATCH (h:{label}) WHERE h.qualified_name = '{handler_escaped}' \
-                 AND h.project_id = '{pid}' \
-                 CREATE (h)-[:CodeRelation {{type: 'HANDLES_TOOL', confidence: 0.85, \
-                 reason: '{tool_name_escaped}', step: 0}}]->(h)"
-            ));
+
+        node_stmts.push(format!(
+            "CREATE (:Tool {{qualified_name: '{tool_qname_escaped}', \
+             name: '{tool_name_escaped}', project_id: '{pid}', \
+             source_file: '', line_start: 0, line_end: 0, \
+             source: 'pipeline', written_by: 'pipeline', \
+             extends_type: '', import_source: '', declared_type: ''}})"
+        ));
+
+        if known_symbols.contains(&tool.handler_qname) {
+            let handler_escaped = cypher_escape(&tool.handler_qname);
+            for label in &["Function", "Method"] {
+                edge_stmts.push(format!(
+                    "MATCH (h:{label}), (t:Tool) WHERE h.qualified_name = '{handler_escaped}' \
+                     AND h.project_id = '{pid}' AND t.qualified_name = '{tool_qname_escaped}' \
+                     CREATE (h)-[:CodeRelation {{type: 'HANDLES_TOOL', confidence: 0.85, \
+                     reason: '{tool_name_escaped}', step: 0}}]->(t)"
+                ));
+            }
         }
     }
 
@@ -264,6 +278,65 @@ fn detect_nextjs_routes(relative: &str, _content: &str, routes: &mut Vec<Detecte
     }
 }
 
+/// Expo Router: file-based routing under app/ with group prefixes
+/// like (tabs), (drawer), (stack). Screen files become GET routes.
+fn detect_expo_routes(relative: &str, routes: &mut Vec<DetectedRoute>) {
+    let sl = relative.to_lowercase();
+    if !sl.starts_with("app/") && !sl.starts_with("src/app/") {
+        return;
+    }
+    let has_group = sl.contains("/(tabs)") || sl.contains("/(drawer)")
+        || sl.contains("/(stack)") || sl.contains("/(modal)");
+    let is_layout = sl.ends_with("/_layout.tsx") || sl.ends_with("/_layout.ts")
+        || sl.ends_with("/_layout.jsx") || sl.ends_with("/_layout.js");
+
+    if !has_group && !is_layout {
+        return;
+    }
+
+    let stem = relative
+        .trim_start_matches("src/")
+        .trim_start_matches("app/");
+
+    let is_screen = stem.ends_with(".tsx") || stem.ends_with(".ts")
+        || stem.ends_with(".jsx") || stem.ends_with(".js");
+    if !is_screen {
+        return;
+    }
+
+    let path_part = stem
+        .rsplit('/')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
+    let url_path = path_part
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".ts")
+        .trim_end_matches(".jsx")
+        .trim_end_matches(".js")
+        .replace("(tabs)/", "")
+        .replace("(drawer)/", "")
+        .replace("(stack)/", "")
+        .replace("(modal)/", "")
+        .replace("_layout", "__layout")
+        .replace('[', ":")
+        .replace(']', "");
+    let url = if url_path.is_empty() || url_path == "index" {
+        "/".to_string()
+    } else {
+        format!("/{url_path}")
+    };
+
+    routes.push(DetectedRoute {
+        method: "GET".to_string(),
+        path: url,
+        handler_qname: format!("{relative}::default"),
+        source_file: relative.to_string(),
+    });
+}
+
 /// Scan for framework decorator/call patterns that define routes:
 /// - Python: @app.route("/path"), @app.get("/path"), @router.post("/path")
 /// - Express: app.get("/path", handler), router.post("/path", handler)
@@ -273,6 +346,7 @@ fn detect_decorator_routes(relative: &str, content: &str, routes: &mut Vec<Detec
     // patterns with minimal cost. Covers Flask, FastAPI, Express, Actix,
     // Rocket, Axum, Spring (@GetMapping etc.), Laravel (Route::get), etc.
     let patterns: &[(&str, &str)] = &[
+        // Flask / FastAPI (Python)
         ("@app.route(", "*"),
         ("@app.get(", "GET"),
         ("@app.post(", "POST"),
@@ -284,6 +358,7 @@ fn detect_decorator_routes(relative: &str, content: &str, routes: &mut Vec<Detec
         ("@router.put(", "PUT"),
         ("@router.delete(", "DELETE"),
         ("@router.patch(", "PATCH"),
+        // Express / Koa / Hono (JS/TS)
         ("app.get(", "GET"),
         ("app.post(", "POST"),
         ("app.put(", "PUT"),
@@ -294,22 +369,60 @@ fn detect_decorator_routes(relative: &str, content: &str, routes: &mut Vec<Detec
         ("router.put(", "PUT"),
         ("router.delete(", "DELETE"),
         ("router.patch(", "PATCH"),
+        // Actix / Rocket / Axum (Rust attribute macros)
         ("#[get(", "GET"),
         ("#[post(", "POST"),
         ("#[put(", "PUT"),
         ("#[delete(", "DELETE"),
         ("#[patch(", "PATCH"),
+        // Axum tower-style
+        (".route(", "*"),
+        // Spring Boot (Java/Kotlin)
         ("@GetMapping(", "GET"),
         ("@PostMapping(", "POST"),
         ("@PutMapping(", "PUT"),
         ("@DeleteMapping(", "DELETE"),
         ("@PatchMapping(", "PATCH"),
         ("@RequestMapping(", "*"),
+        // NestJS (TS decorators)
+        ("@Get(", "GET"),
+        ("@Post(", "POST"),
+        ("@Put(", "PUT"),
+        ("@Delete(", "DELETE"),
+        ("@Patch(", "PATCH"),
+        // Laravel (PHP)
         ("Route::get(", "GET"),
         ("Route::post(", "POST"),
         ("Route::put(", "PUT"),
         ("Route::delete(", "DELETE"),
         ("Route::patch(", "PATCH"),
+        ("Route::any(", "*"),
+        // Gin (Go — case-sensitive method names)
+        ("router.GET(", "GET"),
+        ("router.POST(", "POST"),
+        ("router.PUT(", "PUT"),
+        ("router.DELETE(", "DELETE"),
+        ("router.PATCH(", "PATCH"),
+        ("r.GET(", "GET"),
+        ("r.POST(", "POST"),
+        ("r.PUT(", "PUT"),
+        ("r.DELETE(", "DELETE"),
+        ("r.PATCH(", "PATCH"),
+        // Django (urls.py)
+        ("path(\"", "*"),
+        ("path('", "*"),
+        ("re_path(", "*"),
+        // Rails (routes.rb)
+        ("get \"", "GET"),
+        ("get '", "GET"),
+        ("post \"", "POST"),
+        ("post '", "POST"),
+        ("put \"", "PUT"),
+        ("put '", "PUT"),
+        ("patch \"", "PATCH"),
+        ("patch '", "PATCH"),
+        ("delete \"", "DELETE"),
+        ("delete '", "DELETE"),
     ];
 
     for (line_idx, line) in content.lines().enumerate() {

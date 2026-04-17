@@ -10,7 +10,7 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 
 /// All supported graph node labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeLabel {
     // Structural
@@ -40,6 +40,15 @@ pub enum NodeLabel {
     Const,
     Record,
     Template,
+    // Additional language-specific (GitNexus parity)
+    Property,
+    Constructor,
+    Typedef,
+    Union,
+    Static,
+    Delegate,
+    #[default]
+    CodeElement,
     // Semantic (AI-optimized)
     Community,
     Process,
@@ -48,6 +57,7 @@ pub enum NodeLabel {
     Test,
     // Web / API
     Route,
+    Tool,
 }
 
 impl NodeLabel {
@@ -78,11 +88,19 @@ impl NodeLabel {
             Self::Const => "Const",
             Self::Record => "Record",
             Self::Template => "Template",
+            Self::Property => "Property",
+            Self::Constructor => "Constructor",
+            Self::Typedef => "Typedef",
+            Self::Union => "UnionType",
+            Self::Static => "Static",
+            Self::Delegate => "Delegate",
+            Self::CodeElement => "CodeElement",
             Self::Community => "Community",
             Self::Process => "Process",
             Self::Section => "Section",
             Self::Test => "Test",
             Self::Route => "Route",
+            Self::Tool => "Tool",
         }
     }
 }
@@ -122,6 +140,7 @@ pub enum EdgeType {
     Fetches,
     Queries,
     HandlesTool,
+    Wraps,
 }
 
 impl EdgeType {
@@ -149,6 +168,7 @@ impl EdgeType {
             Self::Fetches => "FETCHES",
             Self::Queries => "QUERIES",
             Self::HandlesTool => "HANDLES_TOOL",
+            Self::Wraps => "WRAPS",
         }
     }
 }
@@ -520,7 +540,7 @@ impl Default for CodeGraphConfig {
             re_index_threshold: 5,
             staleness_threshold_hours: 24,
             max_process_depth: 10,
-            max_processes: 50,
+            max_processes: 75,
             max_process_branching: 4,
             min_process_steps: 3,
             community_min_size: 3,
@@ -550,7 +570,7 @@ fn default_max_process_depth() -> u32 {
     10
 }
 fn default_max_processes() -> u32 {
-    50
+    75
 }
 fn default_max_process_branching() -> u32 {
     4
@@ -603,6 +623,12 @@ pub struct CommunityInfo {
     pub function_count: u64,
     /// Top symbols by centrality.
     pub key_symbols: Vec<String>,
+    /// Internal clustering quality (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cohesion: Option<f64>,
+    /// Dominant terms extracted from member names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
 }
 
 /// An entry point / process node for the UI.
@@ -614,6 +640,18 @@ pub struct ProcessInfo {
     pub call_depth: u32,
     pub community: Option<String>,
     pub steps: Vec<String>,
+    /// `intra_community` or `cross_community`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_type: Option<String>,
+    /// Community IDs touched by this process.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub communities: Vec<String>,
+    /// Entry-point likelihood score (0.0–1.0 normalized).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_point_score: Option<f64>,
+    /// Terminal node qualified name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
 }
 
 /// Index log entry for the UI.

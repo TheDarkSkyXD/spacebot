@@ -1,52 +1,81 @@
-//! BM25 + RRF search for the code graph.
+//! Hybrid BM25 + semantic search for the code graph.
 //!
-//! Codegraph indexing is fully deterministic and LadybugDB-only — no
-//! vector embeddings are produced at index time, so search runs purely
-//! over the FTS5 sqlite index built by the `fts` phase. Reciprocal rank
-//! fusion is preserved as a single-source pass so the result shape and
-//! scoring stay stable for any future hybrid extension.
+//! Combines LadybugDB's native FTS extension (per-table keyword indexes)
+//! with vector similarity search (CodeEmbedding HNSW index). Results are
+//! merged via Reciprocal Rank Fusion (k=60), matching GitNexus's approach.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use anyhow::{Context, Result};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use super::db::SharedCodeGraphDb;
 use super::types::GraphSearchResult;
 use crate::codegraph::NodeLabel;
 
-/// Execute a search across the code graph.
-///
-/// Runs BM25 via FTS5 and re-scores results with RRF (k=60) so the
-/// returned ordering matches the format any future hybrid extension
-/// would produce. Returns an empty list if no FTS index exists yet.
+const SEARCHABLE_LABELS: &[(&str, &str)] = &[
+    ("Function", "function_fts"),
+    ("Method", "method_fts"),
+    ("Class", "class_fts"),
+    ("Interface", "interface_fts"),
+    ("Struct", "struct_fts"),
+    ("Trait", "trait_fts"),
+    ("Enum", "enum_fts"),
+    ("TypeAlias", "typealias_fts"),
+    ("Const", "const_fts"),
+    ("Module", "module_fts"),
+    ("Route", "route_fts"),
+    ("Variable", "variable_fts"),
+    ("Import", "import_fts"),
+    ("Decorator", "decorator_fts"),
+    ("File", "file_fts"),
+    ("Constructor", "constructor_fts"),
+    ("Property", "property_fts"),
+    ("UnionType", "uniontype_fts"),
+    ("Typedef", "typedef_fts"),
+    ("Static", "static_fts"),
+    ("Delegate", "delegate_fts"),
+];
+
 pub async fn hybrid_search(
     project_id: &str,
     query: &str,
     limit: usize,
     db: &SharedCodeGraphDb,
 ) -> Result<Vec<GraphSearchResult>> {
-    let project_dir = db.db_path.parent().unwrap_or(Path::new("."));
+    let sanitized = sanitize_fts_query(query);
+    if sanitized.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    // 1. BM25 search via FTS5 sqlite.
-    let fts_results = fts_search(project_dir, query, limit * 3).await;
-    let fts_results = fts_results.unwrap_or_default();
+    // Run BM25 and semantic search in parallel.
+    let bm25_future = bm25_search(db, &sanitized, limit * 3);
+    let semantic_future = semantic_search(project_id, db, query, limit * 3);
 
-    // 2. Reciprocal Rank Fusion with k=60. Single-source today; the
-    //    fusion math is preserved so adding a second source later is a
-    //    drop-in change.
+    let (bm25_results, semantic_results) = tokio::join!(bm25_future, semantic_future);
+    let bm25_results = bm25_results.unwrap_or_default();
+    let semantic_results = semantic_results.unwrap_or_default();
+
+    // Reciprocal Rank Fusion (k=60) — merge both sources by qualified_name.
     let k = 60.0;
     let mut scores: HashMap<String, (f64, GraphSearchResult)> = HashMap::new();
 
-    for (rank, result) in fts_results.into_iter().enumerate() {
-        let rrf_score = 1.0 / (k + rank as f64 + 1.0);
+    for (rank, result) in bm25_results.into_iter().enumerate() {
+        let rrf = 1.0 / (k + rank as f64 + 1.0);
         scores
             .entry(result.qualified_name.clone())
-            .and_modify(|(s, _)| *s += rrf_score)
-            .or_insert((rrf_score, result));
+            .and_modify(|(s, _)| *s += rrf)
+            .or_insert((rrf, result));
     }
 
-    // 3. Sort by fused score, take top-k.
+    for (rank, result) in semantic_results.into_iter().enumerate() {
+        let rrf = 1.0 / (k + rank as f64 + 1.0);
+        scores
+            .entry(result.qualified_name.clone())
+            .and_modify(|(s, _)| *s += rrf)
+            .or_insert((rrf, result));
+    }
+
     let mut results: Vec<GraphSearchResult> = scores
         .into_values()
         .map(|(score, mut r)| {
@@ -61,80 +90,196 @@ pub async fn hybrid_search(
         project_id = %project_id,
         query = %query,
         results = results.len(),
-        "code graph search complete"
+        "hybrid search complete"
     );
 
     Ok(results)
 }
 
-/// BM25 search via the FTS5 sqlite database.
-async fn fts_search(
-    project_dir: &Path,
-    query: &str,
+/// BM25 keyword search via LadybugDB FTS indexes.
+async fn bm25_search(
+    db: &SharedCodeGraphDb,
+    sanitized_query: &str,
     limit: usize,
 ) -> Result<Vec<GraphSearchResult>> {
-    let fts_path = project_dir.join("fts.sqlite");
-    if !fts_path.exists() {
+    let fts_ready = db.load_fts_extension().await?;
+    if !fts_ready {
         return Ok(Vec::new());
     }
 
-    let fts_url = format!(
-        "sqlite:{}?mode=ro",
-        fts_path.to_string_lossy().replace('\\', "/")
-    );
-    let pool = sqlx::sqlite::SqlitePool::connect(&fts_url)
-        .await
-        .with_context(|| format!("opening FTS database at {}", fts_path.display()))?;
+    let mut results: Vec<GraphSearchResult> = Vec::new();
 
-    let fts_query = sanitize_fts_query(query);
+    for &(label, index_name) in SEARCHABLE_LABELS {
+        let escaped = sanitized_query.replace('\\', "\\\\").replace('\'', "\\'");
+        let cypher = format!(
+            "CALL QUERY_FTS_INDEX('{label}', '{index_name}', '{escaped}', conjunctive := false) \
+             RETURN node.qualified_name, node.name, node.source_file, score \
+             ORDER BY score DESC \
+             LIMIT {limit}"
+        );
 
-    let rows: Vec<(String, String, String, String, f64)> = sqlx::query_as(
-        "SELECT c.qualified_name, c.name, c.label, c.source_file, \
-         bm25(symbols_fts) as score \
-         FROM symbols_fts f \
-         JOIN symbols_content c ON f.rowid = c.id \
-         WHERE symbols_fts MATCH ?1 \
-         ORDER BY score \
-         LIMIT ?2",
-    )
-    .bind(&fts_query)
-    .bind(limit as i64)
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
+        let rows = match db.query(&cypher).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
 
-    pool.close().await;
+        for row in &rows {
+            if let (
+                Some(lbug::Value::String(q)),
+                Some(lbug::Value::String(n)),
+                sf,
+                Some(score_val),
+            ) = (row.first(), row.get(1), row.get(2), row.get(3))
+            {
+                let sf_str = match sf {
+                    Some(lbug::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                    _ => None,
+                };
+                let score_f64 = match score_val {
+                    lbug::Value::Double(d) => *d,
+                    lbug::Value::Float(f) => *f as f64,
+                    lbug::Value::Int64(i) => *i as f64,
+                    lbug::Value::Int32(i) => *i as f64,
+                    _ => 0.0,
+                };
 
-    let results: Vec<GraphSearchResult> = rows
-        .into_iter()
-        .map(|(qname, name, label, source_file, score)| {
-            let parsed_label = serde_json::from_value::<NodeLabel>(
-                serde_json::Value::String(label.to_lowercase()),
-            )
-            .unwrap_or(NodeLabel::Function);
+                let parsed_label = serde_json::from_value::<NodeLabel>(
+                    serde_json::Value::String(label.to_lowercase()),
+                )
+                .unwrap_or(NodeLabel::Function);
 
-            GraphSearchResult {
-                node_id: 0,
-                qualified_name: qname,
-                name,
-                label: parsed_label,
-                source_file: if source_file.is_empty() {
-                    None
-                } else {
-                    Some(source_file)
-                },
-                line_start: None,
-                score: score.abs(),
-                community: None,
-                snippet: None,
+                results.push(GraphSearchResult {
+                    node_id: 0,
+                    qualified_name: q.clone(),
+                    name: n.clone(),
+                    label: parsed_label,
+                    source_file: sf_str,
+                    line_start: None,
+                    score: score_f64.abs(),
+                    community: None,
+                    snippet: None,
+                });
             }
-        })
-        .collect();
+        }
+    }
 
     Ok(results)
 }
 
-/// Sanitize a user query for FTS5 MATCH syntax.
+/// Semantic vector search via LadybugDB HNSW index on CodeEmbedding.
+async fn semantic_search(
+    project_id: &str,
+    db: &SharedCodeGraphDb,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<GraphSearchResult>> {
+    let vector_ready = db.load_vector_extension().await?;
+    if !vector_ready {
+        return Ok(Vec::new());
+    }
+
+    let pid = project_id.replace('\\', "\\\\").replace('\'', "\\'");
+
+    // Embed the query.
+    let query_text = query.to_string();
+    let query_vec = tokio::task::spawn_blocking(move || -> Result<Vec<f32>> {
+        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
+            .context("fastembed model init")?;
+        let embeddings = model.embed(vec![query_text], None)
+            .context("fastembed embed")?;
+        Ok(embeddings.into_iter().next().unwrap_or_default())
+    })
+    .await
+    .context("semantic embed task panicked")??;
+
+    if query_vec.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let vec_str = query_vec
+        .iter()
+        .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let cypher = format!(
+        "CALL QUERY_VECTOR_INDEX('CodeEmbedding', 'code_embedding_idx', \
+         CAST([{vec_str}] AS FLOAT[{dim}]), {limit}) \
+         YIELD node AS emb, distance \
+         WHERE distance < 0.5 \
+         RETURN emb.nodeId AS nodeId, distance \
+         ORDER BY distance \
+         LIMIT {limit}",
+        dim = query_vec.len(),
+    );
+
+    let rows = match db.query(&cypher).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(err = %e, "vector search query failed — embeddings may not exist");
+            return Ok(Vec::new());
+        }
+    };
+
+    // Resolve node metadata from the graph by nodeId (qualified_name).
+    let mut results: Vec<GraphSearchResult> = Vec::new();
+    for row in &rows {
+        let (node_id, distance) = match (row.first(), row.get(1)) {
+            (Some(lbug::Value::String(id)), Some(dist_val)) => {
+                let d = match dist_val {
+                    lbug::Value::Double(d) => *d,
+                    lbug::Value::Float(f) => *f as f64,
+                    _ => 0.5,
+                };
+                (id.clone(), d)
+            }
+            _ => continue,
+        };
+
+        // Look up the node across symbol tables.
+        let escaped_id = node_id.replace('\\', "\\\\").replace('\'', "\\'");
+        for &label in &["Function", "Method", "Class", "Interface", "Struct", "Trait", "File", "Enum", "Module", "Route"] {
+            let meta = db.query(&format!(
+                "MATCH (n:{label}) WHERE n.qualified_name = '{escaped_id}' \
+                 AND n.project_id = '{pid}' \
+                 RETURN n.name, n.source_file"
+            )).await;
+
+            if let Ok(meta_rows) = meta
+                && let Some(meta_row) = meta_rows.first()
+            {
+                let name = match meta_row.first() {
+                    Some(lbug::Value::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                let sf = match meta_row.get(1) {
+                    Some(lbug::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                    _ => None,
+                };
+                let parsed_label = serde_json::from_value::<NodeLabel>(
+                    serde_json::Value::String(label.to_lowercase()),
+                )
+                .unwrap_or(NodeLabel::Function);
+
+                results.push(GraphSearchResult {
+                    node_id: 0,
+                    qualified_name: node_id.clone(),
+                    name,
+                    label: parsed_label,
+                    source_file: sf,
+                    line_start: None,
+                    score: 1.0 - distance,
+                    community: None,
+                    snippet: None,
+                });
+                break;
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 fn sanitize_fts_query(query: &str) -> String {
     let tokens: Vec<String> = query
         .split_whitespace()
@@ -147,13 +292,13 @@ fn sanitize_fts_query(query: &str) -> String {
             if clean.is_empty() {
                 return String::new();
             }
-            format!("{clean}*")
+            clean
         })
         .filter(|t| !t.is_empty())
         .collect();
 
     if tokens.is_empty() {
-        return query.to_string();
+        return String::new();
     }
 
     tokens.join(" ")

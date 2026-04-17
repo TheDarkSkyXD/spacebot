@@ -136,7 +136,7 @@ fn walk_java_node(
             if let Some(name_node) = node.child(1) {
                 let name = text(name_node, source);
                 if !name.is_empty() {
-                    symbols.push(sym(file_path, None, &name, NodeLabel::Module, &node));
+                    symbols.push(sym(file_path, None, &name, NodeLabel::Module, &node, source));
                 }
             }
         }
@@ -170,6 +170,7 @@ fn walk_java_node(
                     implements: Vec::new(),
                     decorates: None,
                     metadata: std::collections::HashMap::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -185,6 +186,8 @@ fn walk_java_node(
 
                 let implements = collect_implements(node, source);
 
+                let (vis, is_pub, is_static, is_abstract, is_final, annotations) =
+                    extract_java_modifiers(node, source.as_bytes());
                 symbols.push(ExtractedSymbol {
                     name: name.clone(),
                     qualified_name: qname.clone(),
@@ -197,6 +200,13 @@ fn walk_java_node(
                     implements,
                     decorates: None,
                     metadata: std::collections::HashMap::new(),
+                    is_exported: is_pub,
+                    visibility: vis,
+                    is_static,
+                    is_abstract,
+                    is_final,
+                    annotations,
+                    ..Default::default()
                 });
 
                 if let Some(body) = node.child_by_field_name("body") {
@@ -212,7 +222,7 @@ fn walk_java_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 let qname = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Interface, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Interface, &node, source));
 
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
@@ -227,7 +237,7 @@ fn walk_java_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 let qname = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Enum, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Enum, &node, source));
 
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
@@ -248,14 +258,25 @@ fn walk_java_node(
                         &name,
                         NodeLabel::Method,
                         &node,
+                        source,
                     );
                     if let Some(type_node) = node.child_by_field_name("type") {
                         let ty = text(type_node, source);
                         if !ty.is_empty() && ty != "void" {
                             method_sym
                                 .metadata
-                                .insert("declared_type".to_string(), ty);
+                                .insert("declared_type".to_string(), ty.clone());
+                            method_sym.return_type = Some(ty);
                         }
+                    }
+                    if let Some(params) = node.child_by_field_name("parameters") {
+                        let pc = {
+                            let cur = &mut params.walk();
+                            params.children(cur)
+                                .filter(|c| c.kind() == "formal_parameter" || c.kind() == "spread_parameter")
+                                .count() as u32
+                        };
+                        method_sym.parameter_count = Some(pc);
                     }
                     symbols.push(method_sym);
                     let fn_qname = qname(file_path, parent_name, &name);
@@ -269,7 +290,7 @@ fn walk_java_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
-                    symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node));
+                    symbols.push(sym(file_path, parent_name, &name, NodeLabel::Method, &node, source));
                     let fn_qname = qname(file_path, parent_name, &name);
                     if let Some(params) = node.child_by_field_name("parameters") {
                         collect_java_params(params, source, &fn_qname, symbols);
@@ -299,6 +320,7 @@ fn walk_java_node(
                             &name,
                             NodeLabel::Variable,
                             &child,
+                            source,
                         );
                         if !declared_type.is_empty() {
                             field_sym
@@ -314,7 +336,7 @@ fn walk_java_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
-                    symbols.push(sym(file_path, parent_name, &name, NodeLabel::Decorator, &node));
+                    symbols.push(sym(file_path, parent_name, &name, NodeLabel::Decorator, &node, source));
                 }
             }
         }
@@ -397,6 +419,7 @@ fn collect_java_params(
             implements: Vec::new(),
             decorates: None,
             metadata,
+            ..Default::default()
         });
     }
 }
@@ -863,7 +886,10 @@ fn sym(
     name: &str,
     label: NodeLabel,
     node: &tree_sitter::Node,
+    source: &str,
 ) -> ExtractedSymbol {
+    let (vis, is_pub, is_static, is_abstract, is_final, annotations) =
+        extract_java_modifiers(*node, source.as_bytes());
     ExtractedSymbol {
         name: name.to_string(),
         qualified_name: qname(file_path, parent, name),
@@ -876,7 +902,75 @@ fn sym(
         implements: Vec::new(),
         decorates: None,
         metadata: std::collections::HashMap::new(),
+        is_exported: is_pub,
+        visibility: vis,
+        is_static,
+        is_abstract,
+        is_final,
+        annotations,
+        ..Default::default()
     }
+}
+
+/// Extract Java modifier info from a declaration node.
+/// Returns (visibility, is_public, is_static, is_abstract, is_final, annotations).
+#[cfg(feature = "codegraph")]
+fn extract_java_modifiers(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> (Option<String>, bool, bool, bool, bool, Option<String>) {
+    let mut vis = None;
+    let mut is_pub = false;
+    let mut is_static = false;
+    let mut is_abstract = false;
+    let mut is_final = false;
+    let mut anno_names: Vec<String> = Vec::new();
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        if child.kind() != "modifiers" {
+            continue;
+        }
+        let mods_cursor = &mut child.walk();
+        for m in child.children(mods_cursor) {
+            let t = m.utf8_text(source).unwrap_or("");
+            match t {
+                "public" => { vis = Some("public".to_string()); is_pub = true; }
+                "private" => { vis = Some("private".to_string()); }
+                "protected" => { vis = Some("protected".to_string()); }
+                "static" => { is_static = true; }
+                "abstract" => { is_abstract = true; }
+                "final" => { is_final = true; }
+                _ => {
+                    if matches!(m.kind(), "annotation" | "marker_annotation")
+                        && let Some(name_node) = m.child_by_field_name("name")
+                    {
+                        let aname = name_node.utf8_text(source).unwrap_or("").to_string();
+                        if !aname.is_empty() {
+                            anno_names.push(aname);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Default to package-private if no access modifier found and it's
+    // not an annotation/import node.
+    if vis.is_none()
+        && matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+                | "method_declaration" | "constructor_declaration" | "field_declaration"
+        )
+    {
+        vis = Some("package-private".to_string());
+    }
+    let annotations = if anno_names.is_empty() {
+        None
+    } else {
+        Some(anno_names.join(","))
+    };
+    (vis, is_pub, is_static, is_abstract, is_final, annotations)
 }
 
 fn fallback_sym(file_path: &str, name: &str, label: NodeLabel, line: u32) -> ExtractedSymbol {
@@ -892,5 +986,6 @@ fn fallback_sym(file_path: &str, name: &str, label: NodeLabel, line: u32) -> Ext
         implements: Vec::new(),
         decorates: None,
         metadata: std::collections::HashMap::new(),
+        ..Default::default()
     }
 }

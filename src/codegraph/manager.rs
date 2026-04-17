@@ -108,6 +108,27 @@ impl CodeGraphManager {
                     "project index is stale"
                 );
             }
+
+            // Check schema version: if meta.json's schema_version doesn't
+            // match the current code, the DB will be wiped by ensure_schema.
+            // Mark the project as Pending so the UI prompts for re-index
+            // instead of trying to load from an empty graph.
+            if (project.status == super::types::IndexStatus::Indexed
+                || project.status == super::types::IndexStatus::Stale)
+                && let Ok(meta_json) = tokio::fs::read_to_string(&meta_path).await
+                && let Ok(meta) = serde_json::from_str::<super::types::ProjectMeta>(&meta_json)
+                && meta.schema_version != super::schema::SCHEMA_VERSION
+            {
+                tracing::info!(
+                    project_id = %project.project_id,
+                    stored = meta.schema_version,
+                    expected = super::schema::SCHEMA_VERSION,
+                    "schema version changed — marking project for re-index"
+                );
+                project.status = super::types::IndexStatus::Pending;
+                project.is_stale = false;
+            }
+
             registry.insert(project.project_id.clone(), project);
         }
 
@@ -311,6 +332,13 @@ impl CodeGraphManager {
         // Slow path: open the database and insert it.
         tracing::info!(project_id = %project_id, "lazy-opening LadybugDB for existing project");
         let db = Arc::new(CodeGraphDb::open(project_id, &self.inner.base_path).await?);
+
+        // Initialize schema so queries against a stale or freshly-created
+        // DB don't fail with missing-table errors. If the schema version
+        // changed since the last index, this drops and recreates tables
+        // (data is lost but a re-index is needed anyway).
+        db.ensure_schema().await?;
+
         let mut databases = self.inner.databases.write().await;
         // Double-check in case another task opened it concurrently.
         databases
@@ -320,64 +348,119 @@ impl CodeGraphManager {
     }
 
     /// Start (or restart) the indexing pipeline for a project.
+    ///
+    /// Returns as soon as the project is marked as `Indexing`. The
+    /// expensive work (DB open, schema init, purge, pipeline spawn) runs
+    /// in a detached task so multiple concurrent re-indexes don't block
+    /// each other's HTTP requests.
     pub async fn start_indexing(&self, project_id: &str) -> Result<()> {
-        // Ensure the project is registered.
-        {
-            let registry = self.inner.registry.read().await;
-            if !registry.contains_key(project_id) {
-                bail!("project '{}' not registered", project_id);
-            }
-        }
-
-        let db = self.ensure_db(project_id).await?;
-
+        // Ensure the project is registered and grab root_path while we
+        // hold the read lock.
         let root_path = {
             let registry = self.inner.registry.read().await;
-            registry
-                .get(project_id)
-                .map(|p| p.root_path.clone())
-                .with_context(|| format!("project '{}' not registered", project_id))?
+            match registry.get(project_id) {
+                Some(p) => p.root_path.clone(),
+                None => bail!("project '{}' not registered", project_id),
+            }
         };
 
         let config = self.inner.config.read().await.clone();
 
-        // Update status to indexing.
+        // Flip status to Indexing synchronously so the very next API
+        // poll sees the transition. Everything after this point runs in
+        // a detached task.
         {
             let mut registry = self.inner.registry.write().await;
             if let Some(project) = registry.get_mut(project_id) {
                 project.status = IndexStatus::Indexing;
                 project.error_message = None;
                 project.updated_at = chrono::Utc::now();
+                // Seed an empty progress so the UI immediately flips
+                // from "Pending" to "Indexing — Extracting" without
+                // waiting for the first real progress tick.
+                project.progress = Some(super::types::PipelineProgress {
+                    phase: super::types::PipelinePhase::Extracting,
+                    phase_progress: 0.0,
+                    message: "Starting indexing pipeline".to_string(),
+                    stats: super::types::PipelineStats::default(),
+                });
             }
         }
 
-        // Purge existing graph data so re-index starts fresh.
-        // This runs before the pipeline spawns, keeping the pipeline itself instant.
-        {
-            db.ensure_schema().await?;
-            let pid = project_id.replace('\\', "\\\\").replace('\'', "\\'");
-            for label in super::schema::ALL_NODE_LABELS {
-                db.execute(&format!(
-                    "MATCH (n:{label}) WHERE n.project_id = '{pid}' DETACH DELETE n"
-                )).await.ok();
+        // Detach the rest. The HTTP request handler returns immediately
+        // after this spawn completes its synchronous prefix.
+        let project_id_owned = project_id.to_string();
+        let inner = self.inner.clone();
+        let manager_self = self.clone_for_spawn();
+
+        tokio::spawn(async move {
+            if let Err(err) = manager_self
+                .run_indexing_pipeline(
+                    project_id_owned.clone(),
+                    root_path,
+                    config,
+                    inner.clone(),
+                )
+                .await
+            {
+                tracing::error!(
+                    project_id = %project_id_owned,
+                    %err,
+                    "indexing pipeline setup failed"
+                );
+                let mut reg = inner.registry.write().await;
+                if let Some(project) = reg.get_mut(&project_id_owned) {
+                    project.status = IndexStatus::Error;
+                    project.error_message = Some(format!("{err:#}"));
+                    project.progress = None;
+                    project.updated_at = chrono::Utc::now();
+                }
             }
-            tracing::debug!(project_id = %project_id, "purged stale graph data before indexing");
+        });
+
+        Ok(())
+    }
+
+    /// Body of the detached indexing task. Opens the DB, purges old
+    /// data, spawns the pipeline, and wires up progress + completion
+    /// handlers. Errors here bubble up so the caller can flip status to
+    /// Error.
+    async fn run_indexing_pipeline(
+        &self,
+        project_id: String,
+        root_path: PathBuf,
+        config: Arc<CodeGraphConfig>,
+        inner: Arc<Inner>,
+    ) -> Result<()> {
+        let db = self.ensure_db(&project_id).await?;
+
+        // Purge existing graph data so re-index starts fresh. When the
+        // schema was just rebuilt by ensure_schema, the tables are
+        // already empty and each DELETE is a no-op — cheap.
+        db.ensure_schema().await?;
+        let pid = project_id.replace('\\', "\\\\").replace('\'', "\\'");
+        for label in super::schema::ALL_NODE_LABELS {
+            db.execute(&format!(
+                "MATCH (n:{label}) WHERE n.project_id = '{pid}' DETACH DELETE n"
+            ))
+            .await
+            .ok();
         }
+        tracing::debug!(project_id = %project_id, "purged stale graph data before indexing");
 
         // Start the pipeline.
         let handle = pipeline::start_full_pipeline(
-            project_id.to_string(),
+            project_id.clone(),
             root_path.clone(),
             db.clone(),
             config.clone(),
-            self.inner.event_tx.clone(),
+            inner.event_tx.clone(),
         );
 
-        // Spawn a progress-forwarder that reads from the watch channel and
-        // updates the registry so polling API responses include live progress.
+        // Spawn progress forwarder.
         let mut progress_rx = handle.progress_rx.clone();
-        let progress_inner = self.inner.clone();
-        let progress_project_id = project_id.to_string();
+        let progress_inner = inner.clone();
+        let progress_project_id = project_id.clone();
         tokio::spawn(async move {
             while progress_rx.changed().await.is_ok() {
                 let progress = progress_rx.borrow().clone();
@@ -395,9 +478,9 @@ impl CodeGraphManager {
             }
         });
 
-        // Spawn a completion handler task.
-        let project_id_owned = project_id.to_string();
-        let inner = self.inner.clone();
+        // Spawn completion handler.
+        let project_id_owned = project_id.clone();
+        let completion_inner = inner.clone();
 
         tokio::spawn(async move {
             match handle.wait().await {
@@ -409,15 +492,11 @@ impl CodeGraphManager {
                         "pipeline completed successfully"
                     );
 
-                    // Detect primary language(s) from the indexed File
-                    // nodes' extensions.
-                    let primary_language = Self::detect_languages(&db, &project_id_owned).await;
+                    let primary_language =
+                        Self::detect_languages(&db, &project_id_owned).await;
 
-                    // Update registry — keep progress visible so the
-                    // frontend can display the finished state before
-                    // transitioning to the overview.
                     {
-                        let mut reg = inner.registry.write().await;
+                        let mut reg = completion_inner.registry.write().await;
                         if let Some(project) = reg.get_mut(&project_id_owned) {
                             project.status = IndexStatus::Indexed;
                             project.error_message = None;
@@ -438,9 +517,7 @@ impl CodeGraphManager {
                         }
                     }
 
-                    // Clear the completion progress after 8 seconds so the
-                    // frontend has time to poll and show the finished state.
-                    let clear_inner = inner.clone();
+                    let clear_inner = completion_inner.clone();
                     let clear_pid = project_id_owned.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -452,15 +529,13 @@ impl CodeGraphManager {
                         }
                     });
 
-                    // Persist registry.
-                    if let Err(err) = Self::save_registry_inner(&inner).await {
+                    if let Err(err) = Self::save_registry_inner(&completion_inner).await {
                         tracing::warn!(%err, "failed to save registry after indexing");
                     }
 
-                    // Start file watcher if enabled.
                     if config.real_time_watching {
                         Self::spawn_watcher_with_worker(
-                            inner.clone(),
+                            completion_inner.clone(),
                             project_id_owned.clone(),
                             root_path,
                             db,
@@ -477,7 +552,7 @@ impl CodeGraphManager {
                         "pipeline failed"
                     );
 
-                    let mut reg = inner.registry.write().await;
+                    let mut reg = completion_inner.registry.write().await;
                     if let Some(project) = reg.get_mut(&project_id_owned) {
                         project.status = IndexStatus::Error;
                         project.error_message = Some(error_msg);
@@ -485,8 +560,7 @@ impl CodeGraphManager {
                         project.updated_at = chrono::Utc::now();
                     }
 
-                    // Persist so the error survives a restart.
-                    if let Err(e) = Self::save_registry_inner(&inner).await {
+                    if let Err(e) = Self::save_registry_inner(&completion_inner).await {
                         tracing::warn!(%e, "failed to save registry after pipeline error");
                     }
                 }
@@ -494,6 +568,14 @@ impl CodeGraphManager {
         });
 
         Ok(())
+    }
+
+    /// Lightweight clone of the manager for use inside spawned tasks.
+    /// Avoids requiring `CodeGraphManager: Clone` at the public API.
+    fn clone_for_spawn(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Remove a project and cascade-delete all its data.

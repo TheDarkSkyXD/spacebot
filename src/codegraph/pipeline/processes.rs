@@ -38,15 +38,18 @@ const ENTRY_PATTERNS: &[&str] = &[
 ///
 /// The score is a weighted blend of:
 /// - Name pattern match (+2.0) or exact `main` (+10.0)
+/// - Route / tool handler (+5.0) — the authoritative "this is an
+///   entry point" signal, produced one phase earlier by route detection
 /// - Degree ratio `out / (in + 1)` capped at 5.0 (stay cheap for hubs)
 /// - `ln(1 + reach)` × 1.5 — rewards functions whose transitive call
 ///   chains touch many symbols (log so we don't let one massive hub
 ///   dominate every slot)
 /// - `community_span` × 1.5 — rewards functions whose chain crosses
-///   module boundaries, which is the strongest signal of "this is a
-///   real entry into a feature"
+///   module boundaries, the strongest signal of "this is a real entry
+///   into a feature"
 fn entry_score(
     name: &str,
+    is_route_or_tool_handler: bool,
     out_degree: usize,
     in_degree: usize,
     reach: usize,
@@ -55,7 +58,6 @@ fn entry_score(
     let name_lower = name.to_lowercase();
     let mut score = 0.0;
 
-    // Name pattern bonus
     for pattern in ENTRY_PATTERNS {
         if name_lower.contains(pattern) {
             score += 2.0;
@@ -63,18 +65,17 @@ fn entry_score(
         }
     }
 
-    // Call ratio: high out-degree + low in-degree → likely entry point
+    if is_route_or_tool_handler {
+        score += 5.0;
+    }
+
     let ratio = (out_degree as f64 + 1.0) / (in_degree as f64 + 1.0);
     score += ratio.min(5.0);
 
-    // Reach: log-damped so a single hub doesn't fill the top-N slots.
     score += ((reach as f64) + 1.0).ln() * 1.5;
 
-    // Community span: every extra module the chain touches is worth a
-    // full ranking unit.
     score += community_span as f64 * 1.5;
 
-    // Bonus for "main" specifically
     if name_lower == "main" {
         score += 10.0;
     }
@@ -209,6 +210,26 @@ pub async fn trace_processes(
         }
     }
 
+    // 2c. Query HANDLES_ROUTE / HANDLES_TOOL sources — the
+    //     authoritative "this function is an entry point" signal emitted
+    //     by the routes phase. A function that serves an HTTP endpoint
+    //     or an MCP tool is an entry point regardless of its name or
+    //     file location, so this directly boosts its score.
+    let mut route_or_tool: HashSet<String> = HashSet::new();
+    let handler_rows = db
+        .query(&format!(
+            "MATCH (n)-[r:CodeRelation]->() \
+             WHERE (r.type = 'HANDLES_ROUTE' OR r.type = 'HANDLES_TOOL') \
+             AND n.project_id = '{pid}' \
+             RETURN n.qualified_name"
+        ))
+        .await?;
+    for row in &handler_rows {
+        if let Some(lbug::Value::String(qname)) = row.first() {
+            route_or_tool.insert(qname.clone());
+        }
+    }
+
     // 3. Score all nodes for entry-point likelihood.
     let mut scored: Vec<(String, f64)> = Vec::new();
     for (qname, (name, _)) in &name_map {
@@ -218,7 +239,7 @@ pub async fn trace_processes(
             continue; // Must call something to be an entry point
         }
         let (reach, span) = reach_and_span(qname, &forward, &community_of, max_depth);
-        let score = entry_score(name, od, id, reach, span);
+        let score = entry_score(name, route_or_tool.contains(qname), od, id, reach, span);
         scored.push((qname.clone(), score));
     }
 
@@ -230,7 +251,9 @@ pub async fn trace_processes(
     let mut edge_stmts: Vec<String> = Vec::new();
     let mut processes_traced = 0u64;
 
-    for (idx, (entry_qname, _score)) in scored.iter().enumerate() {
+    let max_score = scored.first().map(|(_, s)| *s).unwrap_or(1.0);
+
+    for (idx, (entry_qname, score)) in scored.iter().enumerate() {
         let (entry_name, entry_sf) = match name_map.get(entry_qname) {
             Some(v) => v,
             None => continue,
@@ -260,7 +283,6 @@ pub async fn trace_processes(
             }
         }
 
-        // Require minimum steps for a meaningful process
         if trace.len() < config.min_process_steps as usize {
             continue;
         }
@@ -270,19 +292,41 @@ pub async fn trace_processes(
         let entry_name_escaped = cypher_escape(entry_name);
         let entry_sf_escaped = cypher_escape(entry_sf);
 
-        // Get terminal node name
-        let terminal_name = trace.last()
-            .and_then(|qn| name_map.get(qn))
+        let terminal_qname = trace.last().cloned().unwrap_or_default();
+        let terminal_name = name_map.get(&terminal_qname)
             .map(|(n, _)| n.as_str())
             .unwrap_or("?");
+        let terminal_escaped = cypher_escape(&terminal_qname);
         let proc_label = format!("{entry_name} -> {terminal_name}");
         let proc_label_escaped = cypher_escape(&proc_label);
+
+        // Collect distinct communities touched by this trace
+        let mut trace_communities: Vec<String> = Vec::new();
+        {
+            let mut seen_comms: HashSet<String> = HashSet::new();
+            for step_qn in &trace {
+                if let Some(c) = community_of.get(step_qn)
+                    && seen_comms.insert(c.clone())
+                {
+                    trace_communities.push(c.clone());
+                }
+            }
+        }
+        let process_type = if trace_communities.len() <= 1 {
+            "intra_community"
+        } else {
+            "cross_community"
+        };
+        let communities_csv = cypher_escape(&trace_communities.join(","));
+        let entry_point_score = if max_score > 0.0 { score / max_score } else { 0.0 };
 
         node_stmts.push(format!(
             "CREATE (:Process {{qualified_name: '{proc_qname_escaped}', \
              name: '{proc_label_escaped}', project_id: '{pid}', \
              entry_function: '{entry_name_escaped}', source_file: '{entry_sf_escaped}', \
-             call_depth: {depth}, source: 'pipeline'}})",
+             call_depth: {depth}, process_type: '{process_type}', \
+             communities: '{communities_csv}', entry_point_score: {entry_point_score}, \
+             terminal_id: '{terminal_escaped}', source: 'pipeline'}})",
             depth = trace.len(),
         ));
 

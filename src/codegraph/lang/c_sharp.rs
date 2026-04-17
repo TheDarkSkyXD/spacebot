@@ -179,6 +179,7 @@ fn walk_csharp_node(
                     implements: Vec::new(),
                     decorates: None,
                     metadata,
+                    ..Default::default()
                 });
             }
         }
@@ -186,7 +187,7 @@ fn walk_csharp_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 let qn = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Namespace, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Namespace, &node, source));
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
                     for child in body.children(cursor) {
@@ -208,6 +209,8 @@ fn walk_csharp_node(
                 let name = text(name_node, source);
                 let qn = qname(file_path, parent_name, &name);
                 let (extends, implements) = collect_bases(node, source);
+                let (vis, is_static, is_abstract, is_readonly, is_sealed, annotations) =
+                    extract_csharp_modifiers(node, source.as_bytes());
                 symbols.push(ExtractedSymbol {
                     name: name.clone(),
                     qualified_name: qn.clone(),
@@ -220,6 +223,14 @@ fn walk_csharp_node(
                     implements,
                     decorates: None,
                     metadata: std::collections::HashMap::new(),
+                    is_exported: vis.as_deref() == Some("public"),
+                    visibility: vis,
+                    is_static,
+                    is_abstract,
+                    is_readonly,
+                    is_final: is_sealed,
+                    annotations,
+                    ..Default::default()
                 });
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
@@ -234,7 +245,7 @@ fn walk_csharp_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 let qn = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Struct, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Struct, &node, source));
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
                     for child in body.children(cursor) {
@@ -248,7 +259,7 @@ fn walk_csharp_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 let qn = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Record, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Record, &node, source));
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
                     for child in body.children(cursor) {
@@ -262,7 +273,7 @@ fn walk_csharp_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 let qn = qname(file_path, parent_name, &name);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Interface, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Interface, &node, source));
                 if let Some(body) = node.child_by_field_name("body") {
                     let cursor = &mut body.walk();
                     for child in body.children(cursor) {
@@ -275,13 +286,13 @@ fn walk_csharp_node(
         "enum_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Enum, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Enum, &node, source));
             }
         }
         "delegate_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
-                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Function, &node));
+                symbols.push(sym(file_path, parent_name, &name, NodeLabel::Function, &node, source));
             }
         }
         "method_declaration" | "constructor_declaration" | "destructor_declaration" => {
@@ -290,7 +301,7 @@ fn walk_csharp_node(
                 if !name.is_empty() {
                     let method_qname = qname(file_path, parent_name, &name);
                     let mut method_sym =
-                        sym(file_path, parent_name, &name, NodeLabel::Method, &node);
+                        sym(file_path, parent_name, &name, NodeLabel::Method, &node, source);
                     // Only `method_declaration` carries a `returns` field;
                     // constructors and destructors have an implicit void
                     // return that offers no useful type information.
@@ -334,7 +345,7 @@ fn walk_csharp_node(
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = text(name_node, source);
                 if !name.is_empty() {
-                    let mut var_sym = sym(file_path, parent_name, &name, NodeLabel::Variable, &node);
+                    let mut var_sym = sym(file_path, parent_name, &name, NodeLabel::Variable, &node, source);
                     if !declared_type.is_empty() {
                         var_sym
                             .metadata
@@ -379,7 +390,7 @@ fn collect_field_names(
     {
         let name = text(n, source);
         if !name.is_empty() {
-            let mut var_sym = sym(file_path, parent_name, &name, NodeLabel::Variable, &node);
+            let mut var_sym = sym(file_path, parent_name, &name, NodeLabel::Variable, &node, source);
             if !declared_type.is_empty() {
                 var_sym
                     .metadata
@@ -438,6 +449,7 @@ fn collect_csharp_params(
             implements: Vec::new(),
             decorates: None,
             metadata,
+            ..Default::default()
         });
     }
 }
@@ -927,7 +939,10 @@ fn sym(
     name: &str,
     label: NodeLabel,
     node: &tree_sitter::Node,
+    source: &str,
 ) -> ExtractedSymbol {
+    let (vis, is_static, is_abstract, is_readonly, is_sealed, annotations) =
+        extract_csharp_modifiers(*node, source.as_bytes());
     ExtractedSymbol {
         name: name.to_string(),
         qualified_name: qname(file_path, parent, name),
@@ -940,7 +955,66 @@ fn sym(
         implements: Vec::new(),
         decorates: None,
         metadata: std::collections::HashMap::new(),
+        is_exported: vis.as_deref() == Some("public"),
+        visibility: vis,
+        is_static,
+        is_abstract,
+        is_readonly,
+        is_final: is_sealed,
+        annotations,
+        ..Default::default()
     }
+}
+
+/// Extract C# modifier info from a declaration node.
+#[cfg(feature = "codegraph")]
+fn extract_csharp_modifiers(
+    node: tree_sitter::Node,
+    source: &[u8],
+) -> (Option<String>, bool, bool, bool, bool, Option<String>) {
+    let mut vis = None;
+    let mut is_static = false;
+    let mut is_abstract = false;
+    let mut is_readonly = false;
+    let mut is_sealed = false;
+    let mut anno_names: Vec<String> = Vec::new();
+
+    let cursor = &mut node.walk();
+    for child in node.children(cursor) {
+        let kind = child.kind();
+        if kind == "modifier" {
+            let raw = child.utf8_text(source).unwrap_or("");
+            match raw {
+                "public" => vis = Some("public".to_string()),
+                "private" => vis = Some("private".to_string()),
+                "protected" => vis = Some("protected".to_string()),
+                "internal" => vis = Some("internal".to_string()),
+                "static" => is_static = true,
+                "abstract" => is_abstract = true,
+                "readonly" => is_readonly = true,
+                "sealed" => is_sealed = true,
+                _ => {}
+            }
+        } else if kind == "attribute_list" {
+            let attr_cursor = &mut child.walk();
+            for attr in child.children(attr_cursor) {
+                if attr.kind() == "attribute"
+                    && let Some(name_node) = attr.child_by_field_name("name")
+                {
+                    let aname = name_node.utf8_text(source).unwrap_or("").to_string();
+                    if !aname.is_empty() {
+                        anno_names.push(aname);
+                    }
+                }
+            }
+        }
+    }
+    let annotations = if anno_names.is_empty() {
+        None
+    } else {
+        Some(anno_names.join(","))
+    };
+    (vis, is_static, is_abstract, is_readonly, is_sealed, annotations)
 }
 
 fn extract_fallback(file_path: &str, content: &str) -> Vec<ExtractedSymbol> {
@@ -991,5 +1065,6 @@ fn fallback_sym(file_path: &str, name: &str, label: NodeLabel, line: u32) -> Ext
         implements: Vec::new(),
         decorates: None,
         metadata: std::collections::HashMap::new(),
+        ..Default::default()
     }
 }

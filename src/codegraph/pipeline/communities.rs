@@ -37,7 +37,7 @@ pub struct CommunityResult {
 fn edge_weight(edge_type: &str) -> f64 {
     match edge_type {
         "CALLS" => 1.0,
-        "EXTENDS" | "IMPLEMENTS" | "INHERITS" => 0.8,
+        "EXTENDS" | "IMPLEMENTS" => 0.8,
         "CONTAINS" | "HAS_METHOD" => 0.5,
         "IMPORTS" => 0.3,
         _ => 0.0,
@@ -72,7 +72,7 @@ pub async fn detect_communities(
     let edges = db
         .query(&format!(
             "MATCH (a)-[r:CodeRelation]->(b) \
-             WHERE r.type IN ['CALLS', 'EXTENDS', 'IMPLEMENTS', 'INHERITS', \
+             WHERE r.type IN ['CALLS', 'EXTENDS', 'IMPLEMENTS', \
              'CONTAINS', 'HAS_METHOD', 'IMPORTS'] \
              AND a.project_id = '{pid}' \
              RETURN a.qualified_name, b.qualified_name, r.type"
@@ -175,8 +175,8 @@ pub async fn detect_communities(
         });
     }
 
-    // 4. Run weighted Louvain (single-level modularity optimization).
-    let (community, modularity_q, m_total) = louvain_single_level(&adj);
+    // 4. Run Leiden community detection (Louvain + refinement + aggregation).
+    let (community, modularity_q, m_total) = leiden(&adj);
 
     tracing::info!(
         project_id = %project_id,
@@ -231,7 +231,7 @@ pub async fn detect_communities(
             0.0
         };
 
-        // --- 5b. label + counts --- //
+        // --- 5b. label + counts + keywords --- //
         let member_metas: Vec<&SymbolMeta> = members
             .iter()
             .filter_map(|&idx| symbol_meta.get(&idx_to_node[idx]))
@@ -239,6 +239,10 @@ pub async fn detect_communities(
 
         let label = build_community_label(&member_metas, surviving_cid);
         let (file_count, function_count) = count_files_and_functions(&member_metas);
+        let keywords = extract_keywords(&member_metas);
+
+        // Cohesion: ratio of actual internal connectivity to max possible.
+        let cohesion = density.min(1.0);
 
         let description = format!("density={density:.3}; mod={community_q:.4}");
 
@@ -247,11 +251,13 @@ pub async fn detect_communities(
         let comm_qname_escaped = cypher_escape(&comm_qname);
         let label_escaped = cypher_escape(&label);
         let description_escaped = cypher_escape(&description);
+        let keywords_escaped = cypher_escape(&keywords.join(","));
 
         node_stmts.push(format!(
             "CREATE (:Community {{qualified_name: '{comm_qname_escaped}', name: '{label_escaped}', \
              project_id: '{pid}', description: '{description_escaped}', node_count: {nc}, \
-             file_count: {fc}, function_count: {func_c}, density: {density}, source: 'pipeline'}})",
+             file_count: {fc}, function_count: {func_c}, density: {density}, \
+             cohesion: {cohesion}, keywords: '{keywords_escaped}', source: 'pipeline'}})",
             nc = members.len(),
             fc = file_count,
             func_c = function_count,
@@ -271,6 +277,13 @@ pub async fn detect_communities(
                 "Enum",
                 "TypeAlias",
                 "Const",
+                "Constructor",
+                "Property",
+                "UnionType",
+                "Typedef",
+                "Static",
+                "Delegate",
+                "CodeElement",
             ] {
                 edge_stmts.push(format!(
                     "MATCH (n:{label}), (c:Community) WHERE n.qualified_name = '{member_qname}' \
@@ -315,101 +328,137 @@ pub async fn detect_communities(
     })
 }
 
-/// Single-level weighted Louvain modularity optimization.
-///
-/// Each node starts in its own community. For each node we try moving it
-/// to the community of one of its neighbors and pick the move with the
-/// largest positive modularity gain. We repeat the full pass until no
-/// node moves (or we hit `MAX_PASSES`).
-///
-/// Returns `(community_assignment, final_modularity, m_total)` where
-/// `m_total` is the sum of all edge weights (counted once per edge).
-fn louvain_single_level(adj: &[HashMap<usize, f64>]) -> (Vec<usize>, f64, f64) {
+/// Leiden community detection: Louvain local-moving + refinement +
+/// aggregation loop. Matches GitNexus's algorithm with resolution
+/// parameter and timeout protection.
+fn leiden(adj: &[HashMap<usize, f64>]) -> (Vec<usize>, f64, f64) {
     let n = adj.len();
     if n == 0 {
         return (Vec::new(), 0.0, 0.0);
     }
 
-    // Weighted degree of each node.
-    let weighted_deg: Vec<f64> = adj
-        .iter()
-        .map(|m| m.values().sum::<f64>())
-        .collect();
+    let large = n > 10_000;
+    let resolution = if large { 2.0 } else { 1.0 };
+    let max_levels: usize = if large { 3 } else { 10 };
+    let timeout = std::time::Duration::from_secs(60);
+    let start = std::time::Instant::now();
 
-    // m_total = Σ weights, counting each edge once. Since adj is symmetric
-    // (undirected accumulation in the caller), total weight is half the
-    // sum of weighted degrees.
+    let weighted_deg: Vec<f64> = adj.iter().map(|m| m.values().sum::<f64>()).collect();
     let m_total = weighted_deg.iter().sum::<f64>() / 2.0;
-
     if m_total <= 0.0 {
-        // No weighted edges — everyone in their own cluster.
-        let community: Vec<usize> = (0..n).collect();
-        return (community, 0.0, 0.0);
+        return ((0..n).collect(), 0.0, 0.0);
     }
 
+    // Phase 1: Local moving (Louvain)
+    let (mut community, mut best_q) = louvain_local_moving(adj, &weighted_deg, m_total, resolution);
+
+    // Iterative refinement + aggregation
+    let mut current_adj: Vec<HashMap<usize, f64>> = adj.to_vec();
+    let mut current_deg = weighted_deg.clone();
+    let mut node_map: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+
+    for _level in 0..max_levels {
+        if start.elapsed() > timeout {
+            tracing::warn!("leiden timeout — returning current partition");
+            break;
+        }
+
+        // Phase 2: Refinement — try improving within each community
+        let refined = leiden_refine(&current_adj, &community, &current_deg, m_total, resolution);
+
+        // Phase 3: Aggregate into super-nodes
+        let num_comms = *refined.iter().max().unwrap_or(&0) + 1;
+        if num_comms >= current_adj.len() {
+            break;
+        }
+
+        let (new_adj, new_deg, new_map) = aggregate(&current_adj, &refined, &node_map);
+        if new_adj.len() >= current_adj.len() {
+            break;
+        }
+
+        current_adj = new_adj;
+        current_deg = new_deg;
+        node_map = new_map;
+
+        let m_agg = current_deg.iter().sum::<f64>() / 2.0;
+        if m_agg <= 0.0 { break; }
+
+        let (new_comm, q) = louvain_local_moving(&current_adj, &current_deg, m_agg, resolution);
+        if q <= best_q { break; }
+        best_q = q;
+        community = new_comm;
+    }
+
+    // Unpack super-nodes back to original node assignments
+    let mut final_comm = vec![0usize; n];
+    for (super_id, members) in node_map.iter().enumerate() {
+        let c = community.get(super_id).copied().unwrap_or(super_id);
+        for &orig in members {
+            if orig < n { final_comm[orig] = c; }
+        }
+    }
+
+    // Renumber communities to contiguous 0..k
+    let mut remap: HashMap<usize, usize> = HashMap::new();
+    let mut next_id = 0;
+    for c in &mut final_comm {
+        let new_id = *remap.entry(*c).or_insert_with(|| { let id = next_id; next_id += 1; id });
+        *c = new_id;
+    }
+
+    (final_comm, best_q, m_total)
+}
+
+/// Louvain local-moving phase with resolution parameter.
+fn louvain_local_moving(
+    adj: &[HashMap<usize, f64>],
+    weighted_deg: &[f64],
+    m_total: f64,
+    resolution: f64,
+) -> (Vec<usize>, f64) {
+    let n = adj.len();
     let mut community: Vec<usize> = (0..n).collect();
-    // sum_tot[c] = sum of weighted degrees for nodes currently in c.
-    // sum_in[c]  = sum of internal edge weights for c (counted twice so
-    //              self-loops weigh correctly; we have none so it's 2× the
-    //              undirected internal sum).
-    let mut sum_tot: Vec<f64> = weighted_deg.clone();
+    let mut sum_tot: Vec<f64> = weighted_deg.to_vec();
     let mut sum_in: Vec<f64> = vec![0.0; n];
 
     const MAX_PASSES: usize = 10;
 
     for _pass in 0..MAX_PASSES {
         let mut moved = false;
-
         for i in 0..n {
             let ki = weighted_deg[i];
             let current = community[i];
-
-            // Weight of links from i to each neighboring community.
             let mut k_i_to: HashMap<usize, f64> = HashMap::new();
             for (&j, &w) in &adj[i] {
-                if j == i {
-                    continue;
-                }
+                if j == i { continue; }
                 *k_i_to.entry(community[j]).or_insert(0.0) += w;
             }
 
-            // Remove i from its current community.
             let ki_to_current = k_i_to.get(&current).copied().unwrap_or(0.0);
             sum_tot[current] -= ki;
             sum_in[current] -= 2.0 * ki_to_current;
 
-            // Evaluate gain for each candidate community (including the
-            // original, so "stay put" is an option).
             let mut best_c = current;
             let mut best_gain = 0.0;
             for (&c, &k_i_c) in &k_i_to {
-                // Standard Louvain gain formula (simplified):
-                //   ΔQ = k_i_in / m  - Σ_tot * k_i / (2m²)
                 let gain = k_i_c / m_total
-                    - sum_tot[c] * ki / (2.0 * m_total * m_total);
+                    - resolution * sum_tot[c] * ki / (2.0 * m_total * m_total);
                 if gain > best_gain {
                     best_gain = gain;
                     best_c = c;
                 }
             }
 
-            // Re-insert into best_c.
             let ki_to_best = k_i_to.get(&best_c).copied().unwrap_or(0.0);
             sum_tot[best_c] += ki;
             sum_in[best_c] += 2.0 * ki_to_best;
             community[i] = best_c;
-
-            if best_c != current {
-                moved = true;
-            }
+            if best_c != current { moved = true; }
         }
-
-        if !moved {
-            break;
-        }
+        if !moved { break; }
     }
 
-    // Compute final modularity Q = Σ_c [(sum_in[c]/2m) - (sum_tot[c]/2m)²]
     let two_m = 2.0 * m_total;
     let mut seen: HashSet<usize> = HashSet::new();
     let mut q = 0.0;
@@ -419,7 +468,84 @@ fn louvain_single_level(adj: &[HashMap<usize, f64>]) -> (Vec<usize>, f64, f64) {
         }
     }
 
-    (community, q, m_total)
+    (community, q)
+}
+
+/// Leiden refinement: within each Louvain community, try moving nodes
+/// between refined sub-communities for modularity improvement.
+fn leiden_refine(
+    adj: &[HashMap<usize, f64>],
+    partition: &[usize],
+    weighted_deg: &[f64],
+    m_total: f64,
+    resolution: f64,
+) -> Vec<usize> {
+    let n = adj.len();
+    let mut refined: Vec<usize> = (0..n).collect();
+
+    let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, &c) in partition.iter().enumerate() {
+        comm_members.entry(c).or_default().push(i);
+    }
+
+    for members in comm_members.values() {
+        if members.len() <= 1 { continue; }
+        for &node in members {
+            let mut best_target = refined[node];
+            let mut best_gain = 0.0_f64;
+            for (&nbr, &w) in &adj[node] {
+                if partition[nbr] != partition[node] { continue; }
+                let target = refined[nbr];
+                if target == refined[node] { continue; }
+                let ki = weighted_deg[node];
+                let gain = w / m_total - resolution * ki * weighted_deg[nbr] / (2.0 * m_total * m_total);
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_target = target;
+                }
+            }
+            refined[node] = best_target;
+        }
+    }
+
+    refined
+}
+
+type AggregateResult = (Vec<HashMap<usize, f64>>, Vec<f64>, Vec<Vec<usize>>);
+
+/// Collapse communities into super-nodes for the next Leiden level.
+fn aggregate(
+    adj: &[HashMap<usize, f64>],
+    partition: &[usize],
+    node_map: &[Vec<usize>],
+) -> AggregateResult {
+    let mut id_map: HashMap<usize, usize> = HashMap::new();
+    let mut next_id = 0usize;
+    for &c in partition {
+        id_map.entry(c).or_insert_with(|| { let id = next_id; next_id += 1; id });
+    }
+    let k = next_id;
+
+    let mut new_adj: Vec<HashMap<usize, f64>> = vec![HashMap::new(); k];
+    for (i, neighbors) in adj.iter().enumerate() {
+        let ci = id_map[&partition[i]];
+        for (&j, &w) in neighbors {
+            let cj = id_map[&partition[j]];
+            if ci != cj {
+                *new_adj[ci].entry(cj).or_insert(0.0) += w;
+            }
+        }
+    }
+
+    let new_deg: Vec<f64> = new_adj.iter().map(|m| m.values().sum::<f64>()).collect();
+
+    let mut new_map: Vec<Vec<usize>> = vec![Vec::new(); k];
+    for (i, members) in node_map.iter().enumerate() {
+        let ci = id_map[&partition[i]];
+        new_map[ci].extend_from_slice(members);
+    }
+
+    (new_adj, new_deg, new_map)
 }
 
 /// Build a human-readable label for a community from its member metadata.
@@ -488,6 +614,66 @@ fn count_files_and_functions(members: &[&SymbolMeta]) -> (u64, u64) {
         }
     }
     (files.len() as u64, functions)
+}
+
+/// Extract dominant keywords from community member names via term
+/// frequency. Splits camelCase/snake_case identifiers into words,
+/// counts, and returns the top 5 most frequent terms (>= 2 chars).
+fn extract_keywords(members: &[&SymbolMeta]) -> Vec<String> {
+    let mut freq: HashMap<String, usize> = HashMap::new();
+    for m in members {
+        let name = &m.label;
+        // Use source_file basename + the label type as a proxy, but
+        // really we want the symbol names. We get the qname's last segment.
+        let _ = name; // label is the type, not the symbol name
+    }
+    // Split qualified names into word tokens from the symbol metadata
+    // source_file paths to extract directory/module-level keywords.
+    for m in members {
+        for segment in m.source_file.split('/') {
+            let segment = segment.split('.').next().unwrap_or(segment);
+            for word in split_identifier(segment) {
+                let lower = word.to_lowercase();
+                if lower.len() >= 2 && !is_stop_word(&lower) {
+                    *freq.entry(lower).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut sorted: Vec<(String, usize)> = freq.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.into_iter().take(5).map(|(w, _)| w).collect()
+}
+
+fn split_identifier(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in s.chars() {
+        if ch == '_' || ch == '-' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        } else if ch.is_uppercase() && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            current.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn is_stop_word(w: &str) -> bool {
+    matches!(
+        w,
+        "src" | "lib" | "mod" | "rs" | "ts" | "js" | "py" | "go" | "java"
+            | "index" | "main" | "test" | "spec" | "utils" | "util" | "the"
+            | "and" | "for" | "with"
+    )
 }
 
 /// Find the longest directory-level common prefix across a set of

@@ -40,7 +40,7 @@ async fn retry_remove_db(path: &Path) -> bool {
         }
         let is_file = tokio::fs::metadata(path)
             .await
-            .map_or(false, |m| m.is_file());
+            .is_ok_and(|m| m.is_file());
 
         let result = if is_file {
             let r = tokio::fs::remove_file(path).await;
@@ -112,7 +112,7 @@ impl CodeGraphDb {
         if db_path.exists() {
             let is_dir = tokio::fs::metadata(&db_path)
                 .await
-                .map_or(false, |m| m.is_dir());
+                .is_ok_and(|m| m.is_dir());
 
             if is_dir {
                 let is_empty_or_corrupt = match tokio::fs::read_dir(&db_path).await {
