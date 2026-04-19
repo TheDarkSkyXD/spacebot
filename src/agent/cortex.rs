@@ -337,9 +337,21 @@ impl BulletinRefreshOutcome {
 
 fn maybe_spawn_synthesis_task(
     task: &mut Option<tokio::task::JoinHandle<anyhow::Result<bool>>>,
+    backoff: &SynthesisTaskBackoff,
+    task_name: &'static str,
+    now: Instant,
     spawn: impl FnOnce() -> tokio::task::JoinHandle<anyhow::Result<bool>>,
 ) -> bool {
     if task.is_some() {
+        return false;
+    }
+
+    if !backoff.can_spawn(now) {
+        tracing::debug!(
+            task = task_name,
+            failure_count = backoff.failure_count,
+            "cortex synthesis task scheduling skipped during backoff"
+        );
         return false;
     }
 
@@ -368,9 +380,53 @@ fn mark_knowledge_synthesis_version_complete(
     last_version.store(target_version, std::sync::atomic::Ordering::Release);
 }
 
+const SYNTHESIS_TASK_BACKOFF_INITIAL_SECS: u64 = 30;
+const SYNTHESIS_TASK_BACKOFF_MAX_SECS: u64 = 5 * 60;
+
+#[derive(Debug, Clone)]
+struct SynthesisTaskBackoff {
+    failure_count: u32,
+    next_allowed_instant: Instant,
+}
+
+impl SynthesisTaskBackoff {
+    fn new(now: Instant) -> Self {
+        Self {
+            failure_count: 0,
+            next_allowed_instant: now,
+        }
+    }
+
+    fn can_spawn(&self, now: Instant) -> bool {
+        now >= self.next_allowed_instant
+    }
+
+    fn record_success(&mut self, now: Instant) {
+        self.failure_count = 0;
+        self.next_allowed_instant = now;
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.failure_count = self.failure_count.saturating_add(1);
+        self.next_allowed_instant = now + synthesis_task_backoff_delay(self.failure_count);
+    }
+}
+
+fn synthesis_task_backoff_delay(failure_count: u32) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(10);
+    let multiplier = 1_u64 << exponent;
+    let seconds = SYNTHESIS_TASK_BACKOFF_INITIAL_SECS
+        .saturating_mul(multiplier)
+        .min(SYNTHESIS_TASK_BACKOFF_MAX_SECS);
+
+    Duration::from_secs(seconds)
+}
+
 async fn collect_synthesis_task(
     task: &mut Option<tokio::task::JoinHandle<anyhow::Result<bool>>>,
     task_name: &'static str,
+    backoff: &mut SynthesisTaskBackoff,
+    now: Instant,
 ) {
     let Some(handle) = task.as_ref() else {
         return;
@@ -385,16 +441,50 @@ async fn collect_synthesis_task(
     };
 
     match handle.await {
-        Ok(Ok(true)) => tracing::debug!(task = task_name, "cortex synthesis task completed"),
-        Ok(Ok(false)) => tracing::trace!(task = task_name, "cortex synthesis task skipped"),
-        Ok(Err(error)) => tracing::warn!(%error, task = task_name, "cortex synthesis task failed"),
+        Ok(Ok(true)) => {
+            backoff.record_success(now);
+            tracing::debug!(task = task_name, "cortex synthesis task completed");
+        }
+        Ok(Ok(false)) => {
+            backoff.record_success(now);
+            tracing::trace!(task = task_name, "cortex synthesis task skipped");
+        }
+        Ok(Err(error)) => {
+            backoff.record_failure(now);
+            tracing::warn!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task failed"
+            );
+        }
         Err(error) if error.is_cancelled() => {
-            tracing::debug!(%error, task = task_name, "cortex synthesis task cancelled");
+            backoff.record_failure(now);
+            tracing::debug!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task cancelled"
+            );
         }
         Err(error) if error.is_panic() => {
-            tracing::warn!(%error, task = task_name, "cortex synthesis task panicked");
+            backoff.record_failure(now);
+            tracing::warn!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task panicked"
+            );
         }
-        Err(error) => tracing::warn!(%error, task = task_name, "cortex synthesis task failed"),
+        Err(error) => {
+            backoff.record_failure(now);
+            tracing::warn!(
+                %error,
+                task = task_name,
+                failure_count = backoff.failure_count,
+                "cortex synthesis task failed"
+            );
+        }
     }
 }
 
@@ -1926,6 +2016,8 @@ async fn run_cortex_loop(
     let mut last_maintenance = Instant::now();
     let mut intraday_synthesis_task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
     let mut daily_synthesis_task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+    let mut intraday_synthesis_backoff = SynthesisTaskBackoff::new(Instant::now());
+    let mut daily_synthesis_backoff = SynthesisTaskBackoff::new(Instant::now());
 
     loop {
         tokio::select! {
@@ -2015,8 +2107,20 @@ async fn run_cortex_loop(
                 let cortex_config = **cortex.deps.runtime_config.cortex.load();
                 let now = Instant::now();
 
-                collect_synthesis_task(&mut intraday_synthesis_task, "intraday").await;
-                collect_synthesis_task(&mut daily_synthesis_task, "daily").await;
+                collect_synthesis_task(
+                    &mut intraday_synthesis_task,
+                    "intraday",
+                    &mut intraday_synthesis_backoff,
+                    now,
+                )
+                .await;
+                collect_synthesis_task(
+                    &mut daily_synthesis_task,
+                    "daily",
+                    &mut daily_synthesis_backoff,
+                    now,
+                )
+                .await;
 
                 if refresh_task
                     .as_ref()
@@ -2310,13 +2414,21 @@ async fn run_cortex_loop(
                     last_maintenance = Instant::now();
                 }
 
-                maybe_spawn_synthesis_task(&mut intraday_synthesis_task, || {
-                    spawn_intraday_synthesis_task(cortex.deps.clone(), logger.clone())
-                });
+                maybe_spawn_synthesis_task(
+                    &mut intraday_synthesis_task,
+                    &intraday_synthesis_backoff,
+                    "intraday",
+                    now,
+                    || spawn_intraday_synthesis_task(cortex.deps.clone(), logger.clone()),
+                );
 
-                maybe_spawn_synthesis_task(&mut daily_synthesis_task, || {
-                    spawn_daily_synthesis_task(cortex.deps.clone(), logger.clone())
-                });
+                maybe_spawn_synthesis_task(
+                    &mut daily_synthesis_task,
+                    &daily_synthesis_backoff,
+                    "daily",
+                    now,
+                    || spawn_daily_synthesis_task(cortex.deps.clone(), logger.clone()),
+                );
 
                 // Working memory: prune old events (cheap SQL, runs every tick but deletes nothing most of the time).
                 let wm_config = **cortex.deps.runtime_config.working_memory.load();
@@ -4440,15 +4552,16 @@ mod tests {
         BULLETIN_REFRESH_CIRCUIT_OPEN_SECS, BULLETIN_REFRESH_CIRCUIT_OPEN_THRESHOLD, BranchTracker,
         BulletinRefreshOutcome, CortexReceiverOutcome, GatheredSections, HealthRuntimeState,
         MAINTENANCE_TASK_CANCEL_GRACE_SECS, MaintenanceTimeoutAction, ReceiverClosedBehavior,
-        Signal, WorkerTracker, apply_cancelled_warmup_status, build_kill_targets,
-        claim_detached_completion, detached_timeout_transition, handle_cortex_receiver_result,
-        has_completed_initial_warmup, is_cancelled_control_result, is_terminal_control_result,
-        maintenance_task_timeout, maintenance_timeout_action,
-        mark_knowledge_synthesis_version_complete, maybe_close_bulletin_refresh_circuit,
-        maybe_generate_bulletin_under_lock, maybe_spawn_synthesis_task,
-        parse_structured_success_flag, push_signal_into_buffer, record_bulletin_refresh_failure,
-        should_execute_warmup, should_generate_bulletin_from_bulletin_loop, signal_from_event,
-        summarize_signal_text, take_lagged_control_flag,
+        Signal, SynthesisTaskBackoff, WorkerTracker, apply_cancelled_warmup_status,
+        build_kill_targets, claim_detached_completion, collect_synthesis_task,
+        detached_timeout_transition, handle_cortex_receiver_result, has_completed_initial_warmup,
+        is_cancelled_control_result, is_terminal_control_result, maintenance_task_timeout,
+        maintenance_timeout_action, mark_knowledge_synthesis_version_complete,
+        maybe_close_bulletin_refresh_circuit, maybe_generate_bulletin_under_lock,
+        maybe_spawn_synthesis_task, parse_structured_success_flag, push_signal_into_buffer,
+        record_bulletin_refresh_failure, should_execute_warmup,
+        should_generate_bulletin_from_bulletin_loop, signal_from_event, summarize_signal_text,
+        take_lagged_control_flag,
     };
     use crate::ProcessEvent;
     use crate::agent::process_control::ControlActionResult;
@@ -4662,29 +4775,43 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
         let mut task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+        let now = Instant::now();
+        let backoff = SynthesisTaskBackoff::new(now);
 
         let calls_for_first = Arc::clone(&calls);
         let release_rx_for_first = Arc::clone(&release_rx);
-        assert!(maybe_spawn_synthesis_task(&mut task, move || {
-            tokio::spawn(async move {
-                calls_for_first.fetch_add(1, Ordering::SeqCst);
-                let receiver = release_rx_for_first
-                    .lock()
-                    .await
-                    .take()
-                    .expect("release receiver should exist");
-                let _ = receiver.await;
-                Ok(true)
-            })
-        }));
+        assert!(maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            now,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_first.fetch_add(1, Ordering::SeqCst);
+                    let receiver = release_rx_for_first
+                        .lock()
+                        .await
+                        .take()
+                        .expect("release receiver should exist");
+                    receiver.await.expect("release oneshot dropped");
+                    Ok(true)
+                })
+            }
+        ));
 
         let calls_for_second = Arc::clone(&calls);
-        assert!(!maybe_spawn_synthesis_task(&mut task, move || {
-            tokio::spawn(async move {
-                calls_for_second.fetch_add(1, Ordering::SeqCst);
-                Ok(true)
-            })
-        }));
+        assert!(!maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            now,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_second.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        ));
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while calls.load(Ordering::SeqCst) == 0 {
@@ -4700,6 +4827,88 @@ mod tests {
             .await
             .expect("task should join")
             .expect("task should succeed");
+    }
+
+    #[tokio::test]
+    async fn synthesis_task_failure_backs_off_before_respawn() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let mut backoff = SynthesisTaskBackoff::new(now);
+        let mut task: Option<tokio::task::JoinHandle<anyhow::Result<bool>>> = None;
+
+        let calls_for_first = Arc::clone(&calls);
+        assert!(maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            now,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_first.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!("backend unavailable"))
+                })
+            }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed synthesis task should finish");
+        collect_synthesis_task(&mut task, "intraday", &mut backoff, now).await;
+
+        assert!(task.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backoff.failure_count, 1);
+
+        let retry_at = backoff.next_allowed_instant;
+        let blocked_at = retry_at
+            .checked_sub(Duration::from_millis(1))
+            .expect("retry instant should be after current instant");
+        let calls_for_blocked = Arc::clone(&calls);
+        assert!(!maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            blocked_at,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_blocked.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let calls_for_retry = Arc::clone(&calls);
+        assert!(maybe_spawn_synthesis_task(
+            &mut task,
+            &backoff,
+            "intraday",
+            retry_at,
+            move || {
+                tokio::spawn(async move {
+                    calls_for_retry.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                })
+            }
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while task.as_ref().is_some_and(|handle| !handle.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry synthesis task should finish");
+        collect_synthesis_task(&mut task, "intraday", &mut backoff, retry_at).await;
+
+        assert!(task.is_none());
+        assert_eq!(backoff.failure_count, 0);
+        assert_eq!(backoff.next_allowed_instant, retry_at);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
