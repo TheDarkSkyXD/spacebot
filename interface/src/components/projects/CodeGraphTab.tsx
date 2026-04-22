@@ -11,13 +11,15 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/api/client";
+import { api, type CodeGraphProjectDetailResponse, type CodeGraphProjectListResponse } from "@/api/client";
 import { CodeGraphSearchBar } from "./codegraph/CodeGraphSearchBar";
 import { CodeGraphSidebar } from "./codegraph/CodeGraphSidebar";
 import { GraphCanvas, type GraphCanvasHandle } from "./codegraph/GraphCanvas";
 import { CodeInspectorPanel } from "./codegraph/CodeInspectorPanel";
 import { CodeGraphStatusBar } from "./codegraph/CodeGraphStatusBar";
 import { MermaidView } from "./codegraph/MermaidView";
+import { MermaidRightPanel } from "./codegraph/MermaidRightPanel";
+import { buildFileGraph } from "./codegraph/mermaidGraphBuilder";
 import { buildGraph } from "./codegraph/graphAdapter";
 import {
 	DEFAULT_VISIBLE_LABELS,
@@ -30,14 +32,37 @@ import { nodeKey } from "./codegraph/graphAdapter";
 
 export function CodeGraphTab({ projectId }: { projectId: string }) {
 	const [selectedNode, setSelectedNode] = useState<BulkNode | null>(null);
-	const [visibleLabels, setVisibleLabels] = useState<NodeLabel[]>(DEFAULT_VISIBLE_LABELS);
-	const [visibleEdgeTypes, setVisibleEdgeTypes] = useState<EdgeType[]>(DEFAULT_VISIBLE_EDGES);
+	const [visibleLabels, setVisibleLabels] = useState<NodeLabel[]>(() => {
+		try {
+			const saved = localStorage.getItem("spacebot.codegraph.visibleLabels");
+			return saved ? JSON.parse(saved) : DEFAULT_VISIBLE_LABELS;
+		} catch { return DEFAULT_VISIBLE_LABELS; }
+	});
+	const [visibleEdgeTypes, setVisibleEdgeTypes] = useState<EdgeType[]>(() => {
+		try {
+			const saved = localStorage.getItem("spacebot.codegraph.visibleEdgeTypes");
+			return saved ? JSON.parse(saved) : DEFAULT_VISIBLE_EDGES;
+		} catch { return DEFAULT_VISIBLE_EDGES; }
+	});
 	const [depthFilter, setDepthFilter] = useState<number | null>(null);
 	const [isLayoutRunning, setIsLayoutRunning] = useState(false);
-	const [layoutMode, setLayoutMode] = useState<import("./codegraph/graphAdapter").LayoutMode>("force");
+	const [layoutMode, setLayoutMode] = useState<import("./codegraph/graphAdapter").LayoutMode>(() => {
+		try {
+			const saved = localStorage.getItem("spacebot.codegraph.layoutMode");
+			return (saved as import("./codegraph/graphAdapter").LayoutMode) || "force";
+		} catch { return "force"; }
+	});
 	const [colorOverrides, setColorOverrides] = useState<Record<string, string>>(() => {
 		try {
 			const saved = localStorage.getItem("spacebot.codegraph.colorOverrides");
+			return saved ? JSON.parse(saved) : {};
+		} catch {
+			return {};
+		}
+	});
+	const [edgeColorOverrides, setEdgeColorOverrides] = useState<Record<string, string>>(() => {
+		try {
+			const saved = localStorage.getItem("spacebot.codegraph.edgeColorOverrides");
 			return saved ? JSON.parse(saved) : {};
 		} catch {
 			return {};
@@ -59,9 +84,28 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 		});
 	}, []);
 
+	const handleEdgeColorChange = useCallback((edge: EdgeType, color: string | null) => {
+		setEdgeColorOverrides((prev) => {
+			const next = { ...prev };
+			if (color === null) {
+				delete next[edge];
+			} else {
+				next[edge] = color;
+			}
+			try {
+				localStorage.setItem("spacebot.codegraph.edgeColorOverrides", JSON.stringify(next));
+			} catch { /* ignore */ }
+			return next;
+		});
+	}, []);
+
 	const canvasRef = useRef<GraphCanvasHandle>(null);
 	const queryClient = useQueryClient();
 	const [isUpdating, setIsUpdating] = useState(false);
+	// Mermaid view routes the right rail through MermaidRightPanel by default.
+	// When the user clicks "View source" on the NodeInfoCard, this flag opens
+	// the existing CodeInspectorPanel as a third column on top of it.
+	const [showInspector, setShowInspector] = useState(false);
 
 	// Subscribe to SSE for real-time graph updates. When files change in
 	// the project, the watcher fires GraphStale → incremental pipeline →
@@ -76,14 +120,12 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 				}
 				if (event.type === "code_graph_changed" && event.project_id === projectId) {
 					setIsUpdating(false);
-					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-nodes", projectId] });
-					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-edges", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["codegraph-graph-stream", projectId] });
 					queryClient.invalidateQueries({ queryKey: ["codegraph-project", projectId] });
 				}
 				if (event.type === "code_graph_indexed" && event.project_id === projectId) {
 					setIsUpdating(false);
-					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-nodes", projectId] });
-					queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-edges", projectId] });
+					queryClient.invalidateQueries({ queryKey: ["codegraph-graph-stream", projectId] });
 					queryClient.invalidateQueries({ queryKey: ["codegraph-project", projectId] });
 				}
 			} catch { /* ignore parse errors */ }
@@ -104,32 +146,59 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 	const prevStatusRef = useRef<string | undefined>(undefined);
 	useEffect(() => {
 		if (prevStatusRef.current === "indexing" && projectStatus === "indexed") {
-			queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-nodes", projectId] });
-			queryClient.invalidateQueries({ queryKey: ["codegraph-bulk-edges", projectId] });
+			queryClient.invalidateQueries({ queryKey: ["codegraph-graph-stream", projectId] });
 		}
 		prevStatusRef.current = projectStatus;
 	}, [projectStatus, projectId, queryClient]);
 
-	// Load the full graph in two parallel requests. Edges wait for nodes
-	// to resolve first so the server-side node-set matches.
-	const nodesQuery = useQuery({
-		queryKey: ["codegraph-bulk-nodes", projectId],
-		queryFn: () => api.codegraphBulkNodes(projectId),
+	// Persist filter state to localStorage so it survives tab switches
+	// and project changes.
+	useEffect(() => {
+		try { localStorage.setItem("spacebot.codegraph.visibleLabels", JSON.stringify(visibleLabels)); } catch { /* ignore */ }
+	}, [visibleLabels]);
+	useEffect(() => {
+		try { localStorage.setItem("spacebot.codegraph.visibleEdgeTypes", JSON.stringify(visibleEdgeTypes)); } catch { /* ignore */ }
+	}, [visibleEdgeTypes]);
+	useEffect(() => {
+		try { localStorage.setItem("spacebot.codegraph.layoutMode", layoutMode); } catch { /* ignore */ }
+	}, [layoutMode]);
+
+	// Totals for the loading-progress percentage. Fetched in parallel with
+	// the stream so the loading UI can show a real % rather than an
+	// indeterminate bar.
+	const statsQuery = useQuery({
+		queryKey: ["codegraph-stats-totals", projectId],
+		queryFn: () => api.codegraphStats(projectId),
+		enabled: projectStatus === "indexed" || projectStatus === "stale",
+		staleTime: 60_000,
+	});
+
+	const [loadProgress, setLoadProgress] = useState<{
+		phase: "nodes" | "edges";
+		nodesLoaded: number;
+		edgesLoaded: number;
+	} | null>(null);
+
+	// Load the full graph in a single NDJSON stream — nodes then edges are
+	// delivered row-by-row from the Kuzu cursor, so huge graphs land
+	// without crashing the backend. Aborts on unmount via the signal.
+	// Reset progress to 0 at the start of every fetch so the bar doesn't
+	// carry over from a previous load (navigation, reindex, refetch).
+	const graphQuery = useQuery({
+		queryKey: ["codegraph-graph-stream", projectId],
+		queryFn: ({ signal }) => {
+			setLoadProgress(null);
+			return api.codegraphGraphStream(projectId, signal, (p) => {
+				setLoadProgress(p);
+			});
+		},
 		staleTime: 60_000,
 		enabled: projectStatus === "indexed" || projectStatus === "stale",
+		retry: 1,
 	});
 
-	const edgesQuery = useQuery({
-		queryKey: ["codegraph-bulk-edges", projectId],
-		queryFn: () => api.codegraphBulkEdges(projectId),
-		enabled: !!nodesQuery.data,
-		staleTime: 60_000,
-	});
-
-	const nodes = nodesQuery.data?.nodes ?? [];
-	const edges = edgesQuery.data?.edges ?? [];
-	const truncated = nodesQuery.data?.truncated ?? false;
-	const totalAvailable = nodesQuery.data?.total_available ?? 0;
+	const nodes = graphQuery.data?.nodes ?? [];
+	const edges = graphQuery.data?.edges ?? [];
 
 	// Indexed lookup for O(1) selection resolution. Keyed by the composite
 	// graphology key (label:id) since LadybugDB IDs are per-table.
@@ -139,11 +208,22 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 		return map;
 	}, [nodes]);
 
-	// Build the graphology graph once both payloads land.
+	// Build the graphology graph once the payload lands. Skipped in mermaid
+	// mode because GraphCanvas isn't mounted — building it for large projects
+	// (10k+ nodes) was a visible hit on the first mermaid render.
 	const graph = useMemo(() => {
-		if (!nodesQuery.data || !edgesQuery.data) return null;
-		return buildGraph(nodes, edges, colorOverrides);
-	}, [nodesQuery.data, edgesQuery.data, nodes, edges]);
+		if (!graphQuery.data) return null;
+		if (layoutMode === "mermaid") return null;
+		return buildGraph(nodes, edges, colorOverrides, edgeColorOverrides);
+	}, [graphQuery.data, layoutMode, nodes, edges, colorOverrides, edgeColorOverrides]);
+
+	// Parallel file-only graph powering the mermaid view and its right panel.
+	// Cheap to compute (O(nodes+edges)) but memoized so the React Flow layout
+	// stays stable across re-renders.
+	const fileGraph = useMemo(() => {
+		if (layoutMode !== "mermaid" || !graphQuery.data) return null;
+		return buildFileGraph(nodes, edges);
+	}, [layoutMode, graphQuery.data, nodes, edges]);
 
 	const handleToggleLabel = (label: NodeLabel) => {
 		setVisibleLabels((prev) =>
@@ -164,8 +244,36 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 
 	const reindexMutation = useMutation({
 		mutationFn: () => api.codegraphReindex(projectId),
-		onSuccess: () => {
+		onMutate: async () => {
+			const detailKey = ["codegraph-project", projectId];
+			const listKey = ["codegraph-projects"];
+			await Promise.all([
+				queryClient.cancelQueries({ queryKey: detailKey }),
+				queryClient.cancelQueries({ queryKey: listKey }),
+			]);
+			const prevDetail = queryClient.getQueryData<CodeGraphProjectDetailResponse>(detailKey);
+			const prevList = queryClient.getQueryData<CodeGraphProjectListResponse>(listKey);
+			if (prevDetail) {
+				queryClient.setQueryData<CodeGraphProjectDetailResponse>(detailKey, {
+					project: { ...prevDetail.project, status: "indexing" },
+				});
+			}
+			if (prevList) {
+				queryClient.setQueryData<CodeGraphProjectListResponse>(listKey, {
+					projects: prevList.projects.map((p) =>
+						p.project_id === projectId ? { ...p, status: "indexing" } : p,
+					),
+				});
+			}
+			return { prevDetail, prevList };
+		},
+		onError: (_err, _vars, ctx) => {
+			if (ctx?.prevDetail) queryClient.setQueryData(["codegraph-project", projectId], ctx.prevDetail);
+			if (ctx?.prevList) queryClient.setQueryData(["codegraph-projects"], ctx.prevList);
+		},
+		onSettled: () => {
 			queryClient.invalidateQueries({ queryKey: ["codegraph-project", projectId] });
+			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
 		},
 	});
 
@@ -201,7 +309,7 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 		);
 	}
 
-	if (nodesQuery.isError || edgesQuery.isError) {
+	if (graphQuery.isError) {
 		return (
 			<div className="flex h-full w-full flex-1 flex-col items-center justify-center gap-3 bg-app">
 				<div className="h-3 w-3 rounded-full bg-red-500" />
@@ -211,24 +319,39 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 		);
 	}
 
-	// Loading state — fetching nodes and edges.
-	if (nodesQuery.isLoading || edgesQuery.isLoading || !graph) {
-		const nodesPct = nodesQuery.data ? 50 : 0;
-		const edgesPct = edgesQuery.data ? 100 : nodesPct;
+	// Loading state — streaming nodes + edges in a single NDJSON request.
+	// Progress bar is the combined (nodes + edges) ratio so it advances
+	// continuously from 0→100% without resetting when the phase flips.
+	const viewReady = layoutMode === "mermaid" ? !!fileGraph : !!graph;
+	if (graphQuery.isLoading || !viewReady) {
+		const totalNodes = statsQuery.data?.total_nodes;
+		const totalEdges = statsQuery.data?.total_edges;
+		const loadedNodes = loadProgress?.nodesLoaded ?? 0;
+		const loadedEdges = loadProgress?.edgesLoaded ?? 0;
+		const hasTotals = totalNodes !== undefined && totalEdges !== undefined;
+		const loadedCombined = loadedNodes + loadedEdges;
+		const totalCombined = hasTotals ? totalNodes! + totalEdges! : 0;
+		const pct = hasTotals && totalCombined > 0
+			? Math.min(100, Math.round((loadedCombined / totalCombined) * 100))
+			: null;
+		const phaseLabel = loadProgress?.phase === "edges" ? "Loading edges" : "Loading nodes";
+		const phaseLoaded = loadProgress?.phase === "edges" ? loadedEdges : loadedNodes;
+		const phaseTotal = loadProgress?.phase === "edges" ? totalEdges : totalNodes;
+		const detail = phaseTotal !== undefined
+			? `${phaseLabel}... ${phaseLoaded.toLocaleString()} / ${phaseTotal.toLocaleString()}${pct !== null ? ` (${pct}%)` : ""}`
+			: `${phaseLabel}... ${phaseLoaded.toLocaleString()}`;
 		return (
 			<div className="flex h-full w-full flex-1 flex-col items-center justify-center gap-4 bg-app">
-				<div className="h-8 w-8 animate-spin rounded-full border-2 border-accent/30 border-t-accent" />
 				<p className="text-lg font-semibold text-ink">Loading Code Graph</p>
-				<p className="text-sm text-ink-dull">
-					{!nodesQuery.data ? "Fetching nodes..." : !edgesQuery.data ? "Fetching edges..." : "Building graph..."}
-				</p>
+				<p className="text-sm text-ink-dull">{detail}</p>
 				<div className="mt-2 h-1.5 w-64 overflow-hidden rounded-full bg-app-line">
-					<div
-						className="h-full rounded-full bg-accent transition-all duration-500"
-						style={{ width: `${Math.max(2, edgesPct)}%` }}
-					/>
+					{pct !== null && (
+						<div
+							className="h-full rounded-full bg-accent transition-all duration-200"
+							style={{ width: `${pct}%` }}
+						/>
+					)}
 				</div>
-				<p className="text-xs text-ink-faint">{edgesPct}%</p>
 			</div>
 		);
 	}
@@ -239,8 +362,6 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 				nodes={nodes}
 				nodeCount={nodes.length}
 				edgeCount={edges.length}
-				truncated={truncated}
-				totalAvailable={totalAvailable}
 				onSelectNode={handleSelectAndFocus}
 				onReindex={() => reindexMutation.mutate()}
 				isReindexing={reindexMutation.isPending}
@@ -264,11 +385,21 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 					onChangeDepthFilter={setDepthFilter}
 					colorOverrides={colorOverrides}
 					onColorChange={handleColorChange}
+					edgeColorOverrides={edgeColorOverrides}
+					onEdgeColorChange={handleEdgeColorChange}
 				/>
 
 				<div className="relative min-w-0 flex-1">
-					{layoutMode === "mermaid" ? (
-						<MermaidView nodes={nodes} edges={edges} />
+					{layoutMode === "mermaid" && fileGraph ? (
+						<MermaidView
+							projectId={projectId}
+							graph={fileGraph}
+							selectedNode={selectedNode}
+							onSelectFile={(file) => {
+								setSelectedNode(file);
+								if (!file) setShowInspector(false);
+							}}
+						/>
 					) : (
 						<GraphCanvas
 							ref={canvasRef}
@@ -286,11 +417,35 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 					)}
 				</div>
 
-				{selectedNode && (
+				{layoutMode === "mermaid" && fileGraph && (
+					<MermaidRightPanel
+						projectName={projectQuery.data?.project.name ?? "Project"}
+						graph={fileGraph}
+						allNodes={nodes}
+						allEdges={edges}
+						selectedNode={selectedNode}
+						onSelectFile={(file) => {
+							setSelectedNode(file);
+							if (!file) setShowInspector(false);
+						}}
+						onRequestSource={() => setShowInspector(true)}
+					/>
+				)}
+
+				{selectedNode && layoutMode !== "mermaid" && (
 					<CodeInspectorPanel
 						projectId={projectId}
 						selectedNode={selectedNode}
 						onClose={() => setSelectedNode(null)}
+						colorOverrides={colorOverrides}
+					/>
+				)}
+
+				{layoutMode === "mermaid" && showInspector && selectedNode && (
+					<CodeInspectorPanel
+						projectId={projectId}
+						selectedNode={selectedNode}
+						onClose={() => setShowInspector(false)}
 						colorOverrides={colorOverrides}
 					/>
 				)}
@@ -301,7 +456,6 @@ export function CodeGraphTab({ projectId }: { projectId: string }) {
 				edgeCount={edges.length}
 				isLayoutRunning={isLayoutRunning}
 				isUpdating={isUpdating}
-				truncated={truncated}
 			/>
 		</div>
 	);

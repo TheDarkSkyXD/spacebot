@@ -28,6 +28,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import type { IconSvgElement } from "@hugeicons/react";
 import * as Popover from "@radix-ui/react-popover";
+import { NodeColorPicker } from "./NodeColorPicker";
 import {
 	NODE_COLORS,
 	FILTERABLE_LABELS,
@@ -56,7 +57,7 @@ const NODE_TYPE_ICONS: Record<string, IconSvgElement> = {
 
 const getNodeTypeIcon = (label: NodeLabel): IconSvgElement =>
 	NODE_TYPE_ICONS[label] ?? CodeIcon;
-import { getNodeColor } from "./graphAdapter";
+import { getNodeColor, getEdgeColor } from "./graphAdapter";
 import type { BulkNode } from "./types";
 import { GraphStatsView } from "../GraphStatsView";
 
@@ -248,6 +249,8 @@ interface Props {
 	onChangeDepthFilter: (depth: number | null) => void;
 	colorOverrides: Record<string, string>;
 	onColorChange: (label: NodeLabel, color: string | null) => void;
+	edgeColorOverrides: Record<string, string>;
+	onEdgeColorChange: (edge: EdgeType, color: string | null) => void;
 }
 
 export function CodeGraphSidebar({
@@ -264,6 +267,8 @@ export function CodeGraphSidebar({
 	onChangeDepthFilter,
 	colorOverrides,
 	onColorChange,
+	edgeColorOverrides,
+	onEdgeColorChange,
 }: Props) {
 	const [isCollapsed, setIsCollapsed] = useState(false);
 	const [activeTab, setActiveTab] = useState<"files" | "filters">("files");
@@ -530,17 +535,17 @@ export function CodeGraphSidebar({
 					</Section>
 
 					{/* Edge type toggles */}
-					<Section title="Edge Types" subtitle="Toggle relationship visibility">
+					<Section title="Edge Types" subtitle="Click color to change, click name to toggle">
 						<div className="flex flex-col gap-1">
 							{ALL_EDGE_TYPES.map((edge) => {
 								const info = EDGE_INFO[edge];
 								const isVisible = visibleEdgeTypes.includes(edge);
+								const color = getEdgeColor(edge, edgeColorOverrides);
 								return (
-									<button
+									<div
 										key={edge}
-										onClick={() => onToggleEdge(edge)}
 										className={clsx(
-											"flex items-center gap-2.5 rounded px-2 py-1.5 text-left transition-colors",
+											"group flex items-center gap-2.5 rounded px-2 py-1.5 transition-colors",
 											isVisible
 												? "bg-app text-ink"
 												: "text-ink-faint hover:bg-app-hover hover:text-ink-dull",
@@ -548,19 +553,52 @@ export function CodeGraphSidebar({
 									>
 										<div
 											className={clsx(
-												"h-1.5 w-6 rounded-full",
+												"h-1.5 w-6 rounded-full shrink-0",
 												!isVisible && "opacity-40",
 											)}
-											style={{ backgroundColor: info.color }}
+											style={{ backgroundColor: color }}
 										/>
-										<span className="flex-1 text-xs">{info.label}</span>
+										<button
+											className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
+											onClick={() => onToggleEdge(edge)}
+										>
+											<span className="flex-1 text-left text-xs">{info.label}</span>
+										</button>
+
+										<Popover.Root>
+											<Popover.Trigger asChild>
+												<button
+													className="shrink-0 rounded p-0.5 text-ink-faint/0 transition-all group-hover:text-ink-faint hover:!text-ink hover:!bg-app-hover"
+													title="Change edge color"
+												>
+													<svg viewBox="0 0 16 16" fill="currentColor" className="h-3.5 w-3.5">
+														<path d="M13.4 1.6a2.1 2.1 0 0 0-3 0L3.3 8.7a1 1 0 0 0-.2.4l-1 3.5a.5.5 0 0 0 .6.6l3.5-1a1 1 0 0 0 .4-.2l7.1-7.1a2.1 2.1 0 0 0 0-3ZM11 3.2l1.8 1.8-5.7 5.7-2.3.6.6-2.3Z"/>
+													</svg>
+												</button>
+											</Popover.Trigger>
+											<Popover.Portal>
+												<Popover.Content
+													side="right"
+													sideOffset={8}
+													className="z-50 rounded-lg border border-app-line bg-app-darkBox p-2 shadow-xl"
+												>
+													<NodeColorPicker
+														currentColor={color}
+														defaultColor={info.color}
+														onSelect={(c) => onEdgeColorChange(edge, c)}
+														onReset={() => onEdgeColorChange(edge, null)}
+													/>
+												</Popover.Content>
+											</Popover.Portal>
+										</Popover.Root>
+
 										<div
 											className={clsx(
-												"h-2 w-2 rounded-full transition-colors",
+												"h-2 w-2 shrink-0 rounded-full transition-colors",
 												isVisible ? "bg-accent" : "bg-app-line",
 											)}
 										/>
-									</button>
+									</div>
 								);
 							})}
 						</div>
@@ -609,78 +647,6 @@ export function CodeGraphSidebar({
 					</Section>
 				</div>
 			)}
-		</div>
-	);
-}
-
-// ---------------------------------------------------------------------------
-// Color picker popover content
-// ---------------------------------------------------------------------------
-
-const COLOR_PRESETS = [
-	"#ef4444", "#f97316", "#eab308", "#22c55e",
-	"#06b6d4", "#3b82f6", "#8b5cf6", "#d946ef",
-	"#ec4899", "#f43f5e", "#14b8a6", "#84cc16",
-	"#64748b", "#e2e8f0", "#a78bfa", "#fb923c",
-];
-
-function NodeColorPicker({
-	currentColor,
-	defaultColor,
-	onSelect,
-	onReset,
-}: {
-	currentColor: string;
-	defaultColor: string;
-	onSelect: (color: string) => void;
-	onReset: () => void;
-}) {
-	const isCustom = currentColor !== defaultColor;
-	return (
-		<div className="flex flex-col gap-2">
-			<div className="grid grid-cols-4 gap-1.5">
-				{COLOR_PRESETS.map((c) => (
-					<Popover.Close asChild key={c}>
-						<button
-							onClick={() => onSelect(c)}
-							className={clsx(
-								"h-6 w-6 rounded-full border-2 transition-transform hover:scale-110",
-								c.toLowerCase() === currentColor.toLowerCase()
-									? "border-white scale-110"
-									: "border-transparent",
-							)}
-							style={{ backgroundColor: c }}
-							title={c}
-						/>
-					</Popover.Close>
-				))}
-			</div>
-			<div className="flex items-center gap-2 border-t border-app-line pt-2">
-				<label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-ink-faint">
-					Custom
-					<input
-						type="color"
-						defaultValue={currentColor}
-						ref={(el) => {
-							if (!el) return;
-							// Use the native change event (fires once on picker close)
-							// instead of React's onChange which fires on every drag.
-							el.onchange = () => onSelect(el.value);
-						}}
-						className="h-5 w-5 cursor-pointer rounded border-0 bg-transparent p-0"
-					/>
-				</label>
-				{isCustom && (
-					<Popover.Close asChild>
-						<button
-							onClick={onReset}
-							className="ml-auto rounded px-2 py-0.5 text-[10px] text-ink-faint transition-colors hover:bg-app-hover hover:text-ink"
-						>
-							Reset
-						</button>
-					</Popover.Close>
-				)}
-			</div>
 		</div>
 	);
 }
