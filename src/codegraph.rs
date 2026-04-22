@@ -12,6 +12,7 @@ pub mod events;
 pub mod eviction;
 pub mod graph_queries;
 pub mod lang;
+pub mod langmap;
 pub mod manager;
 pub mod pipeline;
 pub mod schema;
