@@ -141,10 +141,19 @@ async fn watch_loop(
             // Receive file events.
             Some(event) = notify_rx.recv() => {
                 for path in &event.paths {
-                    // Only track source files.
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                        && super::lang::language_for_extension(ext).is_some()
+                    // Skip directories — only track file changes.
+                    if !path.is_file() {
+                        continue;
+                    }
+                    // Skip hidden files (dotfiles).
+                    if path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with('.'))
                     {
+                        continue;
+                    }
+                    // Skip build artifacts, binary files, etc.
+                    if !super::pipeline::walker::is_build_artifact(path) {
                         pending_changes.insert(path.clone());
                     }
                 }

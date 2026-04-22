@@ -15,7 +15,7 @@ use super::db::{CodeGraphDb, SharedCodeGraphDb, reset_project_db};
 use super::events::CodeGraphEvent;
 use super::pipeline;
 use super::pipeline::incremental;
-use super::types::{CodeGraphConfig, IndexStatus, RegisteredProject};
+use super::types::{CodeGraphConfig, IndexStatus, LanguageCount, RegisteredProject};
 use super::watcher::{self, ChangeBatch, WatcherHandle};
 
 /// Broadcast capacity for code graph events.
@@ -140,77 +140,68 @@ impl CodeGraphManager {
         Ok(())
     }
 
-    /// Detect the primary language(s) of a project by querying File nodes
-    /// and counting extensions. Returns a human-readable string like
-    /// "Rust, TypeScript" or `None` if no files were indexed.
-    async fn detect_languages(
-        db: &super::db::SharedCodeGraphDb,
-        project_id: &str,
-    ) -> Option<String> {
-        let pid = project_id.replace('\\', "\\\\").replace('\'', "\\'");
-        let rows = db
-            .query(&format!(
-                "MATCH (n:File) WHERE n.project_id = '{pid}' RETURN n.source_file"
-            ))
-            .await
-            .ok()?;
+    /// Walk the project root (respecting `.gitignore` and `.spacebotignore`)
+    /// and bucket files by language. Language names match the GitHub linguist
+    /// display names used in `ozh/github-colors` so the UI can color them
+    /// with a bundled color map. Bytes (not file counts) are summed per
+    /// language so percentages reflect code volume the way GitHub's repo
+    /// bar does — a 400-line Python file outweighs ten 5-line stubs.
+    /// Lockfiles, minified/bundled artifacts, and common vendor/build
+    /// directories are excluded so human-written code dominates the mix.
+    async fn detect_languages(root_path: &std::path::Path) -> Vec<LanguageCount> {
+        let root = root_path.to_path_buf();
+        let counts = tokio::task::spawn_blocking(move || -> std::collections::HashMap<&'static str, u64> {
+            let mut counts: std::collections::HashMap<&'static str, u64> =
+                std::collections::HashMap::new();
 
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for row in &rows {
-            if let Some(lbug::Value::String(path)) = row.first() {
-                let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-                let lang = match ext.as_str() {
-                    "rs" => "Rust",
-                    "ts" | "tsx" => "TypeScript",
-                    "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
-                    "py" | "pyi" => "Python",
-                    "go" => "Go",
-                    "c" | "h" => "C",
-                    "cpp" | "cc" | "cxx" | "hpp" => "C++",
-                    "java" => "Java",
-                    "rb" => "Ruby",
-                    "swift" => "Swift",
-                    "kt" | "kts" => "Kotlin",
-                    "cs" => "C#",
-                    "php" => "PHP",
-                    "scala" => "Scala",
-                    "dart" => "Dart",
-                    "zig" => "Zig",
-                    "ex" | "exs" => "Elixir",
-                    "html" | "htm" => "HTML",
-                    "css" | "scss" | "sass" => "CSS",
-                    "json" => "JSON",
-                    "toml" => "TOML",
-                    "yaml" | "yml" => "YAML",
-                    "md" | "markdown" => "Markdown",
-                    "sql" => "SQL",
-                    "sh" | "bash" | "zsh" => "Shell",
-                    _ => continue,
-                };
-                *counts.entry(lang.to_string()).or_default() += 1;
+            let respect_gitignore = std::env::var_os("SPACEBOT_NO_GITIGNORE").is_none();
+            let mut builder = ignore::WalkBuilder::new(&root);
+            builder
+                .hidden(true)
+                .git_ignore(respect_gitignore)
+                .git_global(respect_gitignore)
+                .git_exclude(respect_gitignore)
+                .follow_links(false);
+            let spacebot_ignore = root.join(".spacebotignore");
+            if spacebot_ignore.is_file() {
+                builder.add_ignore(&spacebot_ignore);
             }
-        }
 
-        if counts.is_empty() {
-            return None;
-        }
+            for entry in builder.build().flatten() {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
+                }
+                let path = entry.path();
+                if is_vendored_or_generated(path) {
+                    continue;
+                }
+                let Some(lang) = super::langmap::language_for_path(path) else {
+                    continue;
+                };
+                if !super::langmap::is_main_language(lang) {
+                    continue;
+                }
+                let bytes = entry
+                    .metadata()
+                    .ok()
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                *counts.entry(lang).or_default() += bytes;
+            }
+            counts
+        })
+        .await
+        .unwrap_or_default();
 
-        // Sort by count descending, take the top 3.
-        let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let top: Vec<String> = sorted
+        let mut sorted: Vec<LanguageCount> = counts
             .into_iter()
-            .take(3)
-            .filter(|(_, count)| *count > 0)
-            .map(|(lang, _)| lang)
+            .map(|(name, count)| LanguageCount {
+                name: name.to_string(),
+                count,
+            })
             .collect();
-
-        if top.is_empty() {
-            None
-        } else {
-            Some(top.join(", "))
-        }
+        sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+        sorted
     }
 
     /// Persist the registry to disk.
@@ -277,6 +268,10 @@ impl CodeGraphManager {
             }
         }
 
+        // Hold the databases write lock across the open so a concurrent
+        // ensure_db for the same project_id can't race us into a second
+        // `lbug::Database::new` on the same path (native SIGSEGV).
+        let mut databases = self.inner.databases.write().await;
         let db = Arc::new(CodeGraphDb::open(&project_id, &self.inner.base_path).await?);
 
         let now = chrono::Utc::now();
@@ -290,6 +285,7 @@ impl CodeGraphManager {
             last_index_stats: None,
             last_indexed_at: None,
             primary_language: None,
+            language_breakdown: Vec::new(),
             schema_version: super::schema::SCHEMA_VERSION,
             indexed_commit: None,
             is_stale: false,
@@ -301,10 +297,8 @@ impl CodeGraphManager {
             let mut registry = self.inner.registry.write().await;
             registry.insert(project_id.clone(), project.clone());
         }
-        {
-            let mut databases = self.inner.databases.write().await;
-            databases.insert(project_id.clone(), db.clone());
-        }
+        databases.insert(project_id.clone(), db.clone());
+        drop(databases);
 
         self.save_registry().await?;
 
@@ -319,9 +313,14 @@ impl CodeGraphManager {
     /// Ensure a database handle exists for a project, opening it if necessary.
     ///
     /// Projects loaded from the persisted registry at startup don't have their
-    /// databases opened until they are actually needed (lazy open).
+    /// databases opened until they are actually needed (lazy open). The write
+    /// lock is held across the entire open so two concurrent requests can't
+    /// both call `lbug::Database::new` on the same path — that's a native
+    /// SIGSEGV with no Rust-side recovery (spawn_blocking can't catch
+    /// segfaults). Opens are rare; briefly blocking other projects' reads
+    /// during one open is acceptable.
     async fn ensure_db(&self, project_id: &str) -> Result<SharedCodeGraphDb> {
-        // Fast path: already open.
+        // Fast path: already open (read lock, concurrent with other reads).
         {
             let databases = self.inner.databases.read().await;
             if let Some(db) = databases.get(project_id) {
@@ -329,7 +328,14 @@ impl CodeGraphManager {
             }
         }
 
-        // Slow path: open the database and insert it.
+        // Slow path: take the write lock for the duration of the open.
+        let mut databases = self.inner.databases.write().await;
+        // Re-check under the write lock — another task may have opened it
+        // while we were waiting to acquire the lock.
+        if let Some(db) = databases.get(project_id) {
+            return Ok(db.clone());
+        }
+
         tracing::info!(project_id = %project_id, "lazy-opening LadybugDB for existing project");
         let db = Arc::new(CodeGraphDb::open(project_id, &self.inner.base_path).await?);
 
@@ -339,12 +345,8 @@ impl CodeGraphManager {
         // (data is lost but a re-index is needed anyway).
         db.ensure_schema().await?;
 
-        let mut databases = self.inner.databases.write().await;
-        // Double-check in case another task opened it concurrently.
-        databases
-            .entry(project_id.to_string())
-            .or_insert(db.clone());
-        Ok(databases.get(project_id).cloned().unwrap())
+        databases.insert(project_id.to_string(), db.clone());
+        Ok(db)
     }
 
     /// Start (or restart) the indexing pipeline for a project.
@@ -494,6 +496,7 @@ impl CodeGraphManager {
         // Spawn completion handler.
         let project_id_owned = project_id.clone();
         let completion_inner = inner.clone();
+        let completion_root = root_path.clone();
 
         tokio::spawn(async move {
             match handle.wait().await {
@@ -505,8 +508,11 @@ impl CodeGraphManager {
                         "pipeline completed successfully"
                     );
 
-                    let primary_language =
-                        Self::detect_languages(&db, &project_id_owned).await;
+                    let language_breakdown =
+                        Self::detect_languages(&completion_root).await;
+                    let primary_language = language_breakdown
+                        .first()
+                        .map(|entry| entry.name.clone());
 
                     {
                         let mut reg = completion_inner.registry.write().await;
@@ -514,6 +520,7 @@ impl CodeGraphManager {
                             project.status = IndexStatus::Indexed;
                             project.error_message = None;
                             project.primary_language = primary_language;
+                            project.language_breakdown = language_breakdown;
                             project.progress = Some(super::types::PipelineProgress {
                                 phase: super::types::PipelinePhase::Complete,
                                 phase_progress: 1.0,
@@ -1066,3 +1073,67 @@ impl std::fmt::Debug for CodeGraphManager {
             .finish_non_exhaustive()
     }
 }
+
+/// Lock files and machine-generated manifests that would dwarf human-written
+/// code in a language breakdown. Matched by exact basename.
+const GENERATED_BASENAMES: &[&str] = &[
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "bun.lock",
+    "Cargo.lock",
+    "Gemfile.lock",
+    "Pipfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "composer.lock",
+    "go.sum",
+    "mix.lock",
+    "flake.lock",
+];
+
+/// Suffixes indicating bundled or minified output. Matched case-insensitively.
+const GENERATED_SUFFIXES: &[&str] = &[
+    ".min.js",
+    ".min.css",
+    ".min.mjs",
+    ".bundle.js",
+    ".bundle.css",
+    ".js.map",
+    ".css.map",
+];
+
+/// Directory names that conventionally hold third-party or build output.
+/// Any file whose path contains one of these as a segment is excluded.
+/// Most repos already `.gitignore` these — this list catches the cases that
+/// slip through (vendored PHP/Go deps, committed build output, etc.).
+const VENDOR_DIR_SEGMENTS: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "dist",
+    "build",
+    "out",
+    "target",
+    "__pycache__",
+];
+
+/// Returns true if the path should be excluded from the language breakdown —
+/// lockfile, minified/bundled output, or inside a known vendor/build dir.
+fn is_vendored_or_generated(path: &std::path::Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        if GENERATED_BASENAMES.iter().any(|&b| b.eq_ignore_ascii_case(name)) {
+            return true;
+        }
+        let lower = name.to_ascii_lowercase();
+        if GENERATED_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+            return true;
+        }
+    }
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| VENDOR_DIR_SEGMENTS.contains(&s))
+    })
+}
+

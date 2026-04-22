@@ -36,6 +36,7 @@ fn val_str_opt(v: Option<&lbug::Value>) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn val_i64(v: Option<&lbug::Value>) -> i64 {
     match v {
         Some(lbug::Value::Int64(n)) => *n,
@@ -44,6 +45,7 @@ fn val_i64(v: Option<&lbug::Value>) -> i64 {
     }
 }
 
+#[allow(dead_code)]
 fn val_f64(v: Option<&lbug::Value>) -> f64 {
     match v {
         Some(lbug::Value::Double(n)) => *n,
@@ -106,23 +108,23 @@ pub async fn symbol_context(
                  RETURN n.qualified_name, n.name, n.source_file, n.line_start"
             ))
             .await;
-        if let Ok(rows) = rows {
-            if let Some(row) = rows.first() {
-                symbol = Some((
-                    SymbolRef {
-                        qualified_name: val_str(row.first()),
-                        name: val_str(row.get(1)),
-                        label: label.to_string(),
-                        source_file: val_str_opt(row.get(2)),
-                        line_start: row.get(3).and_then(|v| match v {
-                            lbug::Value::Int32(n) if *n > 0 => Some(*n as u32),
-                            _ => None,
-                        }),
-                    },
-                    label.to_string(),
-                ));
-                break;
-            }
+        if let Ok(rows) = rows
+            && let Some(row) = rows.first()
+        {
+            symbol = Some((
+                SymbolRef {
+                    qualified_name: val_str(row.first()),
+                    name: val_str(row.get(1)),
+                    label: label.to_string(),
+                    source_file: val_str_opt(row.get(2)),
+                    line_start: row.get(3).and_then(|v| match v {
+                        lbug::Value::Int32(n) if *n > 0 => Some(*n as u32),
+                        _ => None,
+                    }),
+                },
+                label.to_string(),
+            ));
+            break;
         }
     }
 
@@ -264,23 +266,23 @@ pub async fn impact_analysis(
                  RETURN n.qualified_name, n.name, n.source_file, n.line_start"
             ))
             .await;
-        if let Ok(rows) = rows {
-            if let Some(row) = rows.first() {
-                target = Some((
-                    SymbolRef {
-                        qualified_name: val_str(row.first()),
-                        name: val_str(row.get(1)),
-                        label: label.to_string(),
-                        source_file: val_str_opt(row.get(2)),
-                        line_start: row.get(3).and_then(|v| match v {
-                            lbug::Value::Int32(n) if *n > 0 => Some(*n as u32),
-                            _ => None,
-                        }),
-                    },
-                    label.to_string(),
-                ));
-                break;
-            }
+        if let Ok(rows) = rows
+            && let Some(row) = rows.first()
+        {
+            target = Some((
+                SymbolRef {
+                    qualified_name: val_str(row.first()),
+                    name: val_str(row.get(1)),
+                    label: label.to_string(),
+                    source_file: val_str_opt(row.get(2)),
+                    line_start: row.get(3).and_then(|v| match v {
+                        lbug::Value::Int32(n) if *n > 0 => Some(*n as u32),
+                        _ => None,
+                    }),
+                },
+                label.to_string(),
+            ));
+            break;
         }
     }
 
@@ -669,16 +671,16 @@ pub async fn rename_symbol(
     let mut edits: Vec<RenameEdit> = Vec::new();
 
     // 1. Definition location — the symbol itself.
-    if let Some(ref sf) = ctx.symbol.source_file {
-        if let Some(ls) = ctx.symbol.line_start {
-            edits.push(RenameEdit {
-                file_path: sf.clone(),
-                line: ls,
-                old_text: symbol_name.to_string(),
-                new_text: new_name.to_string(),
-                confidence: "graph".to_string(),
-            });
-        }
+    if let Some(ref sf) = ctx.symbol.source_file
+        && let Some(ls) = ctx.symbol.line_start
+    {
+        edits.push(RenameEdit {
+            file_path: sf.clone(),
+            line: ls,
+            old_text: symbol_name.to_string(),
+            new_text: new_name.to_string(),
+            confidence: "graph".to_string(),
+        });
     }
 
     // 2. Graph-based references — all incoming edges that reference this symbol.
@@ -688,44 +690,61 @@ pub async fn rename_symbol(
     }
     for refs in ctx.incoming.values() {
         for r in refs {
-            if let Some(ref sf) = r.source_file {
-                if let Some(ls) = r.line_start {
-                    if graph_files.insert(sf.clone()) || true {
-                        edits.push(RenameEdit {
-                            file_path: sf.clone(),
-                            line: ls,
-                            old_text: symbol_name.to_string(),
-                            new_text: new_name.to_string(),
-                            confidence: "graph".to_string(),
-                        });
-                    }
-                }
+            if let Some(ref sf) = r.source_file
+                && let Some(ls) = r.line_start
+            {
+                graph_files.insert(sf.clone());
+                edits.push(RenameEdit {
+                    file_path: sf.clone(),
+                    line: ls,
+                    old_text: symbol_name.to_string(),
+                    new_text: new_name.to_string(),
+                    confidence: "graph".to_string(),
+                });
             }
         }
     }
 
     let graph_edits = edits.len();
 
-    // 3. Text search — find references the graph missed using grep.
-    let grep_output = std::process::Command::new("grep")
-        .args(["-rn", "--include=*.rs", "--include=*.ts", "--include=*.tsx",
-               "--include=*.js", "--include=*.py", "--include=*.go",
-               "-w", symbol_name])
-        .current_dir(root_path)
-        .output();
-
-    if let Ok(output) = grep_output {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            // Format: "file:line:content"
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() >= 2 {
-                let file = parts[0].to_string();
-                let line_num: u32 = parts[1].parse().unwrap_or(0);
-                if line_num > 0 && !graph_files.contains(&file) {
+    // 3. Text search — find references the graph missed.
+    //    Uses the `ignore` + `regex` crates so this works on all platforms
+    //    (the previous `grep` shell-out failed on Windows).
+    let search_extensions: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "kts",
+        "rb", "swift", "c", "cpp", "h", "hpp", "cs", "php", "dart", "cbl",
+    ];
+    let pattern = regex::Regex::new(&format!(r"\b{}\b", regex::escape(symbol_name)));
+    if let Ok(re) = pattern {
+        let walker = ignore::WalkBuilder::new(root_path)
+            .hidden(true)
+            .git_ignore(true)
+            .build();
+        for entry in walker.flatten() {
+            let path = entry.path();
+            let matches_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| search_extensions.contains(&ext));
+            if !matches_ext || !path.is_file() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root_path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if graph_files.contains(&rel) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            for (line_idx, line) in content.lines().enumerate() {
+                if re.is_match(line) {
                     edits.push(RenameEdit {
-                        file_path: file,
-                        line: line_num,
+                        file_path: rel.clone(),
+                        line: (line_idx + 1) as u32,
                         old_text: symbol_name.to_string(),
                         new_text: new_name.to_string(),
                         confidence: "text_search".to_string(),
@@ -815,10 +834,10 @@ pub async fn route_map(
                     ("*".to_string(), route_name.clone())
                 };
 
-                if let Some(filter) = route_filter {
-                    if !path.contains(filter) {
-                        continue;
-                    }
+                if let Some(filter) = route_filter
+                    && !path.contains(filter)
+                {
+                    continue;
                 }
 
                 routes.push(RouteMapping {
@@ -866,14 +885,13 @@ pub async fn tool_map(
     let pid = esc(project_id);
     let mut tools = Vec::new();
 
-    // HANDLES_TOOL edges are self-loops on Function/Method nodes.
-    // The tool name is stored in r.reason.
+    // HANDLES_TOOL edges go from Function/Method → Tool node.
     for &label in &["Function", "Method"] {
         let rows = db
             .query(&format!(
-                "MATCH (f:{label})-[r:CodeRelation]->(f) \
+                "MATCH (f:{label})-[r:CodeRelation]->(t:Tool) \
                  WHERE f.project_id = '{pid}' AND r.type = 'HANDLES_TOOL' \
-                 RETURN r.reason, f.name, f.source_file, f.line_start"
+                 RETURN t.name, f.name, f.source_file, f.line_start"
             ))
             .await;
         if let Ok(rows) = rows {
@@ -883,10 +901,10 @@ pub async fn tool_map(
                     continue;
                 }
 
-                if let Some(filter) = tool_filter {
-                    if !tool_name.contains(filter) {
-                        continue;
-                    }
+                if let Some(filter) = tool_filter
+                    && !tool_name.contains(filter)
+                {
+                    continue;
                 }
 
                 tools.push(ToolMapping {

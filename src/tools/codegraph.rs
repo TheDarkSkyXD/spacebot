@@ -14,6 +14,24 @@ use serde_json::Value;
 use crate::codegraph::CodeGraphManager;
 use crate::codegraph::tools as cg_tools;
 
+/// Helper to open a project's DB, lazily if needed. Returns a clear
+/// error message so the LLM knows not to retry with the same project.
+async fn open_db(
+    manager: &CodeGraphManager,
+    project_id: &str,
+) -> Result<crate::codegraph::db::SharedCodeGraphDb, String> {
+    manager
+        .get_or_open_db(project_id)
+        .await
+        .map_err(|e| {
+            format!(
+                "Project '{}' not found or its database could not be opened: {}. \
+                 Use codegraph_list_projects to see available projects.",
+                project_id, e
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
 // codegraph_query — search the code graph
 // ---------------------------------------------------------------------------
@@ -53,6 +71,9 @@ pub struct CodeGraphQueryOutput {
     pub success: bool,
     pub results: Vec<Value>,
     pub total: usize,
+    /// Human-readable summary when no results are found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl Tool for CodeGraphQueryTool {
@@ -65,19 +86,15 @@ impl Tool for CodeGraphQueryTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Search the code graph for symbols, functions, classes, and other code entities. Returns ranked results with file locations and context.".to_string(),
+            description: "Search the code graph for symbols, functions, classes, and other code entities. Returns ranked results with file locations and context. If no results are returned, the symbol does not exist in the indexed project — do NOT retry with variations.".to_string(),
             parameters: schemars::schema_for!(CodeGraphQueryArgs).to_value(),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| {
-                CodeGraphQueryError(format!("project '{}' not found", args.project_id))
-            })?;
+            .map_err(CodeGraphQueryError)?;
 
         let limit = args.limit.min(100);
 
@@ -96,10 +113,22 @@ impl Tool for CodeGraphQueryTool {
             .map(|r| serde_json::to_value(r).unwrap_or_default())
             .collect();
 
+        let message = if total == 0 {
+            Some(format!(
+                "No symbols matching '{}' found in project '{}'. \
+                 The symbol may not exist in the indexed codebase. \
+                 Do not retry — report this result to the user.",
+                args.query, args.project_id
+            ))
+        } else {
+            None
+        };
+
         Ok(CodeGraphQueryOutput {
             success: true,
             results: json_results,
             total,
+            message,
         })
     }
 }
@@ -141,7 +170,7 @@ impl Tool for CodeGraphListProjectsTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "List all indexed projects with their status, stats, and available graph data.".to_string(),
+            description: "List all indexed code graph projects with their status, stats, and available graph data.".to_string(),
             parameters: schemars::schema_for!(CodeGraphListProjectsArgs).to_value(),
         }
     }
@@ -206,6 +235,8 @@ pub struct CodeGraphGetFilesOutput {
     pub secondary_files: Vec<String>,
     pub community: Option<String>,
     pub confidence: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl Tool for CodeGraphGetFilesForTaskTool {
@@ -224,15 +255,10 @@ impl Tool for CodeGraphGetFilesForTaskTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| {
-                CodeGraphGetFilesError(format!("project '{}' not found", args.project_id))
-            })?;
+            .map_err(CodeGraphGetFilesError)?;
 
-        // Search for symbols matching the task description.
         let results = crate::codegraph::search::hybrid_search(
             &args.project_id,
             &args.task_description,
@@ -242,7 +268,6 @@ impl Tool for CodeGraphGetFilesForTaskTool {
         .await
         .map_err(|e| CodeGraphGetFilesError(e.to_string()))?;
 
-        // Extract unique file paths from results.
         let primary_files: Vec<String> = results
             .iter()
             .filter_map(|r| r.source_file.clone())
@@ -251,17 +276,25 @@ impl Tool for CodeGraphGetFilesForTaskTool {
             .take(args.max_files)
             .collect();
 
-        // Community from top result.
         let community = results.first().and_then(|r| r.community.clone());
-
-        // Confidence based on top result score.
         let confidence = results.first().map(|r| r.score).unwrap_or(0.0);
+
+        let message = if primary_files.is_empty() {
+            Some(format!(
+                "No files found matching '{}' in project '{}'. \
+                 The task may not match any indexed symbols.",
+                args.task_description, args.project_id
+            ))
+        } else {
+            None
+        };
 
         Ok(CodeGraphGetFilesOutput {
             primary_files,
             secondary_files: Vec::new(),
             community,
             confidence,
+            message,
         })
     }
 }
@@ -310,17 +343,15 @@ impl Tool for CodeGraphContextTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Get a 360-degree view of a code symbol — all callers, callees, inheritance, which processes it participates in, and its file location. Use this to understand how a function/class connects to the rest of the codebase.".to_string(),
+            description: "Get a 360-degree view of a code symbol — all callers, callees, inheritance, which processes it participates in, and its file location. Use this to understand how a function/class connects to the rest of the codebase. If `found` is false, the symbol does not exist — do NOT retry with the same name.".to_string(),
             parameters: schemars::schema_for!(CodeGraphContextArgs).to_value(),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| CodeGraphContextError(format!("project '{}' not found", args.project_id)))?;
+            .map_err(CodeGraphContextError)?;
 
         let result = cg_tools::symbol_context(
             &db,
@@ -338,7 +369,15 @@ impl Tool for CodeGraphContextTool {
             }),
             None => Ok(CodeGraphContextOutput {
                 found: false,
-                context: serde_json::json!({"error": format!("Symbol '{}' not found", args.name)}),
+                context: serde_json::json!({
+                    "error": format!(
+                        "Symbol '{}' not found in project '{}'. \
+                         This is a definitive result — the symbol does not exist \
+                         in the indexed codebase. Do not retry. \
+                         You can use codegraph_query to search for similar symbols.",
+                        args.name, args.project_id
+                    )
+                }),
             }),
         }
     }
@@ -400,17 +439,15 @@ impl Tool for CodeGraphImpactTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Analyze the blast radius of changing a code symbol. Shows what would break at each depth level (d=1: direct callers WILL BREAK, d=2: indirect deps LIKELY AFFECTED, d=3: transitive MAY NEED TESTING), affected execution flows, and risk level (LOW/MEDIUM/HIGH/CRITICAL). Run this BEFORE modifying any function or class.".to_string(),
+            description: "Analyze the blast radius of changing a code symbol. Shows what would break at each depth level (d=1: direct callers WILL BREAK, d=2: indirect deps LIKELY AFFECTED, d=3: transitive MAY NEED TESTING), affected execution flows, and risk level (LOW/MEDIUM/HIGH/CRITICAL). Run this BEFORE modifying any function or class. If `found` is false, the symbol does not exist — do NOT retry.".to_string(),
             parameters: schemars::schema_for!(CodeGraphImpactArgs).to_value(),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| CodeGraphImpactError(format!("project '{}' not found", args.project_id)))?;
+            .map_err(CodeGraphImpactError)?;
 
         let result = cg_tools::impact_analysis(
             &db,
@@ -429,7 +466,14 @@ impl Tool for CodeGraphImpactTool {
             }),
             None => Ok(CodeGraphImpactOutput {
                 found: false,
-                impact: serde_json::json!({"error": format!("Symbol '{}' not found", args.target)}),
+                impact: serde_json::json!({
+                    "error": format!(
+                        "Symbol '{}' not found in project '{}'. \
+                         This is a definitive result — do not retry. \
+                         Use codegraph_query to search for similar symbols.",
+                        args.target, args.project_id
+                    )
+                }),
             }),
         }
     }
@@ -493,13 +537,14 @@ impl Tool for CodeGraphDetectChangesTool {
             .manager
             .get_project(&args.project_id)
             .await
-            .ok_or_else(|| CodeGraphDetectChangesError(format!("project '{}' not found", args.project_id)))?;
+            .ok_or_else(|| CodeGraphDetectChangesError(format!(
+                "Project '{}' not found. Use codegraph_list_projects to see available projects.",
+                args.project_id
+            )))?;
 
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| CodeGraphDetectChangesError("database not available".to_string()))?;
+            .map_err(CodeGraphDetectChangesError)?;
 
         let result = cg_tools::detect_changes(
             &db,
@@ -564,11 +609,9 @@ impl Tool for CodeGraphCypherTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| CodeGraphCypherError(format!("project '{}' not found", args.project_id)))?;
+            .map_err(CodeGraphCypherError)?;
 
         let result = cg_tools::cypher_query(&db, &args.query)
             .await
@@ -633,7 +676,7 @@ impl Tool for CodeGraphRenameTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Rename a code symbol across all files using the knowledge graph + text search. Graph-based edits are high confidence; text_search edits need manual review. Defaults to dry_run=true (preview only). Set dry_run=false to apply the rename.".to_string(),
+            description: "Rename a code symbol across all files using the knowledge graph + text search. Graph-based edits are high confidence; text_search edits need manual review. Defaults to dry_run=true (preview only). Set dry_run=false to apply the rename. If `found` is false, the symbol does not exist — do NOT retry.".to_string(),
             parameters: schemars::schema_for!(CodeGraphRenameArgs).to_value(),
         }
     }
@@ -643,13 +686,14 @@ impl Tool for CodeGraphRenameTool {
             .manager
             .get_project(&args.project_id)
             .await
-            .ok_or_else(|| CodeGraphRenameError(format!("project '{}' not found", args.project_id)))?;
+            .ok_or_else(|| CodeGraphRenameError(format!(
+                "Project '{}' not found. Use codegraph_list_projects to see available projects.",
+                args.project_id
+            )))?;
 
-        let db = self
-            .manager
-            .get_db(&args.project_id)
+        let db = open_db(&self.manager, &args.project_id)
             .await
-            .ok_or_else(|| CodeGraphRenameError("database not available".to_string()))?;
+            .map_err(CodeGraphRenameError)?;
 
         let result = cg_tools::rename_symbol(
             &db,
@@ -670,7 +714,13 @@ impl Tool for CodeGraphRenameTool {
             }),
             None => Ok(CodeGraphRenameOutput {
                 found: false,
-                result: serde_json::json!({"error": format!("Symbol '{}' not found", args.symbol_name)}),
+                result: serde_json::json!({
+                    "error": format!(
+                        "Symbol '{}' not found in project '{}'. \
+                         Cannot rename a symbol that does not exist. Do not retry.",
+                        args.symbol_name, args.project_id
+                    )
+                }),
             }),
         }
     }
@@ -723,11 +773,15 @@ impl Tool for CodeGraphRouteMapTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self.manager.get_db(&args.project_id).await
-            .ok_or_else(|| CodeGraphRouteMapError(format!("project '{}' not found", args.project_id)))?;
-        let result = cg_tools::route_map(&db, &args.project_id, args.route.as_deref()).await
+        let db = open_db(&self.manager, &args.project_id)
+            .await
+            .map_err(CodeGraphRouteMapError)?;
+        let result = cg_tools::route_map(&db, &args.project_id, args.route.as_deref())
+            .await
             .map_err(|e| CodeGraphRouteMapError(e.to_string()))?;
-        Ok(CodeGraphRouteMapOutput { result: serde_json::to_value(result).unwrap_or_default() })
+        Ok(CodeGraphRouteMapOutput {
+            result: serde_json::to_value(result).unwrap_or_default(),
+        })
     }
 }
 
@@ -778,11 +832,15 @@ impl Tool for CodeGraphToolMapTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self.manager.get_db(&args.project_id).await
-            .ok_or_else(|| CodeGraphToolMapError(format!("project '{}' not found", args.project_id)))?;
-        let result = cg_tools::tool_map(&db, &args.project_id, args.tool.as_deref()).await
+        let db = open_db(&self.manager, &args.project_id)
+            .await
+            .map_err(CodeGraphToolMapError)?;
+        let result = cg_tools::tool_map(&db, &args.project_id, args.tool.as_deref())
+            .await
             .map_err(|e| CodeGraphToolMapError(e.to_string()))?;
-        Ok(CodeGraphToolMapOutput { result: serde_json::to_value(result).unwrap_or_default() })
+        Ok(CodeGraphToolMapOutput {
+            result: serde_json::to_value(result).unwrap_or_default(),
+        })
     }
 }
 
@@ -830,17 +888,23 @@ impl Tool for CodeGraphApiImpactTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Pre-change impact report for an API route handler. Combines route mapping with blast-radius analysis to show: the handler function, what calls it, what processes are affected, and the risk level. Use before modifying an API endpoint.".to_string(),
+            description: "Pre-change impact report for an API route handler. Combines route mapping with blast-radius analysis to show: the handler function, what calls it, what processes are affected, and the risk level. Use before modifying an API endpoint. If `found` is false, the route does not exist — do NOT retry.".to_string(),
             parameters: schemars::schema_for!(CodeGraphApiImpactArgs).to_value(),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let db = self.manager.get_db(&args.project_id).await
-            .ok_or_else(|| CodeGraphApiImpactError(format!("project '{}' not found", args.project_id)))?;
+        let db = open_db(&self.manager, &args.project_id)
+            .await
+            .map_err(CodeGraphApiImpactError)?;
         let result = cg_tools::api_impact(
-            &db, &args.project_id, args.route.as_deref(), args.file.as_deref(),
-        ).await.map_err(|e| CodeGraphApiImpactError(e.to_string()))?;
+            &db,
+            &args.project_id,
+            args.route.as_deref(),
+            args.file.as_deref(),
+        )
+        .await
+        .map_err(|e| CodeGraphApiImpactError(e.to_string()))?;
         match result {
             Some(r) => Ok(CodeGraphApiImpactOutput {
                 found: true,
@@ -848,7 +912,9 @@ impl Tool for CodeGraphApiImpactTool {
             }),
             None => Ok(CodeGraphApiImpactOutput {
                 found: false,
-                result: serde_json::json!({"error": "No matching route found"}),
+                result: serde_json::json!({
+                    "error": "No matching route found in the indexed codebase. Do not retry."
+                }),
             }),
         }
     }

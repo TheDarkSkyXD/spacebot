@@ -523,7 +523,7 @@ impl CodeGraphDb {
                     return;
                 }
             };
-            let mut result = match conn
+            let result = match conn
                 .query(&cypher)
                 .with_context(|| format!("querying: {}", truncate_for_log(&cypher, 120)))
             {
@@ -533,7 +533,7 @@ impl CodeGraphDb {
                     return;
                 }
             };
-            while let Some(row) = result.next() {
+            for row in result {
                 if tx.blocking_send(Ok(row)).is_err() {
                     break;
                 }
