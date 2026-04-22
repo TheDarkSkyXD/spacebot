@@ -12,7 +12,15 @@
 //   - extra labels (Struct/Trait/Impl/Community/Process/...)
 
 import Graph from "graphology";
-import { NODE_COLORS, NODE_SIZES, getCommunityColor, type NodeLabel, type EdgeType } from "./constants";
+import {
+	NODE_COLORS,
+	NODE_SIZES,
+	EDGE_INFO,
+	getCommunityColor,
+	toCanonicalLabel,
+	type NodeLabel,
+	type EdgeType,
+} from "./constants";
 import type { BulkNode, BulkEdge } from "./types";
 
 export interface SigmaNodeAttributes {
@@ -142,10 +150,18 @@ export const getNodeColor = (
 ): string =>
 	colorOverrides?.[label] ?? NODE_COLORS[label as NodeLabel] ?? "#6b7280";
 
+/** Resolve an edge's display color, respecting user overrides. */
+export const getEdgeColor = (
+	edgeType: string,
+	edgeColorOverrides?: Record<string, string>,
+): string =>
+	edgeColorOverrides?.[edgeType] ?? EDGE_INFO[edgeType as EdgeType]?.color ?? "#3a3a4a";
+
 export const buildGraph = (
 	bulkNodes: BulkNode[],
 	bulkEdges: BulkEdge[],
 	colorOverrides?: Record<string, string>,
+	edgeColorOverrides?: Record<string, string>,
 ): Graph<SigmaNodeAttributes, SigmaEdgeAttributes> => {
 	const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>();
 	const nodeCount = bulkNodes.length;
@@ -354,6 +370,7 @@ export const buildGraph = (
 		STEP_IN_PROCESS: 0.7,
 		TESTED_BY: 0.6,
 		HANDLES_TOOL: 0.7,
+		WRAPS: 0.7,
 		QUERIES: 0.6,
 	};
 
@@ -364,9 +381,10 @@ export const buildGraph = (
 		// graphology's simple-graph mode rejects parallel edges; ignore dupes.
 		if (graph.hasEdge(src, tgt)) continue;
 		const multiplier = EDGE_SIZE_MULTIPLIER[rel.edge_type] ?? 0.5;
+		const edgeColor = getEdgeColor(rel.edge_type, edgeColorOverrides);
 		graph.addEdge(src, tgt, {
 			size: edgeBaseSize * multiplier,
-			color: "#3a3a4a",
+			color: edgeColor,
 			relationType: rel.edge_type,
 			type: "arrow",
 		});
@@ -389,7 +407,8 @@ export const filterGraphByLabels = (
 			graph.setNodeAttribute(nodeId, "hidden", true);
 			return;
 		}
-		graph.setNodeAttribute(nodeId, "hidden", !visible.has(attrs.nodeType));
+		const canonical = toCanonicalLabel(attrs.nodeType);
+		graph.setNodeAttribute(nodeId, "hidden", !visible.has(canonical));
 	});
 };
 
@@ -433,7 +452,7 @@ export const filterGraphByDepth = (
 			graph.setNodeAttribute(nodeId, "hidden", true);
 			return;
 		}
-		const labelOk = visible.has(attrs.nodeType);
+		const labelOk = visible.has(toCanonicalLabel(attrs.nodeType));
 		graph.setNodeAttribute(nodeId, "hidden", !labelOk || !inRange.has(nodeId));
 	});
 };
@@ -444,104 +463,181 @@ export const filterGraphByDepth = (
 
 export type LayoutMode = "force" | "solar" | "radial" | "mermaid";
 
-// Ring assignments for Solar layout. Inner rings = structural, outer = symbols.
-const SOLAR_RING: Record<string, number> = {
-	Project: 0, Package: 0, Module: 0, Namespace: 0,
-	Folder: 1,
-	File: 2,
-};
-// Everything else goes to ring 3 (outermost).
+// Ring assignments for Solar layout.
+const SOLAR_CORE = new Set(["Project", "Package", "Module", "Namespace"]);
+const SOLAR_TYPES = new Set([
+	"Class", "Interface", "Struct", "Trait", "Enum",
+	"Type", "TypeAlias", "Record", "Template",
+]);
 
-/** Solar layout — 4 concentric rings by structural level. */
+/** Solar layout — 4 concentric rings + 6 satellite clusters.
+ *
+ *  Ring 1 (innermost): Core structural (Project, Package, Module, Namespace)
+ *  Ring 2: Folders
+ *  Ring 3: Type-level symbols (Class, Struct, Trait, Interface, Enum)
+ *  Ring 4 (outermost): Files — densely packed, largest ring
+ *  Satellites: Function/Method/other nodes grouped by top-level folder */
 export const applySolarLayout = (
 	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
 ): void => {
-	// Bucket nodes into rings.
-	const rings: string[][] = [[], [], [], []];
+	const ring1: string[] = []; // core
+	const ring2: string[] = []; // folders
+	const ring3: string[] = []; // types
+	const ring4: string[] = []; // files
+	const satNodes: string[] = []; // functions/methods → satellites
+
 	graph.forEachNode((nodeId, attrs) => {
 		if (attrs.hidden) return;
-		const ring = SOLAR_RING[attrs.nodeType] ?? 3;
-		rings[ring].push(nodeId);
+		if (SOLAR_CORE.has(attrs.nodeType)) {
+			ring1.push(nodeId);
+		} else if (attrs.nodeType === "Folder") {
+			ring2.push(nodeId);
+		} else if (SOLAR_TYPES.has(attrs.nodeType)) {
+			ring3.push(nodeId);
+		} else if (attrs.nodeType === "File") {
+			ring4.push(nodeId);
+		} else {
+			satNodes.push(nodeId);
+		}
 	});
 
+	// Radii — spaced like the reference image: inner rings close together,
+	// large gap before the outermost ring.
 	const baseRadius = Math.sqrt(graph.order) * 8;
-	const ringRadii = [baseRadius * 0.3, baseRadius * 0.6, baseRadius * 1.0, baseRadius * 1.6];
+	const ringRadii = [
+		baseRadius * 0.18, // ring 1 — core
+		baseRadius * 0.33, // ring 2 — folders
+		baseRadius * 0.52, // ring 3 — types
+		baseRadius * 1.0,  // ring 4 — files (outermost)
+	];
 
-	for (let r = 0; r < rings.length; r++) {
-		const nodes = rings[r];
-		const radius = ringRadii[r];
+	// Place nodes on each ring.
+	const placeOnRing = (nodes: string[], radius: number) => {
 		nodes.forEach((nodeId, i) => {
 			const angle = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
-			// Small jitter to avoid perfect overlaps.
-			const jitter = radius * 0.05 * (Math.random() - 0.5);
+			const jitter = radius * 0.03 * (Math.random() - 0.5);
 			graph.setNodeAttribute(nodeId, "x", (radius + jitter) * Math.cos(angle));
 			graph.setNodeAttribute(nodeId, "y", (radius + jitter) * Math.sin(angle));
+		});
+	};
+
+	placeOnRing(ring1, ringRadii[0]);
+	placeOnRing(ring2, ringRadii[1]);
+	placeOnRing(ring3, ringRadii[2]);
+	placeOnRing(ring4, ringRadii[3]);
+
+	// Group satellite nodes by top-level folder.
+	const folderGroups = new Map<string, string[]>();
+	for (const nodeId of satNodes) {
+		const attrs = graph.getNodeAttributes(nodeId);
+		const sf = attrs.sourceFile || "";
+		const topFolder = sf.split("/")[0] || sf.split("\\")[0] || "other";
+		if (!folderGroups.has(topFolder)) folderGroups.set(topFolder, []);
+		folderGroups.get(topFolder)!.push(nodeId);
+	}
+
+	// Target exactly 6 satellites.
+	const TARGET_SATELLITES = 6;
+	const sorted = [...folderGroups.entries()].sort((a, b) => b[1].length - a[1].length);
+	const satelliteGroups: { label: string; nodes: string[] }[] = [];
+	const overflow: string[] = [];
+
+	for (let i = 0; i < sorted.length; i++) {
+		if (i < TARGET_SATELLITES) {
+			satelliteGroups.push({ label: sorted[i][0], nodes: sorted[i][1] });
+		} else {
+			overflow.push(...sorted[i][1]);
+		}
+	}
+	if (overflow.length > 0) {
+		if (satelliteGroups.length < TARGET_SATELLITES) {
+			satelliteGroups.push({ label: "other", nodes: overflow });
+		} else {
+			satelliteGroups[satelliteGroups.length - 1].nodes.push(...overflow);
+		}
+	}
+	while (satelliteGroups.length < TARGET_SATELLITES && satelliteGroups.length > 0) {
+		let maxIdx = 0;
+		for (let i = 1; i < satelliteGroups.length; i++) {
+			if (satelliteGroups[i].nodes.length > satelliteGroups[maxIdx].nodes.length) maxIdx = i;
+		}
+		const biggest = satelliteGroups[maxIdx];
+		if (biggest.nodes.length < 2) break;
+		const half = Math.ceil(biggest.nodes.length / 2);
+		const splitNodes = biggest.nodes.splice(half);
+		satelliteGroups.push({ label: biggest.label + "'", nodes: splitNodes });
+	}
+
+	// Position satellites outside the outermost ring.
+	const outerR = ringRadii[3];
+	const satCount = Math.max(satelliteGroups.length, 1);
+	const satOrbitRadius = outerR * 1.5;
+	const satBaseSize = baseRadius * 0.22;
+
+	for (let s = 0; s < satelliteGroups.length; s++) {
+		const group = satelliteGroups[s];
+		const satAngle = (s / satCount) * Math.PI * 2;
+		const cx = satOrbitRadius * Math.cos(satAngle);
+		const cy = satOrbitRadius * Math.sin(satAngle);
+		const satRadius = satBaseSize * Math.min(1, 0.4 + (group.nodes.length / 80));
+
+		group.nodes.forEach((nodeId, i) => {
+			const angle = (i / Math.max(group.nodes.length, 1)) * Math.PI * 2;
+			const jitter = satRadius * 0.08 * (Math.random() - 0.5);
+			graph.setNodeAttribute(nodeId, "x", cx + (satRadius + jitter) * Math.cos(angle));
+			graph.setNodeAttribute(nodeId, "y", cy + (satRadius + jitter) * Math.sin(angle));
 		});
 	}
 };
 
-/** Radial layout — each File is a spoke radiating from center with
- *  its symbols fanning out along the spoke. Starburst / firework look. */
+/** Radial layout — 4 concentric rings of nodes. Ring 4 (outermost) is
+ *  largest; each inner ring is smaller with clear spacing so adjacent rings
+ *  don't touch. Nodes sit ON the rings:
+ *    Ring 1 (innermost): core structural (Project, Package, Module, Namespace)
+ *    Ring 2: Folders
+ *    Ring 3: type-level symbols (Class, Interface, Struct, Trait, Enum, ...)
+ *    Ring 4 (outermost): Files + Functions/Methods + everything else */
 export const applyRadialLayout = (
 	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
 ): void => {
-	// Group symbols by their source file.
-	const fileNodes: string[] = [];
-	const byFile = new Map<string, string[]>();
-	const orphans: string[] = [];
+	const ring1: string[] = []; // core
+	const ring2: string[] = []; // folders
+	const ring3: string[] = []; // types
+	const ring4: string[] = []; // files + leaf symbols + unknown
 
 	graph.forEachNode((nodeId, attrs) => {
 		if (attrs.hidden) return;
-		if (attrs.nodeType === "File") {
-			fileNodes.push(nodeId);
-			if (!byFile.has(nodeId)) byFile.set(nodeId, []);
-		} else if (attrs.nodeType === "Folder" || attrs.nodeType === "Project" ||
-			attrs.nodeType === "Package" || attrs.nodeType === "Module" || attrs.nodeType === "Namespace") {
-			orphans.push(nodeId);
+		if (SOLAR_CORE.has(attrs.nodeType)) {
+			ring1.push(nodeId);
+		} else if (attrs.nodeType === "Folder") {
+			ring2.push(nodeId);
+		} else if (SOLAR_TYPES.has(attrs.nodeType)) {
+			ring3.push(nodeId);
+		} else {
+			ring4.push(nodeId);
 		}
 	});
 
-	// Assign symbols to their file's spoke via DEFINES edges.
-	graph.forEachEdge((_edge, attrs, source, target) => {
-		if (attrs.relationType === "DEFINES" && byFile.has(source)) {
-			byFile.get(source)!.push(target);
-		}
-	});
-
-	// Any visible nodes not assigned to a file spoke.
-	const assigned = new Set<string>(fileNodes);
-	for (const syms of byFile.values()) syms.forEach((s) => assigned.add(s));
-	graph.forEachNode((nodeId, attrs) => {
-		if (!attrs.hidden && !assigned.has(nodeId) && !orphans.includes(nodeId)) {
-			orphans.push(nodeId);
-		}
-	});
-
-	const spokeCount = fileNodes.length || 1;
 	const baseRadius = Math.sqrt(graph.order) * 6;
+	const ringRadii = [
+		baseRadius * 0.25,
+		baseRadius * 0.55,
+		baseRadius * 0.90,
+		baseRadius * 1.30,
+	];
 
-	fileNodes.forEach((fileId, i) => {
-		const spokeAngle = (i / spokeCount) * Math.PI * 2;
-		// File node sits at the spoke's base.
-		graph.setNodeAttribute(fileId, "x", baseRadius * 0.4 * Math.cos(spokeAngle));
-		graph.setNodeAttribute(fileId, "y", baseRadius * 0.4 * Math.sin(spokeAngle));
-		// Symbols fan out along the spoke.
-		const symbols = byFile.get(fileId) ?? [];
-		symbols.forEach((symId, j) => {
-			const r = baseRadius * (0.5 + 0.8 * ((j + 1) / Math.max(symbols.length, 1)));
-			const spread = 0.15; // angular spread for the fan
-			const symAngle = spokeAngle + (j - symbols.length / 2) * (spread / Math.max(symbols.length, 1));
-			graph.setNodeAttribute(symId, "x", r * Math.cos(symAngle));
-			graph.setNodeAttribute(symId, "y", r * Math.sin(symAngle));
+	const placeOnRing = (nodes: string[], radius: number) => {
+		nodes.forEach((nodeId, i) => {
+			const angle = (i / Math.max(nodes.length, 1)) * Math.PI * 2;
+			const jitter = radius * 0.03 * (Math.random() - 0.5);
+			graph.setNodeAttribute(nodeId, "x", (radius + jitter) * Math.cos(angle));
+			graph.setNodeAttribute(nodeId, "y", (radius + jitter) * Math.sin(angle));
 		});
-	});
+	};
 
-	// Structural/orphan nodes cluster at center.
-	orphans.forEach((nodeId, i) => {
-		const a = (i / Math.max(orphans.length, 1)) * Math.PI * 2;
-		const r = baseRadius * 0.15;
-		graph.setNodeAttribute(nodeId, "x", r * Math.cos(a));
-		graph.setNodeAttribute(nodeId, "y", r * Math.sin(a));
-	});
+	placeOnRing(ring1, ringRadii[0]);
+	placeOnRing(ring2, ringRadii[1]);
+	placeOnRing(ring3, ringRadii[2]);
+	placeOnRing(ring4, ringRadii[3]);
 };
 

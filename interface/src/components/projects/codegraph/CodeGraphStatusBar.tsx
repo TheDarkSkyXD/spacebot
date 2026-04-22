@@ -1,12 +1,8 @@
-// Footer bar for the Code Graph tab. Shows the loaded node/edge counts
-// and a "layout running" indicator.
-
 interface Props {
 	nodeCount: number;
 	edgeCount: number;
 	isLayoutRunning: boolean;
 	isUpdating?: boolean;
-	truncated: boolean;
 }
 
 export function CodeGraphStatusBar({
@@ -14,7 +10,6 @@ export function CodeGraphStatusBar({
 	edgeCount,
 	isLayoutRunning,
 	isUpdating,
-	truncated,
 }: Props) {
 	return (
 		<div className="flex shrink-0 items-center justify-between border-t border-app-line bg-app-darkBox px-4 py-1.5 text-[11px] text-ink-faint">
@@ -25,9 +20,6 @@ export function CodeGraphStatusBar({
 				<span>
 					<span className="text-ink-dull">{edgeCount.toLocaleString()}</span> edges
 				</span>
-				{truncated && (
-					<span className="text-amber-400">truncated</span>
-				)}
 			</div>
 			<div className="flex items-center gap-2">
 				{isUpdating && (

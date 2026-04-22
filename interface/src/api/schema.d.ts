@@ -2449,10 +2449,6 @@ export interface components {
         };
         BulkNodesResponse: {
             nodes: components["schemas"]["NodeSummary"][];
-            /** @description Total number of nodes that would have been returned without the cap. */
-            total_available: number;
-            /** @description True when the server truncated the result to stay under the node cap. */
-            truncated: boolean;
         };
         CancelProcessRequest: {
             channel_id: string;

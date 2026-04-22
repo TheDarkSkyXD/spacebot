@@ -116,21 +116,24 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 		visibleEdgeTypes,
 	});
 
-	// Push the incoming graph into sigma whenever it changes. This also
-	// kicks off a fresh ForceAtlas2 layout run (only in force mode).
+	// Camera only re-animates on the very first push — subsequent pushes
+	// (SSE-driven refetches on file add/remove) would otherwise jolt the view.
+	const hasPushedRef = useRef(false);
 	useEffect(() => {
 		if (!graph) return;
 		pushGraph(graph);
-		// If initial mode isn't force, apply the correct layout immediately.
 		if (layoutMode !== "force") {
 			stopLayout();
 			const sigmaGraph = sigmaRef.current?.getGraph() as Graph<SigmaNodeAttributes, SigmaEdgeAttributes> | undefined;
 			if (sigmaGraph && sigmaGraph.order > 0) {
 				applyLayout(layoutMode, sigmaGraph);
 				sigmaRef.current?.refresh();
-				sigmaRef.current?.getCamera().animate({ x: 0.5, y: 0.5, ratio: 0.6, angle: 0 }, { duration: 300 });
+				if (!hasPushedRef.current) {
+					sigmaRef.current?.getCamera().animate({ x: 0.5, y: 0.5, ratio: 0.6, angle: 0 }, { duration: 300 });
+				}
 			}
 		}
+		hasPushedRef.current = true;
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [graph, pushGraph]);
 

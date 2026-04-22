@@ -13,8 +13,6 @@ interface Props {
 	nodes: BulkNode[];
 	nodeCount: number;
 	edgeCount: number;
-	truncated: boolean;
-	totalAvailable: number;
 	onSelectNode: (node: BulkNode) => void;
 	onReindex?: () => void;
 	isReindexing?: boolean;
@@ -36,8 +34,6 @@ export function CodeGraphSearchBar({
 	nodes,
 	nodeCount,
 	edgeCount,
-	truncated,
-	totalAvailable,
 	onSelectNode,
 	onReindex,
 	isReindexing,
@@ -133,9 +129,6 @@ export function CodeGraphSearchBar({
 						onKeyDown={handleKeyDown}
 						className="flex-1 border-none bg-transparent text-sm text-ink outline-none placeholder:text-ink-faint"
 					/>
-					<kbd className="rounded border border-app-line bg-app-darkBox px-1.5 py-0.5 font-mono text-[10px] text-ink-faint">
-						⌘K
-					</kbd>
 				</div>
 
 				{/* Dropdown */}
@@ -215,14 +208,6 @@ export function CodeGraphSearchBar({
 			<div className="ml-auto flex shrink-0 items-center gap-4 text-xs text-ink-faint">
 				<span>{nodeCount.toLocaleString()} nodes</span>
 				<span>{edgeCount.toLocaleString()} edges</span>
-				{truncated && (
-					<span
-						className="rounded bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-400"
-						title={`Showing ${nodeCount} of ${totalAvailable}. Toggle 'Include noise' or lower the cap to see more.`}
-					>
-						Truncated ({totalAvailable.toLocaleString()} total)
-					</span>
-				)}
 				{onReindex && (
 					<button
 						onClick={onReindex}

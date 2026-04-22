@@ -19,6 +19,7 @@ function getApiBase(): string {
 }
 
 import type * as Types from "./types";
+import { fetchNdjson } from "./ndjson";
 
 // Re-export commonly used types from schema for backward compatibility
 // Only re-export types that don't have local definitions with extra fields
@@ -1546,8 +1547,6 @@ export interface CodeGraphStatsResponse {
 
 export interface CodeGraphBulkNodesResponse {
 	nodes: CodeGraphNodeSummary[];
-	truncated: boolean;
-	total_available: number;
 }
 
 export interface CodeGraphBulkEdgeSummary {
@@ -2666,6 +2665,48 @@ export const api = {
 		fetchJson<CodeGraphBulkEdgesResponse>(
 			`/codegraph/projects/${encodeURIComponent(projectId)}/graph/bulk-edges`,
 		),
+
+	// Stream the full graph as NDJSON. Server yields one record per line:
+	//   {"type":"node","data":{...}} | {"type":"edge","data":{...}} | {"type":"error","error":"..."}
+	// Accumulates into the same {nodes, edges} shape the two paged endpoints
+	// used to return, so callers keep their current contract. Matches
+	// GitNexus's `/api/graph?stream=true` client pattern.
+	codegraphGraphStream: async (
+		projectId: string,
+		signal?: AbortSignal,
+		onProgress?: (p: { phase: "nodes" | "edges"; nodesLoaded: number; edgesLoaded: number }) => void,
+	): Promise<{ nodes: CodeGraphNodeSummary[]; edges: CodeGraphBulkEdgeSummary[] }> => {
+		type Record =
+			| { type: "node"; data: CodeGraphNodeSummary }
+			| { type: "edge"; data: CodeGraphBulkEdgeSummary }
+			| { type: "error"; error: string };
+
+		const nodes: CodeGraphNodeSummary[] = [];
+		const edges: CodeGraphBulkEdgeSummary[] = [];
+		const url = `${getApiBase()}/codegraph/projects/${encodeURIComponent(projectId)}/graph/stream`;
+
+		// Throttle progress callbacks to ~every 100 records so setState
+		// doesn't thrash React on large graphs.
+		let i = 0;
+		let phase: "nodes" | "edges" = "nodes";
+		for await (const record of fetchNdjson<Record>(url, { signal })) {
+			if (record.type === "node") {
+				nodes.push(record.data);
+				phase = "nodes";
+			} else if (record.type === "edge") {
+				edges.push(record.data);
+				phase = "edges";
+			} else if (record.type === "error") {
+				throw new Error(record.error);
+			}
+			i++;
+			if (onProgress && i % 100 === 0) {
+				onProgress({ phase, nodesLoaded: nodes.length, edgesLoaded: edges.length });
+			}
+		}
+		onProgress?.({ phase, nodesLoaded: nodes.length, edgesLoaded: edges.length });
+		return { nodes, edges };
+	},
 
 	fsReadFile: (params: { projectId: string; path: string; startLine?: number; endLine?: number }) => {
 		const qs = new URLSearchParams({
