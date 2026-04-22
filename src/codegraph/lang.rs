@@ -11,6 +11,9 @@
 //! 3. Declare the new module below with `pub mod <name>;`
 //! 4. Add a row to the `LANGUAGES` table in `language_detection.rs`
 
+pub mod cobol_exec;
+pub mod cobol_preprocessor;
+pub mod jcl;
 pub mod provider;
 
 // Registry and enum.
@@ -23,9 +26,11 @@ pub mod c_sharp;
 pub mod cobol;
 pub mod dart;
 pub mod go;
+pub mod html;
 pub mod java;
 pub mod kotlin;
 pub mod php;
+pub mod prisma;
 pub mod python;
 pub mod ruby;
 pub mod rust_lang;

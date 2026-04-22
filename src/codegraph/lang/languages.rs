@@ -30,6 +30,16 @@ pub enum SupportedLanguage {
     Dart,
     /// COBOL uses a regex-based provider rather than tree-sitter.
     Cobol,
+    /// JCL (Job Control Language) — mainframe batch scheduling.
+    /// Emits JclJob / JclStep nodes rather than symbol nodes.
+    Jcl,
+    /// HTML + template dialects. Indexed so form-action URLs and
+    /// AJAX patterns can link to backend routes.
+    Html,
+    /// Prisma schema (`.prisma`). Indexed for model declarations so
+    /// Prisma query calls (`prisma.user.findUnique`) can emit
+    /// QUERIES edges to the model nodes.
+    Prisma,
 }
 
 impl SupportedLanguage {
@@ -51,6 +61,9 @@ impl SupportedLanguage {
             Self::Swift => "Swift",
             Self::Dart => "Dart",
             Self::Cobol => "COBOL",
+            Self::Jcl => "JCL",
+            Self::Html => "HTML",
+            Self::Prisma => "Prisma",
         }
     }
 }

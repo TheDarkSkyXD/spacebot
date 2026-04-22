@@ -13,7 +13,8 @@ use std::sync::Arc;
 use super::languages::SupportedLanguage;
 use super::provider::LanguageProvider;
 use super::{
-    c_cpp, c_sharp, cobol, dart, go, java, kotlin, php, python, ruby, rust_lang, swift, typescript,
+    c_cpp, c_sharp, cobol, dart, go, html, java, kotlin, php, prisma, python, ruby, rust_lang,
+    swift, typescript,
 };
 
 /// A single row in the language registry.
@@ -125,9 +126,32 @@ static LANGUAGES: &[LanguageEntry] = &[
     },
     LanguageEntry {
         lang: SupportedLanguage::Cobol,
-        extensions: &["cbl", "cob", "cpy", "cobol"],
+        extensions: &["cbl", "cob", "cpy", "copybook", "cobol"],
         extensionless_basenames: &[],
         factory: || Arc::new(cobol::CobolProvider),
+    },
+    LanguageEntry {
+        lang: SupportedLanguage::Jcl,
+        extensions: &["jcl", "job", "proc"],
+        extensionless_basenames: &[],
+        // JCL files route through the same COBOL provider for
+        // structural extraction; the specialized parser in
+        // `lang::jcl` runs alongside the pipeline's mainframe phase
+        // and emits JclJob/JclStep nodes. This factory just gives
+        // us a provider hook so JCL files survive the walker.
+        factory: || Arc::new(cobol::CobolProvider),
+    },
+    LanguageEntry {
+        lang: SupportedLanguage::Html,
+        extensions: &["html", "htm"],
+        extensionless_basenames: &[],
+        factory: || Arc::new(html::HtmlProvider),
+    },
+    LanguageEntry {
+        lang: SupportedLanguage::Prisma,
+        extensions: &["prisma"],
+        extensionless_basenames: &[],
+        factory: || Arc::new(prisma::PrismaProvider),
     },
 ];
 
