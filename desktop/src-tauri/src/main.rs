@@ -7,6 +7,16 @@ use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
+/// In debug builds on Windows, allocate a visible console so the
+/// backend sidecar's piped stdout/stderr have somewhere to land.
+/// Without this, the GUI subsystem swallows all print output.
+#[cfg(all(debug_assertions, windows))]
+fn alloc_debug_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::AllocConsole();
+    }
+}
+
 // ── Voice overlay dimensions ─────────────────────────────────────────────
 const OVERLAY_INITIAL_WIDTH: f64 = 520.0;
 const OVERLAY_INITIAL_HEIGHT: f64 = 100.0;
@@ -191,6 +201,9 @@ fn apply_overlay_window_chrome(window: &tauri::WebviewWindow) {
 }
 
 fn main() {
+    #[cfg(all(debug_assertions, windows))]
+    alloc_debug_console();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -350,12 +363,12 @@ fn main() {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(|_window, _event| {
             // Re-apply titlebar style on fullscreen transitions (macOS)
             #[cfg(target_os = "macos")]
-            if let tauri::WindowEvent::Resized(_) = event {
-                if let Ok(is_fullscreen) = window.is_fullscreen() {
-                    if let Ok(ns_window) = window.ns_window() {
+            if let tauri::WindowEvent::Resized(_) = _event {
+                if let Ok(is_fullscreen) = _window.is_fullscreen() {
+                    if let Ok(ns_window) = _window.ns_window() {
                         unsafe {
                             sb_desktop_macos::set_titlebar_style(&ns_window, is_fullscreen);
                         }
