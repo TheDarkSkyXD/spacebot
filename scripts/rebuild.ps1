@@ -64,7 +64,7 @@ if (-not $SkipBackend) {
     }
 
     $env:SPACEBOT_SKIP_FRONTEND_BUILD = "1"
-    cargo build --manifest-path "$RepoRoot\Cargo.toml"
+    cargo build --manifest-path "$RepoRoot\Cargo.toml" --features codegraph
 
     if ($LASTEXITCODE -ne 0) { Fail "backend build failed" }
     Log "backend ready -> $BackendBin"
@@ -84,6 +84,19 @@ if (-not $SkipBackend) {
     $DestBin = Join-Path $BinariesDir "spacebot-${HostTriple}.exe"
     Copy-Item $BackendBin $DestBin -Force
     Log "sidecar bundled -> $DestBin"
+
+    # Also copy to Tauri's runtime binaries dir so the sidecar is fresh
+    # even when Tauri does an incremental build that skips the copy step.
+    $TauriRuntimeBin = Join-Path $RepoRoot "desktop\src-tauri\target\debug\binaries\spacebot-${HostTriple}.exe"
+    $TauriRuntimeDir = Split-Path $TauriRuntimeBin
+    if (Test-Path $TauriRuntimeDir) {
+        try {
+            Copy-Item $BackendBin $TauriRuntimeBin -Force -ErrorAction Stop
+            Log "sidecar also copied -> $TauriRuntimeBin"
+        } catch {
+            Log "note: could not copy to runtime dir (sidecar may be running) - Tauri rebuild will handle it"
+        }
+    }
 }
 
 # ── Tauri desktop rebuild ────────────────────────────────────────────────────
