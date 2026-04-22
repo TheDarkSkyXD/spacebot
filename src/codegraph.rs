@@ -6,6 +6,7 @@
 //! function, class, import, call relationship, inheritance chain, and
 //! execution flow, stored in LadybugDB.
 
+pub mod config;
 pub mod db;
 pub mod embeddings_table;
 pub mod events;
@@ -17,6 +18,7 @@ pub mod manager;
 pub mod pipeline;
 pub mod schema;
 pub mod search;
+pub mod semantic;
 pub mod tools;
 pub mod types;
 pub mod watcher;

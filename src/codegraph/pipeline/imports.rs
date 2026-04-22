@@ -1,11 +1,15 @@
 //! Resolve import/require/use statements.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use anyhow::Result;
 
+use super::phase::{Phase, PhaseCtx};
 use super::PhaseResult;
+use crate::codegraph::config::{ConfigContext, TsPathAlias};
 use crate::codegraph::db::SharedCodeGraphDb;
+use crate::codegraph::types::PipelinePhase;
 
 /// Escape a string for use in a Cypher string literal.
 fn cypher_escape(s: &str) -> String {
@@ -17,6 +21,47 @@ pub struct ImportPhaseResult {
     pub phase: PhaseResult,
     /// Map of source_file → set of imported file paths (for call resolution).
     pub import_map: HashMap<String, HashSet<String>>,
+    /// Number of files that participate in at least one import cycle.
+    /// Computed via Kahn's topological sort over `import_map`.
+    pub cycle_count: u32,
+}
+
+/// Count files that sit in at least one import cycle. Runs Kahn's
+/// topological sort: files with 0 in-edges are peeled off repeatedly;
+/// anything left is part of a strongly-connected component. Cheap O(V+E).
+fn count_import_cycle_files(import_map: &HashMap<String, HashSet<String>>) -> u32 {
+    if import_map.is_empty() {
+        return 0;
+    }
+
+    let mut in_degree: HashMap<&str, usize> = HashMap::new();
+    for (src, targets) in import_map {
+        in_degree.entry(src.as_str()).or_insert(0);
+        for tgt in targets {
+            *in_degree.entry(tgt.as_str()).or_insert(0) += 1;
+        }
+    }
+
+    let mut queue: Vec<&str> = in_degree
+        .iter()
+        .filter_map(|(k, v)| (*v == 0).then_some(*k))
+        .collect();
+
+    while let Some(node) = queue.pop() {
+        if let Some(targets) = import_map.get(node) {
+            for tgt in targets {
+                if let Some(d) = in_degree.get_mut(tgt.as_str()) {
+                    *d = d.saturating_sub(1);
+                    if *d == 0 {
+                        queue.push(tgt.as_str());
+                    }
+                }
+            }
+        }
+        in_degree.remove(node);
+    }
+
+    in_degree.len() as u32
 }
 
 /// Resolve import statements and create IMPORTS edges between files.
@@ -26,8 +71,9 @@ pub struct ImportPhaseResult {
 pub async fn resolve_imports(
     project_id: &str,
     db: &SharedCodeGraphDb,
+    config: &ConfigContext,
 ) -> Result<ImportPhaseResult> {
-    resolve_imports_scoped(project_id, db, None).await
+    resolve_imports_scoped(project_id, db, config, None).await
 }
 
 /// Scoped variant of `resolve_imports`: if `scope_files` is `Some`, only
@@ -37,6 +83,7 @@ pub async fn resolve_imports(
 pub async fn resolve_imports_scoped(
     project_id: &str,
     db: &SharedCodeGraphDb,
+    config: &ConfigContext,
     scope_files: Option<&HashSet<String>>,
 ) -> Result<ImportPhaseResult> {
     let mut result = PhaseResult::default();
@@ -153,7 +200,13 @@ pub async fn resolve_imports_scoped(
             .map(|i| &source_file[..i])
             .unwrap_or("");
 
-        let candidates = [
+        // Alias-based candidates (tsconfig paths, go.mod module prefix,
+        // PSR-4 namespaces, etc.) go first — they're the right answer
+        // when they match, and the tail heuristics below are the
+        // fallback for imports with no config-driven resolution.
+        let mut candidates: Vec<String> =
+            apply_aliases(&cleaned, source_file, config);
+        candidates.extend([
             // Direct path
             cleaned.clone(),
             // Relative to source dir
@@ -169,7 +222,7 @@ pub async fn resolve_imports_scoped(
             format!("{cleaned}.py"),
             // Rust-style mod resolution
             format!("{cleaned}/mod.rs"),
-        ];
+        ]);
 
         // Normalize path separators and strip leading ./
         for candidate in &candidates {
@@ -255,15 +308,321 @@ pub async fn resolve_imports_scoped(
         result.errors += batch.errors;
     }
 
+    let cycle_count = count_import_cycle_files(&import_map);
+
     tracing::info!(
         project_id = %project_id,
         edges = result.edges_created,
         import_entries = import_map.len(),
+        cycle_files = cycle_count,
         "import resolution complete"
     );
 
     Ok(ImportPhaseResult {
         phase: result,
         import_map,
+        cycle_count,
     })
+}
+
+/// Imports phase: resolves `import_source` paths on Import nodes into
+/// IMPORTS edges between files and stashes the resulting `import_map` on
+/// the context so the Calls phase can use it for tier-2 resolution.
+pub struct ImportsPhase;
+
+#[async_trait::async_trait]
+impl Phase for ImportsPhase {
+    fn label(&self) -> &'static str {
+        "imports"
+    }
+
+    fn phase(&self) -> Option<PipelinePhase> {
+        Some(PipelinePhase::Imports)
+    }
+
+    async fn run(&self, ctx: &mut PhaseCtx) -> Result<()> {
+        ctx.emit_progress(PipelinePhase::Imports, 0.0, "Resolving imports");
+        let result = resolve_imports(&ctx.project_id, &ctx.db, &ctx.config_context).await?;
+        ctx.stats.nodes_created += result.phase.nodes_created;
+        ctx.stats.edges_created += result.phase.edges_created;
+        ctx.import_map = result.import_map;
+        ctx.emit_progress(PipelinePhase::Imports, 1.0, "Imports resolved");
+        Ok(())
+    }
+}
+
+/// Translate an `import_source` through the workspace's configured
+/// build-system aliases into one or more project-root-relative
+/// candidate paths. The calling resolver then tries each candidate
+/// against the file index.
+///
+/// The helper is a *producer* of candidates — it never decides which
+/// wins. When no alias matches, it returns an empty `Vec` and the
+/// fallback heuristics below take over.
+fn apply_aliases(
+    import_source: &str,
+    source_file: &str,
+    config: &ConfigContext,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let source_path = Path::new(source_file);
+    let ws = match config.workspace_for(source_path) {
+        Some(w) => w,
+        None => return out,
+    };
+
+    // TypeScript / JavaScript path aliases.
+    for alias in &ws.ts_paths {
+        for candidate in expand_ts_alias(import_source, alias, &ws.root) {
+            out.push(candidate);
+        }
+    }
+
+    // TypeScript `baseUrl`: non-relative, non-aliased imports resolve
+    // from `baseUrl`. We add it as a lower-priority candidate so an
+    // explicit path alias still wins when both match.
+    if let Some(base) = &ws.ts_base_url
+        && !import_source.starts_with('.')
+        && !import_source.starts_with('/')
+    {
+        out.push(join_rel(&ws.root, &base.join(import_source)));
+    }
+
+    // Go: strip the module prefix so `github.com/foo/bar/pkg/x` maps
+    // to `pkg/x` under the workspace root.
+    if let Some(module) = &ws.go_module
+        && let Some(stripped) = import_source
+            .strip_prefix(module)
+            .and_then(|rest| rest.strip_prefix('/').or(Some(rest)))
+        && !stripped.is_empty()
+    {
+        out.push(join_rel(&ws.root, Path::new(stripped)));
+    }
+
+    // PHP PSR-4: `App\Models\User` under `App\ → src/` maps to
+    // `src/Models/User`. The candidate list below will try `.php`.
+    for mapping in ws.php_psr4.iter().chain(ws.php_psr0.iter()) {
+        if let Some(stripped) = strip_php_namespace(import_source, &mapping.namespace) {
+            let rel = Path::new(&mapping.directory).join(stripped.replace('\\', "/"));
+            out.push(join_rel(&ws.root, &rel));
+        }
+    }
+
+    // C# root namespace: `MyApp.Services.Foo` under RootNamespace
+    // `MyApp` maps to `Services/Foo`.
+    if let Some(ns) = &ws.csharp_root_namespace
+        && let Some(stripped) = import_source
+            .strip_prefix(ns)
+            .and_then(|rest| rest.strip_prefix('.').or(Some(rest)))
+        && !stripped.is_empty()
+    {
+        let rel = stripped.replace('.', "/");
+        out.push(join_rel(&ws.root, Path::new(&rel)));
+    }
+
+    // Dart: `package:my_app/utils/foo.dart` under package `my_app`
+    // maps to `lib/utils/foo.dart`.
+    if let Some(pkg) = &ws.dart_package {
+        let prefix = format!("package:{pkg}/");
+        if let Some(rest) = import_source.strip_prefix(&prefix) {
+            let rel = Path::new("lib").join(rest);
+            out.push(join_rel(&ws.root, &rel));
+        }
+    }
+
+    // Swift: `import Foo` resolves to `Sources/Foo/` (or the target's
+    // `path:` override). Swift imports are module-granularity, so the
+    // candidate is the target root directory — the resolver's file
+    // index still has to find a matching file inside.
+    for target in &ws.swift_targets {
+        if target.name == import_source {
+            let dir = target
+                .path
+                .as_deref()
+                .map(Path::new)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| Path::new("Sources").join(&target.name));
+            out.push(join_rel(&ws.root, &dir));
+        }
+    }
+
+    out
+}
+
+/// Expand a tsconfig `paths` entry against an import source. Returns
+/// zero-or-more candidates (tsconfig allows an alias to resolve to
+/// multiple target directories).
+fn expand_ts_alias(
+    import_source: &str,
+    alias: &TsPathAlias,
+    ws_root: &Path,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(star) = alias.pattern.find('*') {
+        let prefix = &alias.pattern[..star];
+        let suffix = &alias.pattern[star + 1..];
+        if import_source.starts_with(prefix) && import_source.ends_with(suffix) {
+            let captured = &import_source[prefix.len()..import_source.len() - suffix.len()];
+            for target in &alias.targets {
+                let resolved = target.replace('*', captured);
+                out.push(join_rel(ws_root, Path::new(&resolved)));
+            }
+        }
+    } else if import_source == alias.pattern {
+        for target in &alias.targets {
+            out.push(join_rel(ws_root, Path::new(target)));
+        }
+    }
+    out
+}
+
+/// Strip a PSR-4 / PSR-0 namespace prefix from a class-style import.
+/// PSR-4 namespaces use `\` as the separator and always end with `\`.
+/// We normalize by checking both with and without the trailing
+/// separator.
+fn strip_php_namespace(import_source: &str, namespace: &str) -> Option<String> {
+    // `App\\` canonical form.
+    if let Some(rest) = import_source.strip_prefix(namespace) {
+        return Some(rest.to_string());
+    }
+    // Tolerate a missing trailing backslash in the namespace config.
+    let without_trailing = namespace.trim_end_matches('\\');
+    if !without_trailing.is_empty()
+        && let Some(rest) = import_source.strip_prefix(without_trailing)
+    {
+        return Some(rest.trim_start_matches('\\').to_string());
+    }
+    None
+}
+
+/// Join a workspace-root-relative base with a sub-path and normalize
+/// to forward-slash form. The resolver downstream expects forward
+/// slashes because the file index keys are stored that way.
+fn join_rel(ws_root: &Path, rel: &Path) -> String {
+    let joined = ws_root.join(rel);
+    joined.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegraph::config::{
+        ConfigContext, Psr4Mapping, SwiftTarget, TsPathAlias, WorkspaceConfig,
+    };
+    use std::path::PathBuf;
+
+    fn ctx_with(mut ws: WorkspaceConfig) -> ConfigContext {
+        ws.root = PathBuf::new();
+        let mut c = ConfigContext::default();
+        c.add_workspace(ws);
+        c
+    }
+
+    #[test]
+    fn ts_path_alias_expands_wildcard() {
+        let ctx = ctx_with(WorkspaceConfig {
+            ts_paths: vec![TsPathAlias {
+                pattern: "@/*".to_string(),
+                targets: vec!["src/*".to_string()],
+            }],
+            ..Default::default()
+        });
+        let got = apply_aliases("@/utils/foo", "src/app.ts", &ctx);
+        assert_eq!(got, vec!["src/utils/foo".to_string()]);
+    }
+
+    #[test]
+    fn ts_alias_with_multiple_targets_produces_multiple_candidates() {
+        let ctx = ctx_with(WorkspaceConfig {
+            ts_paths: vec![TsPathAlias {
+                pattern: "@shared/*".to_string(),
+                targets: vec!["shared/*".to_string(), "vendor/shared/*".to_string()],
+            }],
+            ..Default::default()
+        });
+        let got = apply_aliases("@shared/logger", "src/app.ts", &ctx);
+        assert_eq!(
+            got,
+            vec![
+                "shared/logger".to_string(),
+                "vendor/shared/logger".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn go_module_prefix_stripped() {
+        let ctx = ctx_with(WorkspaceConfig {
+            go_module: Some("github.com/acme/svc".to_string()),
+            ..Default::default()
+        });
+        let got = apply_aliases("github.com/acme/svc/pkg/foo", "cmd/main.go", &ctx);
+        assert_eq!(got, vec!["pkg/foo".to_string()]);
+    }
+
+    #[test]
+    fn psr4_namespace_mapped_to_directory() {
+        let ctx = ctx_with(WorkspaceConfig {
+            php_psr4: vec![Psr4Mapping {
+                namespace: "App\\".to_string(),
+                directory: "src/".to_string(),
+            }],
+            ..Default::default()
+        });
+        let got = apply_aliases("App\\Models\\User", "src/app.php", &ctx);
+        assert_eq!(got, vec!["src/Models/User".to_string()]);
+    }
+
+    #[test]
+    fn csharp_root_namespace_mapped_to_path() {
+        let ctx = ctx_with(WorkspaceConfig {
+            csharp_root_namespace: Some("MyApp".to_string()),
+            ..Default::default()
+        });
+        let got = apply_aliases("MyApp.Services.UserService", "Program.cs", &ctx);
+        assert_eq!(got, vec!["Services/UserService".to_string()]);
+    }
+
+    #[test]
+    fn dart_package_prefix_mapped_to_lib() {
+        let ctx = ctx_with(WorkspaceConfig {
+            dart_package: Some("my_app".to_string()),
+            ..Default::default()
+        });
+        let got = apply_aliases("package:my_app/utils/foo.dart", "lib/app.dart", &ctx);
+        assert_eq!(got, vec!["lib/utils/foo.dart".to_string()]);
+    }
+
+    #[test]
+    fn swift_target_name_mapped_to_sources() {
+        let ctx = ctx_with(WorkspaceConfig {
+            swift_targets: vec![SwiftTarget {
+                name: "MyLib".to_string(),
+                path: None,
+            }],
+            ..Default::default()
+        });
+        let got = apply_aliases("MyLib", "Sources/App/Main.swift", &ctx);
+        assert_eq!(got, vec!["Sources/MyLib".to_string()]);
+    }
+
+    #[test]
+    fn swift_target_with_custom_path_used() {
+        let ctx = ctx_with(WorkspaceConfig {
+            swift_targets: vec![SwiftTarget {
+                name: "MyLib".to_string(),
+                path: Some("Custom/Dir".to_string()),
+            }],
+            ..Default::default()
+        });
+        let got = apply_aliases("MyLib", "Sources/App/Main.swift", &ctx);
+        assert_eq!(got, vec!["Custom/Dir".to_string()]);
+    }
+
+    #[test]
+    fn no_matches_returns_empty() {
+        let ctx = ctx_with(WorkspaceConfig::default());
+        let got = apply_aliases("./utils/foo", "src/app.ts", &ctx);
+        assert!(got.is_empty());
+    }
 }

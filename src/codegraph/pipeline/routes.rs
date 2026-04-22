@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use super::phase::{Phase, PhaseCtx};
 use super::PhaseResult;
 use crate::codegraph::db::SharedCodeGraphDb;
 use crate::codegraph::lang;
@@ -54,6 +55,13 @@ pub async fn detect_routes(
 
     let mut routes: Vec<DetectedRoute> = Vec::new();
     let mut tools: Vec<DetectedTool> = Vec::new();
+    // Fetch-call records: (source_file, method, url). Processed after
+    // Route nodes exist so FETCHES edges can MATCH against them.
+    let mut fetch_calls: Vec<(String, String, String)> = Vec::new();
+    // HTML form-action records: same shape as fetch_calls. Kept
+    // separate only for cleaner logging — they produce FETCHES
+    // edges identically.
+    let mut html_forms: Vec<(String, String, String)> = Vec::new();
 
     for file_path in files {
         let ext = file_path
@@ -80,6 +88,42 @@ pub async fn detect_routes(
         detect_expo_routes(&relative, &mut routes);
         detect_decorator_routes(&relative, &content, &mut routes);
         detect_tool_definitions(&relative, &content, &mut tools);
+
+        // Dispatch to the framework-specific extractors in
+        // `semantic::route_extractors` — they pick up Django `urls.py`,
+        // FastAPI / Flask decorators, Laravel / Symfony, ASP.NET.
+        // Each returns `DetectedRoute { method, path, handler_name,
+        // line }` where `handler_name` is the bare function name; we
+        // join with the source_file to match the pipeline's
+        // `{relative}::{name}` qname scheme used by
+        // `detect_decorator_routes`.
+        let ext_routes = crate::codegraph::semantic::route_extractors::extract_all(
+            file_path, &content,
+        );
+        for r in ext_routes {
+            routes.push(DetectedRoute {
+                method: r.method,
+                path: r.path,
+                handler_qname: format!("{relative}::{}", r.handler_name),
+                source_file: relative.clone(),
+            });
+        }
+
+        // Fetch / axios / requests calls. Target route matching
+        // happens once all routes are known; for now we just
+        // collect.
+        for f in crate::codegraph::semantic::response_shapes::extract(&content) {
+            fetch_calls.push((relative.clone(), f.method, f.url));
+        }
+
+        // HTML form actions and script-src references. Only
+        // relevant for .html / .htm files, but the extractor short-
+        // circuits cheaply on non-matching content.
+        if ext == "html" || ext == "htm" {
+            for form in crate::codegraph::lang::html::extract_form_actions(&content) {
+                html_forms.push((relative.clone(), form.method, form.url));
+            }
+        }
     }
 
     if routes.is_empty() {
@@ -176,6 +220,52 @@ pub async fn detect_routes(
                 ));
             }
         }
+    }
+
+    // ── FETCHES edges ───────────────────────────────────────────────
+    // For every fetch/axios/requests call and every HTML form-action,
+    // if the URL matches a Route we just created, emit a FETCHES
+    // edge from the calling file to the Route. URL matching is
+    // exact-string for now — downstream phases can upgrade to
+    // normalised patterns (`:id` → regex) as needed.
+    let mut route_qname_by_key: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for route in &routes {
+        // Same key shape as the Route.qualified_name construction
+        // above (method + path), preserved literally so lookup
+        // succeeds.
+        let route_qname = format!(
+            "{pid}::route::{}::{}",
+            cypher_escape(&route.method),
+            cypher_escape(&route.path)
+        );
+        route_qname_by_key
+            .entry((route.method.clone(), route.path.clone()))
+            .or_insert(route_qname);
+    }
+    let mut seen_fetches: HashSet<(String, String)> = HashSet::new();
+    for (source_file, method, url) in fetch_calls.iter().chain(html_forms.iter()) {
+        // Try the exact (method, url) match first; fall back to
+        // catch-all method "*" which many extractors emit.
+        let matched = route_qname_by_key
+            .get(&(method.clone(), url.clone()))
+            .or_else(|| route_qname_by_key.get(&("*".to_string(), url.clone())))
+            .cloned();
+        let Some(route_qname) = matched else { continue };
+        let key = (source_file.clone(), route_qname.clone());
+        if !seen_fetches.insert(key) {
+            continue;
+        }
+        let src_qname = format!("{pid}::{}", cypher_escape(source_file));
+        let src_escaped = cypher_escape(&src_qname);
+        let route_escaped = cypher_escape(&route_qname);
+        edge_stmts.push(format!(
+            "MATCH (f:File), (r:Route) \
+             WHERE f.qualified_name = '{src_escaped}' AND f.project_id = '{pid}' \
+             AND r.qualified_name = '{route_escaped}' AND r.project_id = '{pid}' \
+             CREATE (f)-[:CodeRelation {{type: 'FETCHES', confidence: 0.75, \
+             reason: 'url match', step: 0}}]->(r)"
+        ));
     }
 
     if !node_stmts.is_empty() {
@@ -563,4 +653,24 @@ fn detect_tool_definitions(relative: &str, content: &str, tools: &mut Vec<Detect
 
     // Drop any tools whose handler was never resolved
     tools.retain(|t| !t.handler_qname.contains("__tool_pending_"));
+}
+
+/// Routes phase: detects framework routes + MCP tools and links them to
+/// their handler functions. Runs silently (no UI progress event) because
+/// the UI has no dedicated `Routes` phase segment today.
+pub struct RoutesPhase;
+
+#[async_trait::async_trait]
+impl Phase for RoutesPhase {
+    fn label(&self) -> &'static str {
+        "routes"
+    }
+
+    async fn run(&self, ctx: &mut PhaseCtx) -> Result<()> {
+        let result =
+            detect_routes(&ctx.project_id, &ctx.root_path, &ctx.files, &ctx.db).await?;
+        ctx.stats.nodes_created += result.nodes_created;
+        ctx.stats.edges_created += result.edges_created;
+        Ok(())
+    }
 }

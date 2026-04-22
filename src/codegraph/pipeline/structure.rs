@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+use super::phase::{Phase, PhaseCtx};
 use super::PhaseResult;
 use crate::codegraph::db::SharedCodeGraphDb;
+use crate::codegraph::types::PipelinePhase;
 
 /// Escape a string for use in a Cypher string literal.
 fn cypher_escape(s: &str) -> String {
@@ -283,4 +285,37 @@ pub async fn build_structure(
     );
 
     Ok(result)
+}
+
+/// Structure phase: builds Project/Folder/File/Package/Module nodes and
+/// their CONTAINS edges from the files the walker produced, then parses
+/// detected build-system manifests into `ctx.config_context` for the
+/// imports phase to consume.
+pub struct StructurePhase;
+
+#[async_trait::async_trait]
+impl Phase for StructurePhase {
+    fn label(&self) -> &'static str {
+        "structure"
+    }
+
+    fn phase(&self) -> Option<PipelinePhase> {
+        Some(PipelinePhase::Structure)
+    }
+
+    async fn run(&self, ctx: &mut PhaseCtx) -> Result<()> {
+        ctx.emit_progress(PipelinePhase::Structure, 0.0, "Building structural nodes");
+        let result = build_structure(&ctx.project_id, &ctx.root_path, &ctx.files, &ctx.db).await?;
+        ctx.stats.nodes_created += result.nodes_created;
+        ctx.stats.edges_created += result.edges_created;
+
+        // Parse any manifests we found in the walk into a
+        // ConfigContext. Failures per-manifest are logged inside the
+        // loader and don't fail the pipeline.
+        ctx.config_context =
+            crate::codegraph::config::load_config_context(&ctx.root_path, &ctx.files).await;
+
+        ctx.emit_progress(PipelinePhase::Structure, 1.0, "Structure complete");
+        Ok(())
+    }
 }
