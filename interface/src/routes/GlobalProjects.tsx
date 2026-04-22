@@ -564,6 +564,26 @@ export function GlobalProjects() {
 		},
 	});
 
+	// Live-refresh the list when the file watcher reports a graph change or
+	// completed re-index. Without this the language breakdown on each card
+	// only updates on the 10s idle poll — a file add/delete would lag.
+	useEffect(() => {
+		const source = new EventSource(api.getEventsUrl());
+		const handle = (e: MessageEvent) => {
+			try {
+				const event = JSON.parse(e.data);
+				if (event.type === "code_graph_changed" || event.type === "code_graph_indexed") {
+					queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
+					if (event.project_id) {
+						queryClient.invalidateQueries({ queryKey: ["codegraph-project", event.project_id] });
+					}
+				}
+			} catch { /* ignore parse errors */ }
+		};
+		source.addEventListener("message", handle);
+		return () => source.close();
+	}, [queryClient]);
+
 	const projects = data?.projects ?? [];
 	const needsReindex = projects.filter((p) => p.status === "pending" && p.last_indexed_at);
 	const filtered = statusFilter === "all"

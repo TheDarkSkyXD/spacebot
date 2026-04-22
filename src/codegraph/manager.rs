@@ -974,11 +974,29 @@ async fn run_incremental_worker(
                     "incremental update applied"
                 );
 
-                let mut reg = inner.registry.write().await;
-                if let Some(project) = reg.get_mut(&project_id) {
-                    project.status = IndexStatus::Indexed;
-                    project.last_indexed_at = Some(chrono::Utc::now());
-                    project.updated_at = chrono::Utc::now();
+                // Re-walk the tree so added/deleted files are reflected in the
+                // breakdown. A language that dropped to zero bytes is removed
+                // entirely (detect_languages only inserts non-zero entries),
+                // which is what fixes the stale "0.0%" rows in the UI.
+                let language_breakdown =
+                    CodeGraphManager::detect_languages(&root_path).await;
+                let primary_language = language_breakdown
+                    .first()
+                    .map(|entry| entry.name.clone());
+
+                {
+                    let mut reg = inner.registry.write().await;
+                    if let Some(project) = reg.get_mut(&project_id) {
+                        project.status = IndexStatus::Indexed;
+                        project.last_indexed_at = Some(chrono::Utc::now());
+                        project.primary_language = primary_language;
+                        project.language_breakdown = language_breakdown;
+                        project.updated_at = chrono::Utc::now();
+                    }
+                }
+
+                if let Err(err) = CodeGraphManager::save_registry_inner(&inner).await {
+                    tracing::warn!(%err, "failed to save registry after incremental update");
                 }
             }
             Err(err) => {
@@ -1044,7 +1062,7 @@ async fn trigger_full_reindex(
 
     let handle = pipeline::start_full_pipeline(
         project_id.clone(),
-        root_path,
+        root_path.clone(),
         db,
         config,
         inner.event_tx.clone(),
@@ -1052,13 +1070,27 @@ async fn trigger_full_reindex(
 
     match handle.wait().await {
         Ok(stats) => {
-            let mut reg = inner.registry.write().await;
-            if let Some(project) = reg.get_mut(&project_id) {
-                project.status = IndexStatus::Indexed;
-                project.error_message = None;
-                project.last_index_stats = Some(stats);
-                project.last_indexed_at = Some(chrono::Utc::now());
-                project.updated_at = chrono::Utc::now();
+            let language_breakdown =
+                CodeGraphManager::detect_languages(&root_path).await;
+            let primary_language = language_breakdown
+                .first()
+                .map(|entry| entry.name.clone());
+
+            {
+                let mut reg = inner.registry.write().await;
+                if let Some(project) = reg.get_mut(&project_id) {
+                    project.status = IndexStatus::Indexed;
+                    project.error_message = None;
+                    project.primary_language = primary_language;
+                    project.language_breakdown = language_breakdown;
+                    project.last_index_stats = Some(stats);
+                    project.last_indexed_at = Some(chrono::Utc::now());
+                    project.updated_at = chrono::Utc::now();
+                }
+            }
+
+            if let Err(err) = CodeGraphManager::save_registry_inner(&inner).await {
+                tracing::warn!(%err, "failed to save registry after full re-index");
             }
             Ok(())
         }

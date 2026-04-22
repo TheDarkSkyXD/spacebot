@@ -16,6 +16,10 @@ interface Slice {
 
 const OTHER_COLOR = "#8b8b8b";
 
+// Anything below this rounds to "0.0%" with toFixed(1). Fold those into
+// "Other" so the legend never shows a visually-empty row.
+const MIN_VISIBLE_PERCENT = 0.05;
+
 function buildSlices(
 	breakdown: CodeGraphLanguageCount[],
 	topN: number,
@@ -24,25 +28,36 @@ function buildSlices(
 	if (total === 0) return null;
 
 	const sorted = [...breakdown].sort((a, b) => b.count - a.count);
-	const top = sorted.slice(0, topN);
+	const topCandidates = sorted.slice(0, topN);
 	const rest = sorted.slice(topN);
-	const restCount = rest.reduce((sum, entry) => sum + entry.count, 0);
+	let restCount = rest.reduce((sum, entry) => sum + entry.count, 0);
 
-	const slices: Slice[] = top.map((entry) => ({
-		name: entry.name,
-		count: entry.count,
-		percent: (entry.count / total) * 100,
-		color: languageColor(entry.name),
-	}));
-	if (restCount > 0) {
+	const slices: Slice[] = [];
+	for (const entry of topCandidates) {
+		const percent = (entry.count / total) * 100;
+		if (percent < MIN_VISIBLE_PERCENT) {
+			restCount += entry.count;
+			continue;
+		}
+		slices.push({
+			name: entry.name,
+			count: entry.count,
+			percent,
+			color: languageColor(entry.name),
+		});
+	}
+
+	const restPercent = (restCount / total) * 100;
+	if (restPercent >= MIN_VISIBLE_PERCENT) {
 		slices.push({
 			name: "Other",
 			count: restCount,
-			percent: (restCount / total) * 100,
+			percent: restPercent,
 			color: OTHER_COLOR,
 		});
 	}
-	return slices;
+
+	return slices.length > 0 ? slices : null;
 }
 
 function formatPercent(pct: number): string {
