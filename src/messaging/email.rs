@@ -27,11 +27,18 @@ const EMAIL_MAX_RETRY_BACKOFF_SECS: u64 = 300;
 /// Proton Bridge (and similar local bridges) expose IMAP/SMTP over plain TCP
 /// on localhost. The `imap` crate's `Session<T>` is generic, so we need this
 /// enum to support both paths at runtime.
+///
+/// The TLS variant is boxed because `imap::Session<TlsStream>` is ~368 bytes
+/// while the plaintext variant is ~120 bytes; boxing keeps the enum compact.
 enum ImapSession {
-    Tls(imap::Session<native_tls::TlsStream<std::net::TcpStream>>),
+    Tls(Box<imap::Session<native_tls::TlsStream<std::net::TcpStream>>>),
     Plain(imap::Session<std::net::TcpStream>),
 }
 
+// `imap::Error` is ~256 bytes and lives in an external crate, so we can't
+// box it at the source. Allow the lint here because changing these return
+// types would ripple through every caller for no real benefit.
+#[allow(clippy::result_large_err)]
 impl ImapSession {
     fn select(&mut self, folder: &str) -> imap::error::Result<imap::types::Mailbox> {
         match self {
@@ -791,7 +798,7 @@ fn open_imap_session(config: &EmailPollConfig) -> anyhow::Result<ImapSession> {
             .map_err(|error| anyhow::anyhow!(error.0))
             .context("failed to authenticate to IMAP server")?;
 
-        Ok(ImapSession::Tls(session))
+        Ok(ImapSession::Tls(Box::new(session)))
     } else {
         if !is_local_mail_host(&config.imap_host) {
             return Err(anyhow::anyhow!(

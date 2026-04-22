@@ -2108,17 +2108,17 @@ impl Tool for BrowserCloseTool {
                     task.abort();
                 }
 
-                if let Some(mut browser) = browser {
-                    if let Err(error) = browser.close().await {
-                        // The browser connection may already be dead (e.g. "oneshot canceled"
-                        // from a dropped WebSocket). That's fine — the browser is effectively
-                        // closed. Log it but don't fail the tool call.
-                        tracing::warn!(
-                            policy = "close_browser",
-                            %error,
-                            "browser.close() failed, treating as already closed"
-                        );
-                    }
+                if let Some(mut browser) = browser
+                    && let Err(error) = browser.close().await
+                {
+                    // The browser connection may already be dead (e.g. "oneshot canceled"
+                    // from a dropped WebSocket). That's fine — the browser is effectively
+                    // closed. Log it but don't fail the tool call.
+                    tracing::warn!(
+                        policy = "close_browser",
+                        %error,
+                        "browser.close() failed, treating as already closed"
+                    );
                 }
 
                 if !persistent_profile && let Some(dir) = user_data_dir {
