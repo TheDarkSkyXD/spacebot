@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { api, type CodeGraphProject, type CodeGraphIndexStatus, type DirEntry } from "@/api/client";
+import { api, type CodeGraphProject, type CodeGraphIndexStatus, type DirEntry, type CodeGraphProjectListResponse, type CodeGraphProjectDetailResponse } from "@/api/client";
 import { Badge, Button } from "@/ui";
+import { LanguageBreakdown } from "@/components/projects/LanguageBreakdown";
 import {
 	Dialog,
 	DialogContent,
@@ -28,7 +29,7 @@ const STATUS_CONFIG: Record<
 	indexing: { label: "Indexing", color: "text-blue-400", dot: "bg-blue-500" },
 	stale: { label: "Stale", color: "text-amber-400", dot: "bg-amber-500" },
 	error: { label: "Error", color: "text-red-400", dot: "bg-red-500" },
-	pending: { label: "Pending", color: "text-ink-faint", dot: "bg-ink-faint" },
+	pending: { label: "Pending", color: "text-amber-400", dot: "bg-amber-500" },
 };
 
 function StatusBadge({ status, progress }: { status: CodeGraphIndexStatus; progress?: CodeGraphProject["progress"] }) {
@@ -67,7 +68,45 @@ const PHASE_COLORS: Record<string, string> = {
 };
 
 function ProjectCard({ project }: { project: CodeGraphProject }) {
+	const queryClient = useQueryClient();
+	const [removeOpen, setRemoveOpen] = useState(false);
+	const reindexMutation = useMutation({
+		mutationFn: () => api.codegraphReindex(project.project_id),
+		onMutate: async () => {
+			const listKey = ["codegraph-projects"];
+			const detailKey = ["codegraph-project", project.project_id];
+			await Promise.all([
+				queryClient.cancelQueries({ queryKey: listKey }),
+				queryClient.cancelQueries({ queryKey: detailKey }),
+			]);
+			const prevList = queryClient.getQueryData<CodeGraphProjectListResponse>(listKey);
+			const prevDetail = queryClient.getQueryData<CodeGraphProjectDetailResponse>(detailKey);
+			if (prevList) {
+				queryClient.setQueryData<CodeGraphProjectListResponse>(listKey, {
+					projects: prevList.projects.map((p) =>
+						p.project_id === project.project_id ? { ...p, status: "indexing" } : p,
+					),
+				});
+			}
+			if (prevDetail) {
+				queryClient.setQueryData<CodeGraphProjectDetailResponse>(detailKey, {
+					project: { ...prevDetail.project, status: "indexing" },
+				});
+			}
+			return { prevList, prevDetail };
+		},
+		onError: (_err, _vars, ctx) => {
+			if (ctx?.prevList) queryClient.setQueryData(["codegraph-projects"], ctx.prevList);
+			if (ctx?.prevDetail) queryClient.setQueryData(["codegraph-project", project.project_id], ctx.prevDetail);
+		},
+		onSettled: () => {
+			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
+			queryClient.invalidateQueries({ queryKey: ["codegraph-project", project.project_id] });
+		},
+	});
+
 	const isIndexing = project.status === "indexing";
+	const needsReindex = project.status === "pending" && !!project.last_indexed_at;
 	const progress = project.progress;
 	const stats = isIndexing ? progress?.stats : project.last_index_stats;
 
@@ -98,8 +137,40 @@ function ProjectCard({ project }: { project: CodeGraphProject }) {
 						<p className="truncate text-xs text-ink-faint">{project.root_path}</p>
 					</div>
 				</div>
-				<StatusBadge status={project.status} progress={project.progress} />
+				<div className="flex items-center gap-2">
+					<StatusBadge status={project.status} progress={project.progress} />
+					<button
+						type="button"
+						onClick={(e) => { e.preventDefault(); e.stopPropagation(); setRemoveOpen(true); }}
+						title="Remove project"
+						aria-label="Remove project"
+						className="rounded p-1 text-ink-faint transition-colors hover:bg-red-500/10 hover:text-red-400"
+					>
+						<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+							<polyline points="3 6 5 6 21 6" />
+							<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+							<path d="M10 11v6" />
+							<path d="M14 11v6" />
+							<path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
+						</svg>
+					</button>
+				</div>
 			</div>
+
+			{/* Schema upgrade banner */}
+			{needsReindex && (
+				<div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2">
+					<span className="flex-1 text-xs text-amber-400">Re-index required — engine updated</span>
+					<Button
+						size="sm"
+						onClick={(e) => { e.preventDefault(); reindexMutation.mutate(); }}
+						disabled={reindexMutation.isPending}
+						className="h-6 px-2 text-[10px]"
+					>
+						{reindexMutation.isPending ? "Starting..." : "Re-index"}
+					</Button>
+				</div>
+			)}
 
 			{/* Indexing progress bar — segmented by phase */}
 			{isIndexing && progress && (
@@ -145,11 +216,15 @@ function ProjectCard({ project }: { project: CodeGraphProject }) {
 				</p>
 			)}
 
-			{project.primary_language && (
+			{project.language_breakdown && project.language_breakdown.length > 0 ? (
+				<div className="mt-3">
+					<LanguageBreakdown breakdown={project.language_breakdown} />
+				</div>
+			) : project.primary_language ? (
 				<div className="mt-2">
 					<Badge variant="default" size="sm">{project.primary_language}</Badge>
 				</div>
-			)}
+			) : null}
 
 			{/* Actions */}
 			<div className="mt-4 flex items-center gap-2">
@@ -161,7 +236,75 @@ function ProjectCard({ project }: { project: CodeGraphProject }) {
 					View Details
 				</Link>
 			</div>
+
+			<RemoveProjectDialog
+				project={project}
+				open={removeOpen}
+				onOpenChange={setRemoveOpen}
+			/>
 		</motion.div>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Remove Project Dialog
+// ---------------------------------------------------------------------------
+
+function RemoveProjectDialog({
+	project,
+	open,
+	onOpenChange,
+}: {
+	project: CodeGraphProject;
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+}) {
+	const queryClient = useQueryClient();
+
+	const { data: removeInfo } = useQuery({
+		queryKey: ["codegraph-remove-info", project.project_id],
+		queryFn: () => api.codegraphRemoveInfo(project.project_id),
+		enabled: open,
+	});
+
+	const mutation = useMutation({
+		mutationFn: () => api.codegraphDeleteProject(project.project_id),
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
+			onOpenChange(false);
+		},
+	});
+
+	return (
+		<Dialog open={open} onOpenChange={onOpenChange}>
+			<DialogContent>
+				<DialogHeader>
+					<DialogTitle>Remove Project: {project.name}?</DialogTitle>
+					<DialogDescription>This will permanently delete:</DialogDescription>
+				</DialogHeader>
+				<div className="flex flex-col gap-2 py-4 text-sm text-ink-dull">
+					{removeInfo && (
+						<>
+							<p>Code graph index ({removeInfo.node_count.toLocaleString()} nodes, {removeInfo.edge_count.toLocaleString()} edges)</p>
+							<p>All index history and logs</p>
+						</>
+					)}
+					<p className="mt-2 font-medium text-red-400">This cannot be undone.</p>
+				</div>
+				<DialogFooter>
+					<Button variant="ghost" onClick={() => onOpenChange(false)}>
+						Cancel
+					</Button>
+					<Button
+						variant="destructive"
+						onClick={() => mutation.mutate()}
+						disabled={mutation.isPending}
+					>
+						{mutation.isPending ? "Removing..." : "Remove Project"}
+					</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
 	);
 }
 
@@ -408,6 +551,7 @@ function CreateProjectDialog({
 // ---------------------------------------------------------------------------
 
 export function GlobalProjects() {
+	const queryClient = useQueryClient();
 	const [createOpen, setCreateOpen] = useState(false);
 	const [statusFilter, setStatusFilter] = useState<CodeGraphIndexStatus | "all">("all");
 
@@ -421,9 +565,19 @@ export function GlobalProjects() {
 	});
 
 	const projects = data?.projects ?? [];
+	const needsReindex = projects.filter((p) => p.status === "pending" && p.last_indexed_at);
 	const filtered = statusFilter === "all"
 		? projects
 		: projects.filter((p) => p.status === statusFilter);
+
+	const reindexAllMutation = useMutation({
+		mutationFn: async () => {
+			await Promise.all(needsReindex.map((p) => api.codegraphReindex(p.project_id)));
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
+		},
+	});
 
 	return (
 		<div className="flex h-full flex-col overflow-y-auto p-6">
@@ -438,9 +592,26 @@ export function GlobalProjects() {
 				<Button onClick={() => setCreateOpen(true)}>+ Add Project</Button>
 			</div>
 
+			{/* Schema upgrade banner */}
+			{needsReindex.length > 0 && (
+				<div className="mb-4 flex items-center gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+					<div className="h-2 w-2 rounded-full bg-amber-500" />
+					<p className="flex-1 text-sm text-amber-400">
+						{needsReindex.length} project{needsReindex.length !== 1 ? "s need" : " needs"} re-indexing after engine update
+					</p>
+					<Button
+						size="sm"
+						onClick={() => reindexAllMutation.mutate()}
+						disabled={reindexAllMutation.isPending}
+					>
+						{reindexAllMutation.isPending ? "Starting..." : `Re-index All (${needsReindex.length})`}
+					</Button>
+				</div>
+			)}
+
 			{/* Filter */}
 			<div className="mb-4 flex gap-2">
-				{(["all", "indexed", "indexing", "stale", "error"] as const).map((s) => (
+				{(["all", "indexed", "indexing", "pending", "stale", "error"] as const).map((s) => (
 					<button
 						key={s}
 						onClick={() => setStatusFilter(s)}

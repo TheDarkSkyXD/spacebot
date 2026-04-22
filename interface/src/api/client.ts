@@ -1362,9 +1362,15 @@ export interface CodeGraphProject {
 	last_index_stats?: CodeGraphPipelineStats;
 	last_indexed_at?: string;
 	primary_language?: string;
+	language_breakdown?: CodeGraphLanguageCount[];
 	schema_version: number;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface CodeGraphLanguageCount {
+	name: string;
+	count: number;
 }
 
 export interface CodeGraphPipelineStats {

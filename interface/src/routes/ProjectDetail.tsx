@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { api, type CodeGraphProject } from "@/api/client";
+import { api, type CodeGraphProject, type CodeGraphProjectDetailResponse, type CodeGraphProjectListResponse } from "@/api/client";
 import { Button } from "@/ui";
 import {
 	Dialog,
@@ -14,6 +14,7 @@ import {
 import { useSetTopBar } from "@/components/TopBar";
 import { clsx } from "clsx";
 import { CodeGraphTab } from "@/components/projects/CodeGraphTab";
+import { LanguageBreakdown } from "@/components/projects/LanguageBreakdown";
 
 // ---------------------------------------------------------------------------
 // Sub-tab definitions
@@ -359,8 +360,40 @@ function OverviewTab({ project }: { project: CodeGraphProject }) {
 
 	const reindexMutation = useMutation({
 		mutationFn: () => api.codegraphReindex(project.project_id),
-		onSuccess: () => {
+		onMutate: async () => {
+			const detailKey = ["codegraph-project", project.project_id];
+			const listKey = ["codegraph-projects"];
+			await Promise.all([
+				queryClient.cancelQueries({ queryKey: detailKey }),
+				queryClient.cancelQueries({ queryKey: listKey }),
+			]);
+			const prevDetail = queryClient.getQueryData<CodeGraphProjectDetailResponse>(detailKey);
+			const prevList = queryClient.getQueryData<CodeGraphProjectListResponse>(listKey);
+			if (prevDetail) {
+				queryClient.setQueryData<CodeGraphProjectDetailResponse>(detailKey, {
+					project: { ...prevDetail.project, status: "indexing" },
+				});
+			}
+			if (prevList) {
+				queryClient.setQueryData<CodeGraphProjectListResponse>(listKey, {
+					projects: prevList.projects.map((p) =>
+						p.project_id === project.project_id ? { ...p, status: "indexing" } : p,
+					),
+				});
+			}
+			return { prevDetail, prevList };
+		},
+		onError: (_err, _vars, ctx) => {
+			if (ctx?.prevDetail) {
+				queryClient.setQueryData(["codegraph-project", project.project_id], ctx.prevDetail);
+			}
+			if (ctx?.prevList) {
+				queryClient.setQueryData(["codegraph-projects"], ctx.prevList);
+			}
+		},
+		onSettled: () => {
 			queryClient.invalidateQueries({ queryKey: ["codegraph-project", project.project_id] });
+			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
 		},
 	});
 
@@ -374,40 +407,38 @@ function OverviewTab({ project }: { project: CodeGraphProject }) {
 			{/* Live indexing progress — stays visible during animation + after completion */}
 			{showProgress && <IndexingProgress project={project} />}
 
-			{/* Status banner — shown when not actively indexing */}
-			{!showProgress && (project.status === "indexed" || project.status === "error") && (
-				<div
-					className={clsx(
-						"flex items-center gap-3 rounded-xl border p-4",
-						project.status === "indexed"
-							? "border-emerald-500/30 bg-emerald-500/5"
-							: "border-red-500/30 bg-red-500/5",
-					)}
-				>
-					<div
-						className={clsx(
-							"h-2.5 w-2.5 rounded-full",
-							project.status === "indexed" ? "bg-emerald-500" : "bg-red-500",
-						)}
-					/>
-					<div className="flex flex-col gap-1">
-						<p
-							className={clsx(
-								"text-sm font-semibold",
-								project.status === "indexed" ? "text-emerald-400" : "text-red-400",
-							)}
-						>
-							{project.status === "indexed" ? "Index Completed" : "Index Failed"}
+			{/* Schema upgrade banner — project was previously indexed but schema changed */}
+			{!showProgress && project.status === "pending" && project.last_indexed_at && (
+				<div className="flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
+					<div className="h-2.5 w-2.5 rounded-full bg-amber-500" />
+					<div className="flex flex-1 flex-col gap-1">
+						<p className="text-sm font-semibold text-amber-400">
+							Re-index Required
 						</p>
-						{project.status === "error" && project.error_message && (
+						<p className="text-xs text-amber-300/80">
+							The code graph engine was updated. Please re-index to view your project.
+						</p>
+					</div>
+					<Button
+						size="sm"
+						onClick={() => reindexMutation.mutate()}
+						disabled={reindexMutation.isPending}
+					>
+						{reindexMutation.isPending ? "Starting..." : "Re-index Now"}
+					</Button>
+				</div>
+			)}
+
+			{/* Status banner — shown when not actively indexing */}
+			{!showProgress && project.status === "error" && (
+				<div className="flex items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/5 p-4">
+					<div className="h-2.5 w-2.5 rounded-full bg-red-500" />
+					<div className="flex flex-col gap-1">
+						<p className="text-sm font-semibold text-red-400">Index Failed</p>
+						{project.error_message && (
 							<p className="text-xs text-red-300/80">{project.error_message}</p>
 						)}
 					</div>
-					{project.status === "indexed" && project.last_indexed_at && (
-						<span className="ml-auto text-xs text-ink-faint">
-							{new Date(project.last_indexed_at).toLocaleString()}
-						</span>
-					)}
 				</div>
 			)}
 
@@ -450,21 +481,26 @@ function OverviewTab({ project }: { project: CodeGraphProject }) {
 							</span>
 						</dd>
 					</div>
-					<div>
-						<dt className="text-ink-faint">Language</dt>
-						<dd className="text-ink">{project.primary_language ?? "Detecting..."}</dd>
-					</div>
 					{project.last_indexed_at && (
 						<div>
 							<dt className="text-ink-faint">Last Indexed</dt>
 							<dd className="text-ink">{new Date(project.last_indexed_at).toLocaleString()}</dd>
 						</div>
 					)}
-					<div>
-						<dt className="text-ink-faint">Schema Version</dt>
-						<dd className="text-ink">{project.schema_version}</dd>
-					</div>
 				</dl>
+				{project.language_breakdown && project.language_breakdown.length > 0 ? (
+					<div className="mt-5 border-t border-app-line pt-5">
+						<LanguageBreakdown
+							breakdown={project.language_breakdown}
+							topN={project.language_breakdown.length}
+						/>
+					</div>
+				) : project.primary_language ? (
+					<div className="mt-5 border-t border-app-line pt-5">
+						<dt className="text-ink-faint text-sm">Language</dt>
+						<dd className="text-ink text-sm">{project.primary_language}</dd>
+					</div>
+				) : null}
 			</div>
 
 			{/* Stats */}
@@ -490,15 +526,6 @@ function OverviewTab({ project }: { project: CodeGraphProject }) {
 				</div>
 			)}
 
-			{/* Actions */}
-			<div className="flex gap-3">
-				<Button
-					onClick={() => reindexMutation.mutate()}
-					disabled={reindexMutation.isPending || project.status === "indexing"}
-				>
-					{reindexMutation.isPending ? "Starting..." : "Re-index"}
-				</Button>
-			</div>
 		</div>
 	);
 }
@@ -510,6 +537,7 @@ function OverviewTab({ project }: { project: CodeGraphProject }) {
 export function ProjectDetail({ projectId, initialTab }: { projectId: string; initialTab?: string }) {
 	const [activeTab, setActiveTab] = useState<TabKey>((initialTab as TabKey) || "overview");
 	const [removeOpen, setRemoveOpen] = useState(false);
+	const queryClient = useQueryClient();
 
 	const { data, isLoading } = useQuery({
 		queryKey: ["codegraph-project", projectId],
@@ -525,6 +553,51 @@ export function ProjectDetail({ projectId, initialTab }: { projectId: string; in
 	});
 
 	const project = data?.project;
+
+	// Header reindex — flips the detail + list caches to status="indexing"
+	// immediately on click so the UI shows the state transition before the
+	// server round-trip lands.
+	const reindexMutation = useMutation({
+		mutationFn: () => api.codegraphReindex(projectId),
+		onMutate: async () => {
+			const detailKey = ["codegraph-project", projectId];
+			const listKey = ["codegraph-projects"];
+			await Promise.all([
+				queryClient.cancelQueries({ queryKey: detailKey }),
+				queryClient.cancelQueries({ queryKey: listKey }),
+			]);
+			const prevDetail = queryClient.getQueryData<CodeGraphProjectDetailResponse>(detailKey);
+			const prevList = queryClient.getQueryData<CodeGraphProjectListResponse>(listKey);
+			if (prevDetail) {
+				queryClient.setQueryData<CodeGraphProjectDetailResponse>(detailKey, {
+					project: { ...prevDetail.project, status: "indexing" },
+				});
+			}
+			if (prevList) {
+				queryClient.setQueryData<CodeGraphProjectListResponse>(listKey, {
+					projects: prevList.projects.map((p) =>
+						p.project_id === projectId ? { ...p, status: "indexing" } : p,
+					),
+				});
+			}
+			return { prevDetail, prevList };
+		},
+		onError: (_err, _vars, ctx) => {
+			if (ctx?.prevDetail) queryClient.setQueryData(["codegraph-project", projectId], ctx.prevDetail);
+			if (ctx?.prevList) queryClient.setQueryData(["codegraph-projects"], ctx.prevList);
+		},
+		onSettled: () => {
+			queryClient.invalidateQueries({ queryKey: ["codegraph-project", projectId] });
+			queryClient.invalidateQueries({ queryKey: ["codegraph-projects"] });
+		},
+	});
+
+	// Kick user back to overview if indexing starts while on Code Graph tab.
+	useEffect(() => {
+		if (activeTab === "code-graph" && project && project.status !== "indexed" && project.status !== "stale") {
+			setActiveTab("overview");
+		}
+	}, [activeTab, project]);
 
 	useSetTopBar(
 		<div className="flex h-full items-center gap-4 px-6">
@@ -551,29 +624,45 @@ export function ProjectDetail({ projectId, initialTab }: { projectId: string; in
 			{/* Tab bar */}
 			<div className="flex items-center justify-between border-b border-app-line px-6">
 				<div className="flex">
-					{TABS.map((tab) => (
-						<button
-							key={tab.key}
-							onClick={() => setActiveTab(tab.key)}
-							className={clsx(
-								"border-b-2 px-4 py-3 text-sm font-medium transition-colors",
-								activeTab === tab.key
-									? "border-accent text-accent"
-									: "border-transparent text-ink-dull hover:text-ink",
-							)}
-						>
-							{tab.label}
-						</button>
-					))}
+					{TABS.map((tab) => {
+						const isGraphTab = tab.key === "code-graph";
+						const notReady = isGraphTab && project.status !== "indexed" && project.status !== "stale";
+						return (
+							<button
+								key={tab.key}
+								onClick={() => !notReady && setActiveTab(tab.key)}
+								disabled={notReady}
+								className={clsx(
+									"border-b-2 px-4 py-3 text-sm font-medium transition-colors",
+									activeTab === tab.key
+										? "border-accent text-accent"
+										: notReady
+											? "cursor-not-allowed border-transparent text-ink-faint/40"
+											: "border-transparent text-ink-dull hover:text-ink",
+								)}
+								title={notReady ? "Wait for indexing to finish" : undefined}
+							>
+								{tab.label}
+							</button>
+						);
+					})}
 				</div>
-				<Button
-					variant="ghost"
-					size="sm"
-					className="text-red-400 hover:text-red-300"
-					onClick={() => setRemoveOpen(true)}
-				>
-					Remove
-				</Button>
+				<div className="flex items-center gap-2">
+					<Button
+						size="sm"
+						onClick={() => reindexMutation.mutate()}
+						disabled={reindexMutation.isPending || project.status === "indexing"}
+					>
+						{reindexMutation.isPending || project.status === "indexing" ? "Re-indexing..." : "Re-index"}
+					</Button>
+					<Button
+						size="sm"
+						className="bg-red-600 text-white hover:bg-red-500 border-red-600"
+						onClick={() => setRemoveOpen(true)}
+					>
+						Remove
+					</Button>
+				</div>
 			</div>
 
 			{/* Tab content — Overview is scroll+padded, Code Graph owns its own layout */}
