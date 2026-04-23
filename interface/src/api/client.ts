@@ -20,6 +20,7 @@ function getApiBase(): string {
 
 import type * as Types from "./types";
 import { fetchNdjson } from "./ndjson";
+import { fetchWithRetry } from "./fetchRetry";
 
 // Re-export commonly used types from schema for backward compatibility
 // Only re-export types that don't have local definitions with extra fields
@@ -298,7 +299,7 @@ export interface TimelineWorkerRun {
 // Note: TimelineItem is re-exported from types.ts as a union type
 
 async function fetchJson<T>(path: string): Promise<T> {
-	const response = await fetch(`${getApiBase()}${path}`);
+	const response = await fetchWithRetry(`${getApiBase()}${path}`);
 	if (!response.ok) {
 		throw new Error(`API error: ${response.status}`);
 	}

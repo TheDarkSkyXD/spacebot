@@ -548,9 +548,22 @@ export function ProjectDetail({ projectId, initialTab }: { projectId: string; in
 			// and briefly after completion for the transition.
 			if (project?.status === "indexing") return 1_000;
 			if (project?.status === "indexed" && project?.progress) return 2_000;
-			return 10_000;
+			return false;
 		},
 	});
+
+	// When the user navigates from project A → B, cancel any inflight
+	// requests and the codegraph bulk stream for A. Without this the
+	// outgoing project's async fetches keep running against the backend
+	// while the new project is lazy-opening its LadybugDB — the overlap
+	// is what produces the CONNECTION_REFUSED avalanche during the switch.
+	useEffect(() => {
+		return () => {
+			queryClient.cancelQueries({ queryKey: ["codegraph-project", projectId] });
+			queryClient.cancelQueries({ queryKey: ["codegraph-graph-stream", projectId] });
+			queryClient.cancelQueries({ queryKey: ["codegraph-stats-totals", projectId] });
+		};
+	}, [projectId, queryClient]);
 
 	const project = data?.project;
 

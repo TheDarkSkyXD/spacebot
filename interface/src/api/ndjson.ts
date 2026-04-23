@@ -1,3 +1,5 @@
+import { fetchWithRetry } from "./fetchRetry";
+
 // Stream newline-delimited JSON records from an HTTP response.
 //
 // Mirrors GitNexus's `parseNdjsonGraphResponse` (gitnexus-web backend
@@ -9,7 +11,9 @@ export async function* fetchNdjson<T>(
 	url: string,
 	init?: RequestInit,
 ): AsyncGenerator<T, void, unknown> {
-	const res = await fetch(url, init);
+	// Retry only the connect — once the stream body begins reading,
+	// a mid-stream failure is a real error and should propagate.
+	const res = await fetchWithRetry(url, init);
 	if (!res.ok) {
 		throw new Error(`API error: ${res.status}`);
 	}

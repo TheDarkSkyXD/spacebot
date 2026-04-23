@@ -93,15 +93,28 @@ export function useEventSource(url: string, options: UseEventSourceOptions) {
 
 	useEffect(() => {
 		if (!enabled) {
+			// Cancel any pending backoff timer and close the existing
+			// source — otherwise a timer scheduled by onerror before the
+			// disable will fire later and open a stray EventSource.
+			if (reconnectTimeout.current) {
+				clearTimeout(reconnectTimeout.current);
+				reconnectTimeout.current = null;
+			}
+			eventSourceRef.current?.close();
+			eventSourceRef.current = null;
 			setConnectionState("disconnected");
 			return;
 		}
 
+		// Fresh enable: reset backoff so a previous run's accumulated
+		// delay doesn't push the first reconnect attempt 30s out.
+		retryDelayRef.current = INITIAL_RETRY_MS;
 		connect();
 
 		return () => {
 			if (reconnectTimeout.current) {
 				clearTimeout(reconnectTimeout.current);
+				reconnectTimeout.current = null;
 			}
 			eventSourceRef.current?.close();
 		};
