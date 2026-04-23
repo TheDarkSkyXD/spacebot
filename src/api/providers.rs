@@ -1167,7 +1167,7 @@ pub(super) async fn claude_cli_status(
 
     // Try to find the `claude` binary.
     let (cli_installed, cli_version, authenticated, email) =
-        tokio::task::spawn_blocking(move || detect_claude_cli())
+        tokio::task::spawn_blocking(detect_claude_cli)
             .await
             .unwrap_or((false, None, false, None));
 
@@ -1264,17 +1264,16 @@ fn find_claude_binary() -> Option<String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !path.is_empty() {
-                return Some(path);
-            }
+        let path = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !path.is_empty() {
+            return Some(path);
         }
     }
 

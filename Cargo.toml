@@ -94,6 +94,7 @@ ignore = "0.4"
 # Discord
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "chrono", "rustls_backend"] }
 async-trait = "0.1"
+streaming-iterator = "0.1"
 
 # Slack
 slack-morphism = { version = "2.17", features = ["hyper"] }
@@ -120,7 +121,7 @@ tokio-stream = "0.1"
 
 # HTTP server for control UI
 axum = { version = "0.8", features = ["multipart"] }
-tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "compression-gzip"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
 async-stream = "0.3"
@@ -159,6 +160,7 @@ open = "5.3.3"
 urlencoding = "2.1.3"
 url = "2"
 moka = "0.12.13"
+lbug = "0.15.2"
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
@@ -167,8 +169,44 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["processthreadsapi", "handleapi", "fileapi", "winbase", "errhandlingapi", "namedpipeapi", "synchapi", "winerror"] }
 
+# Tree-sitter (code graph indexing) — 15 supported languages
+tree-sitter = { version = "0.24", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+tree-sitter-kotlin-ng = { version = "1", optional = true }
+tree-sitter-swift = { version = "0.7", optional = true }
+tree-sitter-dart = { version = "0.1", optional = true }
+# Note: COBOL uses a regex-based provider (no tree-sitter crate).
+
 [features]
+default = ["codegraph"]
 metrics = ["dep:prometheus"]
+codegraph = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-ruby",
+    "dep:tree-sitter-php",
+    "dep:tree-sitter-kotlin-ng",
+    "dep:tree-sitter-swift",
+    "dep:tree-sitter-dart",
+]
 
 [patch.crates-io]
 imap-proto = { path = "vendor/imap-proto-0.10.2" }
@@ -193,3 +231,8 @@ path = "src/bin/openapi_spec.rs"
 [profile.release]
 lto = "thin"
 strip = true
+
+# LadybugDB's C++ static library exceeds the 4 GB image limit on Windows
+# in debug mode. Build with optimizations so cmake uses Release mode.
+[profile.dev.package.lbug]
+opt-level = 2

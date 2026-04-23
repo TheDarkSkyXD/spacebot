@@ -130,6 +130,7 @@ async fn bootstrap_deps() -> anyhow::Result<(spacebot::AgentDeps, spacebot::conf
             db.sqlite.clone(),
             chrono_tz::Tz::UTC,
         ),
+        codegraph_manager: None,
     };
 
     Ok((deps, config))
@@ -401,6 +402,7 @@ async fn dump_worker_context() {
         deps.sandbox.clone(),
         vec![],
         deps.runtime_config.clone(),
+        None,
     );
 
     let tool_defs = worker_tool_server
@@ -581,6 +583,7 @@ async fn dump_all_contexts() {
         deps.sandbox.clone(),
         vec![],
         deps.runtime_config.clone(),
+        None,
     );
     let worker_tool_defs = worker_tool_server.get_tool_defs(None).await.unwrap();
     let worker_tools_text = format_tool_defs(&worker_tool_defs);

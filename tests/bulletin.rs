@@ -131,6 +131,7 @@ async fn bootstrap_deps() -> anyhow::Result<spacebot::AgentDeps> {
             db.sqlite.clone(),
             chrono_tz::Tz::UTC,
         ),
+        codegraph_manager: None,
     })
 }
 
