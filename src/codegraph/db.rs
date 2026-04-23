@@ -62,6 +62,33 @@ async fn remove_sidecar_version(db_path: &Path) {
     let _ = tokio::fs::remove_file(sidecar_path(db_path)).await;
 }
 
+/// Path to the "open in progress" marker. Written before `Database::new()`
+/// and removed once `open()` fully returns success. If it is still present
+/// on the next open, the previous run crashed mid-open — most likely a
+/// native segfault during WAL recovery — and the database directory is
+/// no longer trustworthy. Treat as corrupt and nuke before reopening.
+fn inflight_path(db_path: &Path) -> PathBuf {
+    db_path.with_extension("opening")
+}
+
+async fn inflight_marker_exists(db_path: &Path) -> bool {
+    tokio::fs::metadata(inflight_path(db_path)).await.is_ok()
+}
+
+async fn write_inflight_marker(db_path: &Path) -> Result<()> {
+    let path = inflight_path(db_path);
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    tokio::fs::write(&path, b"")
+        .await
+        .with_context(|| format!("writing open-in-progress marker at {}", path.display()))
+}
+
+async fn remove_inflight_marker(db_path: &Path) {
+    let _ = tokio::fs::remove_file(inflight_path(db_path)).await;
+}
+
 /// Remove a LadybugDB database at `path`, handling both the single-file
 /// format (file + optional `.wal` sibling) and the directory-based format.
 /// Retries up to 5 times with escalating delays because Windows holds file
@@ -141,6 +168,30 @@ impl CodeGraphDb {
         // Track whether we cleaned up stale data so we can skip the schema
         // version check on a freshly created database (no tables to nuke).
         let mut freshly_cleaned = false;
+
+        // Pre-open crash-recovery check: if an "opening" marker exists on
+        // disk, the previous open() did not return cleanly — almost always
+        // a native segfault inside Database::new() during WAL recovery,
+        // which spawn_blocking cannot catch. The DB files are no longer
+        // trustworthy regardless of what the schema version sidecar says,
+        // so nuke them preemptively before a second open attempt crashes
+        // the process the same way.
+        if db_path.exists() && inflight_marker_exists(&db_path).await {
+            tracing::warn!(
+                project_id = %project_id,
+                path = %db_path.display(),
+                "previous LadybugDB open did not complete — nuking to recover from likely native crash"
+            );
+            if !retry_remove_db(&db_path).await {
+                bail!(
+                    "cannot remove unsafe LadybugDB at {} after crash-recovery detection",
+                    db_path.display()
+                );
+            }
+            remove_sidecar_version(&db_path).await;
+            remove_inflight_marker(&db_path).await;
+            freshly_cleaned = true;
+        }
 
         // Pre-open sidecar check: if the on-disk schema version recorded
         // next to the DB doesn't match what this binary expects, nuke the
@@ -225,6 +276,12 @@ impl CodeGraphDb {
                     format!("creating parent directory at {}", parent.display())
                 })?;
         }
+
+        // Write an in-flight marker so a native segfault inside Database::new
+        // (uncatchable by spawn_blocking) leaves evidence on disk. The next
+        // open() sees the marker and nukes preemptively instead of crashing
+        // the sidecar again in the same spot. Removed at the end of open().
+        write_inflight_marker(&db_path).await?;
 
         let path_clone = db_path.clone();
         let database = tokio::task::spawn_blocking(move || {
@@ -313,6 +370,10 @@ impl CodeGraphDb {
         // Persist the current version so the next open() can short-circuit
         // the Database::new() → _SchemaVersion query path entirely.
         write_sidecar_version(&db_path, schema::SCHEMA_VERSION).await;
+
+        // All native-code paths completed successfully — clear the in-flight
+        // marker so the next open() doesn't treat this healthy DB as crashed.
+        remove_inflight_marker(&db_path).await;
 
         Ok(Self {
             db_path,
