@@ -18,7 +18,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { useSigma } from "./useSigma";
 import {
-	filterGraphByDepth, getNodeColor,
+	filterGraphByDepth, filterGraphByEdgeTypes, getNodeColor,
 	applySolarLayout, applyRadialLayout,
 	type SigmaNodeAttributes, type SigmaEdgeAttributes, type LayoutMode,
 } from "./graphAdapter";
@@ -184,9 +184,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [colorOverrides]);
 
-	// Re-filter when labels/edges/depth change. We call directly into the
-	// sigma graph instead of relying on the reducer because label
-	// visibility gets stored as a node attribute.
+	// Re-filter when labels/edges/depth change. We write the `hidden`
+	// attribute directly on the graphology graph instead of relying on the
+	// Sigma reducer: Sigma caches reducer output per scene, so a plain
+	// refresh() after a toggle leaves stale edges/nodes on screen.
 	useEffect(() => {
 		const sigma = sigmaRef.current;
 		if (!sigma || !graph) return;
@@ -198,9 +199,10 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle, Props>(function GraphCa
 			depthFilter,
 			visibleLabels,
 		);
+		filterGraphByEdgeTypes(g, visibleEdgeTypes);
 		sigma.refresh();
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [visibleLabels, depthFilter, selectedNode, graph]);
+	}, [visibleLabels, visibleEdgeTypes, depthFilter, selectedNode, graph]);
 
 	// Expose a focusNode handle for the search bar + sidebar.
 	useImperativeHandle(

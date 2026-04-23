@@ -16,6 +16,7 @@ import {
 	NODE_COLORS,
 	NODE_SIZES,
 	EDGE_INFO,
+	ALL_EDGE_TYPES,
 	getCommunityColor,
 	toCanonicalLabel,
 	type NodeLabel,
@@ -409,6 +410,44 @@ export const filterGraphByLabels = (
 		}
 		const canonical = toCanonicalLabel(attrs.nodeType);
 		graph.setNodeAttribute(nodeId, "hidden", !visible.has(canonical));
+	});
+};
+
+// Mirrors filterGraphByLabels for edges. We intentionally flip the
+// `hidden` attribute directly on the graph instead of relying on the
+// Sigma edge reducer: Sigma caches reducer output per scene and a plain
+// `refresh()` does not re-run it, so reducer-only edge hiding leaves
+// stale lines on screen after a toggle. Setting the attribute invalidates
+// the cache for those edges and the next refresh paints them hidden.
+//
+// Only the six filterable ALL_EDGE_TYPES count as real relationships in
+// this view. Backend-emitted "off-taxonomy" edges (HAS_METHOD,
+// HAS_PROPERTY, HAS_PARAMETER, DECORATES, MEMBER_OF, STEP_IN_PROCESS,
+// OVERRIDES, …) carry no user-visible meaning here and are permanently
+// hidden — they otherwise render as unexplainable gray lines between
+// symbol nodes.
+//
+// Must run after the node-visibility pass — we also read the node
+// `hidden` attribute so edges whose endpoints are hidden (e.g. a label
+// toggled off in the filters tab) stop drawing as dangling lines.
+export const filterGraphByEdgeTypes = (
+	graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>,
+	visibleEdgeTypes: EdgeType[],
+): void => {
+	const visible = new Set<string>(visibleEdgeTypes);
+	const inTaxonomy = new Set<string>(ALL_EDGE_TYPES);
+	graph.forEachEdge((edgeId, attrs, _src, _tgt, srcAttrs, tgtAttrs) => {
+		const t = attrs.relationType;
+		let hidden: boolean;
+		if (t && inTaxonomy.has(t)) {
+			hidden = !visible.has(t);
+		} else {
+			hidden = true;
+		}
+		if (!hidden && (srcAttrs.hidden || tgtAttrs.hidden)) {
+			hidden = true;
+		}
+		graph.setEdgeAttribute(edgeId, "hidden", hidden);
 	});
 };
 
