@@ -342,17 +342,26 @@ export function Sidebar({liveStates: _liveStates}: SidebarProps) {
 					);
 				})}
 			</nav>
-				{/* Projects section */}
-				{projects.length > 0 && (
-					<section className="mb-4">
-						<div className="mb-2 flex items-center justify-between px-2">
-							<div className="text-sidebar-inkDull text-[11px] font-semibold uppercase tracking-[0.16em]">
-								Projects
-							</div>
-							<Link to="/projects">
-								<CircleButton icon={DotsThree} size="sm" title="All Projects" />
-							</Link>
+				{/* Projects section — always visible so the All-Projects link is
+					reachable when the list is empty (the only place to create the
+					first project). */}
+				<section className="mb-4">
+					<div className="mb-2 flex items-center justify-between px-2">
+						<div className="text-sidebar-inkDull text-[11px] font-semibold uppercase tracking-[0.16em]">
+							Projects
 						</div>
+						<Link to="/projects">
+							<CircleButton icon={DotsThree} size="sm" title="All Projects" />
+						</Link>
+					</div>
+					{projects.length === 0 ? (
+						<Link
+							to="/projects"
+							className="flex w-full items-center px-2 py-1.5 text-left text-sidebar-inkDull hover:text-sidebar-ink"
+						>
+							<span className="text-xs">+ Add a project</span>
+						</Link>
+					) : (
 						<div className="space-y-0.5">
 							{projects.slice(0, 5).map((project) => {
 								const logoUrl = project.logo_path
@@ -407,8 +416,8 @@ export function Sidebar({liveStates: _liveStates}: SidebarProps) {
 								</Link>
 							)}
 						</div>
-					</section>
-				)}
+					)}
+				</section>
 
 				{/* Agents section */}
 				<section>
