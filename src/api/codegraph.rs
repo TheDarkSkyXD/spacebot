@@ -61,6 +61,7 @@ pub(super) struct NodeListQuery {
     /// When `gitnexus`, label names on response items are translated
     /// to GitNexus conventions (e.g. `MacroDef`→`Macro`).
     #[serde(default)]
+    #[param(value_type = String)]
     schema: super::schema_alias::ApiSchema,
 }
 
@@ -90,6 +91,7 @@ pub(super) struct EdgeListQuery {
     /// Optional output schema vocabulary (`default` or `gitnexus`).
     /// Translates label + edge-type names on response items.
     #[serde(default)]
+    #[param(value_type = String)]
     schema: super::schema_alias::ApiSchema,
 }
 

@@ -15,7 +15,7 @@ use crate::error::SecretsError;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Service name used for Keychain/keyring identification.
-#[allow(dead_code)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE_NAME: &str = "sh.spacebot.master-key";
 
 /// Whether the kernel keyring `keyctl` syscall is available on this system.

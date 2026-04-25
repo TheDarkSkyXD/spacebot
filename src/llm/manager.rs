@@ -224,6 +224,8 @@ impl LlmManager {
                 name: None,
                 use_bearer_auth: false,
                 extra_headers: vec![],
+                api_version: None,
+                deployment: None,
             }),
             (None, None) => Err(LlmError::UnknownProvider("anthropic".to_string()).into()),
         }
@@ -304,6 +306,8 @@ impl LlmManager {
                 name: None,
                 use_bearer_auth: false,
                 extra_headers: vec![],
+                api_version: None,
+                deployment: None,
             }),
             None => Err(LlmError::UnknownProvider("openai-chatgpt".to_string()).into()),
         }
@@ -416,6 +420,8 @@ impl LlmManager {
                     COPILOT_EDITOR_PLUGIN_VERSION.to_string(),
                 ),
             ],
+            api_version: None,
+            deployment: None,
         })
     }
 

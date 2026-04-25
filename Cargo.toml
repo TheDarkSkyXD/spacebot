@@ -1,6 +1,6 @@
 [package]
 name = "spacebot"
-version = "0.3.3"
+version = "0.4.1"
 edition = "2024"
 default-run = "spacebot"
 
@@ -94,10 +94,9 @@ ignore = "0.4"
 # Discord
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "cache", "chrono", "rustls_backend"] }
 async-trait = "0.1"
-streaming-iterator = "0.1"
 
 # Slack
-slack-morphism = { version = "2.17", features = ["hyper"] }
+slack-morphism = { version = "2.19", features = ["hyper"] }
 emojis = "0.8"
 
 # TLS (shared crypto backend for slack-morphism, reqwest, teloxide)
@@ -121,7 +120,7 @@ tokio-stream = "0.1"
 
 # HTTP server for control UI
 axum = { version = "0.8", features = ["multipart"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 mime_guess = "2"
 async-stream = "0.3"
@@ -161,15 +160,10 @@ urlencoding = "2.1.3"
 url = "2"
 moka = "0.12.13"
 lbug = "0.15.2"
+streaming-iterator = "0.1"
 
-[target.'cfg(unix)'.dependencies]
-daemonize = "0.5"
-libc = "0.2"
-
-[target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "handleapi", "fileapi", "winbase", "errhandlingapi", "namedpipeapi", "synchapi", "winerror"] }
-
-# Tree-sitter (code graph indexing) — 15 supported languages
+# Tree-sitter (code graph indexing) — 15 supported languages.
+# COBOL uses a regex-based provider (no tree-sitter crate).
 tree-sitter = { version = "0.24", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
@@ -185,7 +179,13 @@ tree-sitter-php = { version = "0.24", optional = true }
 tree-sitter-kotlin-ng = { version = "1", optional = true }
 tree-sitter-swift = { version = "0.7", optional = true }
 tree-sitter-dart = { version = "0.1", optional = true }
-# Note: COBOL uses a regex-based provider (no tree-sitter crate).
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "handleapi", "fileapi", "winbase", "errhandlingapi", "namedpipeapi", "synchapi", "winerror"] }
 
 [features]
 default = ["codegraph"]
@@ -228,11 +228,11 @@ security-framework = "3"
 name = "openapi-spec"
 path = "src/bin/openapi_spec.rs"
 
-[profile.release]
-lto = "thin"
-strip = true
-
 # LadybugDB's C++ static library exceeds the 4 GB image limit on Windows
 # in debug mode. Build with optimizations so cmake uses Release mode.
 [profile.dev.package.lbug]
 opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true

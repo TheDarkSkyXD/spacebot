@@ -2,9 +2,10 @@
 
 use super::state::ApiState;
 use super::{
-    agents, bindings, channels, codegraph, config, cortex, cron, factory, fs, ingest, links, mcp,
-    memories, messaging, models, opencode_proxy, projects, providers, secrets, settings, skills,
-    ssh, system, tasks, tools, webchat, workers,
+    activity, agents, attachments, bindings, channels, codegraph, config, cortex, cron, factory,
+    ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
+    projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki,
+    workers,
 };
 
 use axum::Json;
@@ -13,10 +14,9 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::any;
 use rust_embed::Embed;
 use serde_json::json;
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use utoipa::OpenApi;
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -93,6 +93,10 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(channels::list_prompt_snapshots))
         .routes(routes!(channels::get_prompt_snapshot))
         .routes(routes!(channels::cancel_process))
+        .routes(routes!(
+            channels::get_channel_settings,
+            channels::update_channel_settings
+        ))
         // Worker routes
         .routes(routes!(workers::list_workers))
         .routes(routes!(workers::worker_detail))
@@ -121,6 +125,13 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(cron::cron_executions))
         .routes(routes!(cron::trigger_cron))
         .routes(routes!(cron::toggle_cron))
+        // Notification routes
+        .routes(routes!(notifications::list_notifications))
+        .routes(routes!(notifications::unread_count))
+        .routes(routes!(notifications::mark_read))
+        .routes(routes!(notifications::dismiss_notification))
+        .routes(routes!(notifications::mark_all_read))
+        .routes(routes!(notifications::dismiss_read))
         // Task routes
         .routes(routes!(tasks::list_tasks, tasks::create_task))
         .routes(routes!(
@@ -131,14 +142,45 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(tasks::approve_task))
         .routes(routes!(tasks::execute_task))
         .routes(routes!(tasks::assign_task))
+        // Wiki routes
+        .routes(routes!(wiki::list_pages, wiki::create_page))
+        .routes(routes!(wiki::search_pages))
+        .routes(routes!(wiki::get_page, wiki::archive_page))
+        .routes(routes!(wiki::edit_page))
+        .routes(routes!(wiki::get_history))
+        .routes(routes!(wiki::restore_version))
+        // Code graph routes
+        .routes(routes!(
+            codegraph::list_projects,
+            codegraph::create_project
+        ))
+        .routes(routes!(
+            codegraph::get_project,
+            codegraph::delete_project
+        ))
+        .routes(routes!(codegraph::reindex_project))
+        .routes(routes!(codegraph::get_communities))
+        .routes(routes!(codegraph::get_processes))
+        .routes(routes!(codegraph::search_graph))
+        .routes(routes!(codegraph::get_index_log))
+        .routes(routes!(codegraph::get_remove_info))
+        .routes(routes!(codegraph::list_nodes))
+        .routes(routes!(codegraph::get_node))
+        .routes(routes!(codegraph::get_node_edges))
+        .routes(routes!(codegraph::get_graph_stats))
+        .routes(routes!(codegraph::get_bulk_nodes))
+        .routes(routes!(codegraph::get_bulk_edges))
+        .routes(routes!(codegraph::get_graph_stream))
         // Project routes
         .routes(routes!(projects::list_projects, projects::create_project))
+        .routes(routes!(projects::reorder_projects))
         .routes(routes!(
             projects::get_project,
             projects::update_project,
             projects::delete_project
         ))
         .routes(routes!(projects::scan_project))
+        .routes(routes!(projects::serve_logo))
         .routes(routes!(projects::disk_usage))
         .routes(routes!(projects::create_repo))
         .routes(routes!(projects::delete_repo))
@@ -178,10 +220,14 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
             providers::get_providers,
             providers::update_provider
         ))
+        .routes(routes!(providers::start_anthropic_oauth))
+        .routes(routes!(providers::exchange_anthropic_oauth))
+        .routes(routes!(providers::claude_cli_status))
         .routes(routes!(providers::start_openai_browser_oauth))
         .routes(routes!(providers::openai_browser_oauth_status))
         .routes(routes!(providers::test_provider_model))
         .routes(routes!(providers::delete_provider))
+        .routes(routes!(providers::get_provider_config))
         // Model routes
         .routes(routes!(models::get_models))
         .routes(routes!(models::refresh_models))
@@ -215,9 +261,18 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         // SSH routes
         .routes(routes!(ssh::set_authorized_key))
         .routes(routes!(ssh::ssh_status))
-        // Webchat routes
-        .routes(routes!(webchat::webchat_send))
-        .routes(routes!(webchat::webchat_history))
+        // Portal routes
+        .routes(routes!(portal::portal_send))
+        .routes(routes!(portal::portal_history))
+        .routes(routes!(portal::list_portal_conversations))
+        .routes(routes!(portal::create_portal_conversation))
+        .routes(routes!(portal::update_portal_conversation))
+        .routes(routes!(portal::delete_portal_conversation))
+        .routes(routes!(portal::conversation_defaults))
+        // Attachment routes
+        .routes(routes!(attachments::upload_attachment))
+        .routes(routes!(attachments::serve_attachment))
+        .routes(routes!(attachments::list_attachments))
         // Link routes
         .routes(routes!(links::list_links, links::create_link))
         .routes(routes!(links::update_link, links::delete_link))
@@ -227,30 +282,11 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(links::update_group, links::delete_group))
         .routes(routes!(links::list_humans, links::create_human))
         .routes(routes!(links::update_human, links::delete_human))
-        // Code Graph routes
-        .routes(routes!(
-            codegraph::list_projects,
-            codegraph::create_project
-        ))
-        .routes(routes!(
-            codegraph::get_project,
-            codegraph::delete_project
-        ))
-        .routes(routes!(codegraph::reindex_project))
-        .routes(routes!(codegraph::get_communities))
-        .routes(routes!(codegraph::get_processes))
-        .routes(routes!(codegraph::search_graph))
-        .routes(routes!(codegraph::get_index_log))
-        .routes(routes!(codegraph::get_remove_info))
-        .routes(routes!(codegraph::list_nodes))
-        .routes(routes!(codegraph::get_node))
-        .routes(routes!(codegraph::get_node_edges))
-        .routes(routes!(codegraph::get_graph_stats))
-        .routes(routes!(codegraph::get_bulk_nodes))
-        .routes(routes!(codegraph::get_bulk_edges))
-        .routes(routes!(codegraph::get_graph_stream))
-        // Filesystem routes (OpenAPI-documented)
-        .routes(routes!(fs::read_file))
+        // Usage routes
+        .routes(routes!(usage::get_usage))
+        .routes(routes!(usage::get_conversation_usage))
+        // Activity routes
+        .routes(routes!(activity::get_activity))
         // Factory routes
         .routes(routes!(factory::list_presets))
         .routes(routes!(factory::get_preset))
@@ -287,8 +323,6 @@ pub async fn start_http_server(
     let protected_routes = Router::new()
         // API routes under /api
         .nest("/api", api_routes)
-        // Filesystem browsing (not yet in OpenAPI schema)
-        .route("/api/fs/list-dir", get(fs::list_dir))
         // Swagger UI and OpenAPI spec (protected)
         .merge(utoipa_swagger_ui::SwaggerUi::new("/api/docs").url("/api/openapi.json", api))
         // Opencode proxy routes (protected)
@@ -298,19 +332,6 @@ pub async fn start_http_server(
         )
         .route("/api/opencode/{port}", any(opencode_proxy::opencode_proxy))
         .route("/api/opencode/{port}/", any(opencode_proxy::opencode_proxy))
-        // Anthropic OAuth routes (not yet in OpenAPI schema)
-        .route(
-            "/api/providers/anthropic/oauth/cli-status",
-            get(providers::claude_cli_status),
-        )
-        .route(
-            "/api/providers/anthropic/oauth/start",
-            post(providers::start_anthropic_oauth),
-        )
-        .route(
-            "/api/providers/anthropic/oauth/exchange",
-            post(providers::exchange_anthropic_oauth),
-        )
         // Apply auth middleware to all protected routes
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -320,18 +341,12 @@ pub async fn start_http_server(
     #[cfg(feature = "metrics")]
     let protected_routes = protected_routes.layer(middleware::from_fn(metrics_middleware));
 
-    // Gzip-compress large JSON responses. The code graph bulk endpoints
-    // ship multi-MB payloads that shrink 5–10x under gzip. Small responses
-    // skip compression automatically via the built-in size predicate.
-    let compression = CompressionLayer::new().gzip(true);
-
     // Build the main application router
     let app = Router::new()
         // Mount all protected routes
         .merge(protected_routes)
         // Static file handler for frontend (unprotected)
         .fallback(static_handler)
-        .layer(compression)
         .layer(cors)
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MiB
         .with_state(state);

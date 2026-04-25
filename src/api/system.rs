@@ -133,6 +133,9 @@ pub(super) async fn events_sse(
                             ApiEvent::OpenCodePartUpdated { .. } => "opencode_part_updated",
                             ApiEvent::WorkerText { .. } => "worker_text",
                             ApiEvent::CortexChatMessage { .. } => "cortex_chat_message",
+                            ApiEvent::NotificationCreated { .. } => "notification_created",
+                            ApiEvent::NotificationUpdated { .. } => "notification_updated",
+                            ApiEvent::ToolOutput { .. } => "tool_output",
                             ApiEvent::CodeGraphStale { .. } => "code_graph_stale",
                             ApiEvent::CodeGraphChanged { .. } => "code_graph_changed",
                             ApiEvent::CodeGraphIndexed { .. } => "code_graph_indexed",
@@ -246,7 +249,11 @@ fn read_filesystem_usage(path: &Path) -> anyhow::Result<StorageStatus> {
     use std::os::windows::ffi::OsStrExt;
     use winapi::um::fileapi::GetDiskFreeSpaceExW;
 
-    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let mut free_bytes_available: u64 = 0;
     let mut total_bytes: u64 = 0;
     let mut total_free_bytes: u64 = 0;

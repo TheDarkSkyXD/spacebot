@@ -461,17 +461,25 @@ pub(super) async fn trigger_warmup(
             );
             continue;
         };
+        let Some(project_store) = state.project_store.load().as_ref().clone() else {
+            tracing::warn!(
+                agent_id,
+                "shared project store not initialized, skipping warmup"
+            );
+            continue;
+        };
 
         let llm_manager = llm_manager.clone();
         let force = request.force;
         let agent_id = agent_id.clone();
         let injection_tx = state.injection_tx.clone();
         let humans = (**state.agent_humans.load()).clone();
-        let codegraph_manager = state.codegraph_manager.load().as_ref().clone();
+        let notif_store_warmup = state.notification_store.load().as_ref().clone();
         tokio::spawn(async move {
-            let (event_tx, memory_event_tx) = crate::create_process_event_buses();
-            let project_store =
-                std::sync::Arc::new(crate::projects::ProjectStore::new(sqlite_pool.clone()));
+            let process_event_buses = crate::create_process_event_buses();
+            let event_tx = process_event_buses.control;
+            let memory_event_tx = process_event_buses.memory;
+            let tool_output_tx = process_event_buses.tool_output;
             let working_memory_tz = runtime_config
                 .user_timezone
                 .load()
@@ -490,6 +498,7 @@ pub(super) async fn trigger_warmup(
                 runtime_config,
                 event_tx,
                 memory_event_tx,
+                tool_output_tx,
                 sqlite_pool: sqlite_pool.clone(),
                 messaging_manager: None,
                 sandbox,
@@ -503,9 +512,13 @@ pub(super) async fn trigger_warmup(
                 ),
                 injection_tx,
                 working_memory,
-                codegraph_manager,
+                api_state: None,
+                wiki_store: None,
             };
-            let logger = CortexLogger::new(sqlite_pool);
+            let mut logger = CortexLogger::new(sqlite_pool);
+            if let Some(store) = notif_store_warmup {
+                logger = logger.with_notifications(store, agent_id.clone());
+            }
             crate::agent::cortex::run_warmup_once(&deps, &logger, "api_trigger", force).await;
         });
     }
@@ -711,6 +724,7 @@ pub async fn create_agent_internal(
         max_turns: None,
         branch_max_turns: None,
         context_window: None,
+        tool_use_enforcement: None,
         compaction: None,
         memory_persistence: None,
         coalesce: None,
@@ -792,7 +806,10 @@ pub async fn create_agent_internal(
         .clone()
         .ok_or_else(|| "global task store not initialized".to_string())?;
 
-    let (event_tx, memory_event_tx) = crate::create_process_event_buses();
+    let process_event_buses = crate::create_process_event_buses();
+    let event_tx = process_event_buses.control;
+    let memory_event_tx = process_event_buses.memory;
+    let tool_output_tx = process_event_buses.tool_output;
     let arc_agent_id: crate::AgentId = std::sync::Arc::from(agent_id.as_str());
 
     crate::identity::scaffold_identity_files(&agent_config.identity_dir)
@@ -839,8 +856,7 @@ pub async fn create_agent_internal(
         identity,
         skills,
     ));
-    let explicit_listen_only = raw_config.channel.map(|channel| channel.listen_only_mode);
-    runtime_config.set_settings(settings_store.clone(), explicit_listen_only);
+    runtime_config.set_settings(settings_store.clone());
 
     let llm_manager = {
         let guard = state.llm_manager.read().await;
@@ -866,10 +882,15 @@ pub async fn create_agent_internal(
         .await,
     );
 
-    let project_store = std::sync::Arc::new(crate::projects::ProjectStore::new(db.sqlite.clone()));
+    let project_store = state
+        .project_store
+        .load()
+        .as_ref()
+        .clone()
+        .ok_or_else(|| "shared project store not initialized".to_string())?;
 
     // Inject active project root paths into the sandbox allowlist.
-    crate::projects::refresh_sandbox_project_paths(&project_store, &arc_agent_id, &sandbox).await;
+    crate::projects::refresh_sandbox_project_paths(&project_store, &sandbox).await;
 
     let deps = crate::AgentDeps {
         agent_id: arc_agent_id.clone(),
@@ -882,6 +903,7 @@ pub async fn create_agent_internal(
         runtime_config: runtime_config.clone(),
         event_tx: event_tx.clone(),
         memory_event_tx: memory_event_tx.clone(),
+        tool_output_tx: tool_output_tx.clone(),
         sqlite_pool: db.sqlite.clone(),
         messaging_manager: Some(messaging_manager.clone()),
         sandbox: sandbox.clone(),
@@ -924,15 +946,14 @@ pub async fn create_agent_internal(
                 .unwrap_or(chrono_tz::Tz::UTC);
             crate::memory::WorkingMemoryStore::new(db.sqlite.clone(), tz)
         },
-        codegraph_manager: state
-            .codegraph_manager
-            .load()
-            .as_ref()
-            .clone(),
+        api_state: Some(state.clone()),
+        wiki_store: state.wiki_store.load().as_ref().clone(),
     };
 
     let event_rx = event_tx.subscribe();
     state.register_agent_events(agent_id.clone(), event_rx);
+    let tool_output_rx = tool_output_tx.subscribe();
+    state.register_tool_output_stream(agent_id.clone(), tool_output_rx);
 
     let cron_store = std::sync::Arc::new(crate::cron::CronStore::new(db.sqlite.clone()));
     let cron_context = crate::cron::CronContext {
@@ -955,6 +976,7 @@ pub async fn create_agent_internal(
     let channel_store = crate::conversation::ChannelStore::new(db.sqlite.clone());
     let run_logger = crate::conversation::ProcessRunLogger::new(db.sqlite.clone());
     let cortex_ctx = crate::agent::cortex_chat::CortexChatSession::create_context();
+    #[allow(deprecated)] // Cortex chat is legacy — being replaced by Channel Settings
     let cortex_tool_server = crate::tools::create_cortex_chat_tool_server(
         deps.agent_id.clone(),
         deps.clone(),
@@ -990,14 +1012,22 @@ pub async fn create_agent_internal(
     )
     .with_factory(true);
 
-    let cortex_logger = crate::agent::cortex::CortexLogger::new(db.sqlite.clone());
+    let notif_store_for_cortex = state.notification_store.load().as_ref().clone();
+    let make_cortex_logger = |pool: sqlx::SqlitePool| {
+        let mut logger = crate::agent::cortex::CortexLogger::new(pool);
+        if let Some(ref store) = notif_store_for_cortex {
+            logger = logger.with_notifications(store.clone(), agent_id.to_string());
+        }
+        logger
+    };
+    let cortex_logger = make_cortex_logger(db.sqlite.clone());
     let _warmup_loop = crate::agent::cortex::spawn_warmup_loop(deps.clone(), cortex_logger.clone());
     let _cortex_loop = crate::agent::cortex::spawn_cortex_loop(deps.clone(), cortex_logger.clone());
     let _association_loop =
         crate::agent::cortex::spawn_association_loop(deps.clone(), cortex_logger);
     crate::agent::cortex::spawn_ready_task_loop(
         deps.clone(),
-        crate::agent::cortex::CortexLogger::new(db.sqlite.clone()),
+        make_cortex_logger(db.sqlite.clone()),
     );
 
     let ingestion_config = **runtime_config.ingestion.load();
@@ -1054,12 +1084,6 @@ pub async fn create_agent_internal(
         let mut sandboxes = (**state.sandboxes.load()).clone();
         sandboxes.insert(agent_id.clone(), sandbox);
         state.sandboxes.store(std::sync::Arc::new(sandboxes));
-
-        let mut project_stores_map = (**state.project_stores.load()).clone();
-        project_stores_map.insert(agent_id.clone(), project_store);
-        state
-            .project_stores
-            .store(std::sync::Arc::new(project_stores_map));
 
         let mut agent_infos = (**state.agent_configs.load()).clone();
         agent_infos.push(AgentInfo {
@@ -1389,12 +1413,6 @@ pub(super) async fn delete_agent(
         state
             .cortex_chat_sessions
             .store(std::sync::Arc::new(sessions));
-
-        let mut project_stores_map = (**state.project_stores.load()).clone();
-        project_stores_map.remove(&agent_id);
-        state
-            .project_stores
-            .store(std::sync::Arc::new(project_stores_map));
     }
 
     // Signal the main event loop to remove the agent

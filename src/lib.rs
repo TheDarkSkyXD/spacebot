@@ -19,6 +19,7 @@ pub mod llm;
 pub mod mcp;
 pub mod memory;
 pub mod messaging;
+pub mod notifications;
 pub mod openai_auth;
 pub mod opencode;
 pub mod projects;
@@ -33,6 +34,7 @@ pub mod tasks;
 pub mod telemetry;
 pub mod tools;
 pub mod update;
+pub mod wiki;
 
 pub use error::{Error, Result};
 
@@ -208,6 +210,7 @@ pub enum ProcessEvent {
         agent_id: AgentId,
         process_id: ProcessId,
         channel_id: Option<ChannelId>,
+        call_id: String,
         tool_name: String,
         args: String,
     },
@@ -215,6 +218,7 @@ pub enum ProcessEvent {
         agent_id: AgentId,
         process_id: ProcessId,
         channel_id: Option<ChannelId>,
+        call_id: String,
         tool_name: String,
         result: String,
     },
@@ -317,27 +321,25 @@ pub enum ProcessEvent {
         channel_id: Option<ChannelId>,
         text: String,
     },
-    /// Code graph indexing progress update.
-    CodeGraphIndexing {
-        project_id: String,
-        phase: codegraph::PipelinePhase,
-        phase_progress: f32,
-        message: String,
+    /// A line of live output from a running tool (e.g. shell stdout/stderr).
+    /// Ephemeral — not accumulated into transcripts. The full output is
+    /// captured in ToolCompleted as before.
+    ToolOutput {
+        agent_id: AgentId,
+        process_id: ProcessId,
+        channel_id: Option<ChannelId>,
+        /// Stable identifier matching the tool_call that initiated this stream.
+        /// Allows frontend to deterministically associate lines with invocations.
+        call_id: String,
+        tool_name: String,
+        line: String,
+        stream: String,
     },
-    /// Code graph indexing completed.
-    CodeGraphIndexed {
-        project_id: String,
-        stats: codegraph::PipelineStats,
-    },
-    /// Code graph changed (incremental update).
-    CodeGraphChanged {
-        project_id: String,
-        files_changed: Vec<String>,
-    },
-    /// Code graph error.
-    CodeGraphError {
-        project_id: String,
-        error: String,
+    /// Conversation settings were updated via API. The channel should
+    /// re-load its settings from the database.
+    SettingsUpdated {
+        agent_id: AgentId,
+        channel_id: ChannelId,
     },
 }
 
@@ -347,31 +349,51 @@ pub const CONTROL_EVENT_BUS_CAPACITY: usize = 256;
 /// Default broadcast capacity for the per-agent memory event bus.
 pub const MEMORY_EVENT_BUS_CAPACITY: usize = 1024;
 
-/// Create the default pair of per-agent process event buses.
+/// Default broadcast capacity for the per-agent tool output streaming bus.
+/// Higher capacity because tool output (e.g. cargo build -vv) can be very
+/// high volume. ToolOutput events are lossy-by-design — dropping lines is
+/// acceptable for live display.
+pub const TOOL_OUTPUT_BUS_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub struct ProcessEventBuses {
+    pub control: tokio::sync::broadcast::Sender<ProcessEvent>,
+    pub memory: tokio::sync::broadcast::Sender<ProcessEvent>,
+    pub tool_output: tokio::sync::broadcast::Sender<ProcessEvent>,
+}
+
+/// Create the default set of per-agent process event buses.
 ///
 /// - `event_tx` carries control/lifecycle events consumed by channels and UI.
 /// - `memory_event_tx` carries memory-save telemetry consumed by the cortex.
-pub fn create_process_event_buses() -> (
-    tokio::sync::broadcast::Sender<ProcessEvent>,
-    tokio::sync::broadcast::Sender<ProcessEvent>,
-) {
-    create_process_event_buses_with_capacity(CONTROL_EVENT_BUS_CAPACITY, MEMORY_EVENT_BUS_CAPACITY)
+/// - `tool_output_tx` carries live tool output (shell stdout/stderr lines)
+///   consumed by the SSE pipeline for frontend live display.
+pub fn create_process_event_buses() -> ProcessEventBuses {
+    create_process_event_buses_with_capacity(
+        CONTROL_EVENT_BUS_CAPACITY,
+        MEMORY_EVENT_BUS_CAPACITY,
+        TOOL_OUTPUT_BUS_CAPACITY,
+    )
 }
 
 /// Create per-agent process event buses with explicit capacities.
 pub fn create_process_event_buses_with_capacity(
     control_event_capacity: usize,
     memory_event_capacity: usize,
-) -> (
-    tokio::sync::broadcast::Sender<ProcessEvent>,
-    tokio::sync::broadcast::Sender<ProcessEvent>,
-) {
+    tool_output_capacity: usize,
+) -> ProcessEventBuses {
     let control_event_capacity = control_event_capacity.max(1);
     let memory_event_capacity = memory_event_capacity.max(1);
+    let tool_output_capacity = tool_output_capacity.max(1);
     let (event_tx, _event_rx) = tokio::sync::broadcast::channel(control_event_capacity);
     let (memory_event_tx, _memory_event_rx) =
         tokio::sync::broadcast::channel(memory_event_capacity);
-    (event_tx, memory_event_tx)
+    let (tool_output_tx, _tool_output_rx) = tokio::sync::broadcast::channel(tool_output_capacity);
+    ProcessEventBuses {
+        control: event_tx,
+        memory: memory_event_tx,
+        tool_output: tool_output_tx,
+    }
 }
 
 /// Track lagged broadcast events and return the dropped count when a warning
@@ -421,6 +443,9 @@ pub struct AgentDeps {
     pub runtime_config: Arc<config::RuntimeConfig>,
     pub event_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
     pub memory_event_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
+    /// Bus for live tool output (shell stdout/stderr lines). Separate from the
+    /// control event bus so high-volume output doesn't crowd out critical events.
+    pub tool_output_tx: tokio::sync::broadcast::Sender<ProcessEvent>,
     pub sqlite_pool: sqlx::SqlitePool,
     pub messaging_manager: Option<Arc<messaging::MessagingManager>>,
     pub sandbox: Arc<sandbox::Sandbox>,
@@ -436,8 +461,10 @@ pub struct AgentDeps {
     pub injection_tx: tokio::sync::mpsc::Sender<ChannelInjection>,
     /// Working memory event log for temporal situational awareness.
     pub working_memory: Arc<memory::WorkingMemoryStore>,
-    /// Shared code graph manager (None if not initialized).
-    pub codegraph_manager: Option<Arc<codegraph::CodeGraphManager>>,
+    /// Optional API state for tools that need to emit notifications/SSE events.
+    pub api_state: Option<Arc<api::ApiState>>,
+    /// Instance-wide wiki store.
+    pub wiki_store: Option<Arc<wiki::WikiStore>>,
 }
 
 impl AgentDeps {
@@ -617,6 +644,11 @@ pub struct Attachment {
     /// Excluded from serialization to prevent credential leakage.
     #[serde(skip)]
     pub auth_header: Option<String>,
+    /// ID of a pre-saved attachment in `saved_attachments`. When set, the file
+    /// is already on disk — skip download and DB insert. The actual path is
+    /// re-derived from the DB row + workspace `saved/` dir at read time.
+    #[serde(skip)]
+    pub pre_saved_id: Option<String>,
 }
 
 /// An outbound response paired with the inbound message that triggered it.

@@ -10,19 +10,19 @@ use std::sync::Arc;
 #[derive(Serialize, Clone, utoipa::ToSchema)]
 pub(super) struct ModelInfo {
     /// Full routing string (e.g. "openrouter/anthropic/claude-sonnet-4")
-    id: String,
+    pub(super) id: String,
     /// Human-readable name
-    name: String,
+    pub(super) name: String,
     /// Provider ID for routing ("anthropic", "openrouter", "openai", etc.)
-    provider: String,
+    pub(super) provider: String,
     /// Context window size in tokens, if known
-    context_window: Option<u64>,
+    pub(super) context_window: Option<u64>,
     /// Whether this model supports tool/function calling
-    tool_call: bool,
+    pub(super) tool_call: bool,
     /// Whether this model has reasoning/thinking capability
-    reasoning: bool,
+    pub(super) reasoning: bool,
     /// Whether this model accepts audio input.
-    input_audio: bool,
+    pub(super) input_audio: bool,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -220,7 +220,7 @@ async fn fetch_models_dev() -> anyhow::Result<Vec<ModelInfo>> {
 }
 
 /// Ensure the cache is populated (fetches on first call, then uses TTL).
-async fn ensure_models_cache() -> Vec<ModelInfo> {
+pub(super) async fn ensure_models_cache() -> Vec<ModelInfo> {
     {
         let cache = MODELS_CACHE.read().await;
         if !cache.0.is_empty() && cache.1.elapsed() < MODELS_CACHE_TTL {
@@ -265,7 +265,10 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
         std::env::var(env_var).is_ok()
     };
 
-    if has_key("anthropic_key", "ANTHROPIC_API_KEY") {
+    let anthropic_oauth_configured = config_path
+        .parent()
+        .is_some_and(|instance_dir| crate::auth::credentials_path(instance_dir).exists());
+    if has_key("anthropic_key", "ANTHROPIC_API_KEY") || anthropic_oauth_configured {
         providers.push("anthropic");
     }
     // Anthropic OAuth stores credentials as a separate JSON file
