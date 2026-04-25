@@ -287,7 +287,10 @@ pub(super) async fn configured_providers(config_path: &std::path::Path) -> Vec<&
         std::env::var(env_var).is_ok()
     };
 
-    if has_key("anthropic_key", "ANTHROPIC_API_KEY") {
+    let anthropic_oauth_configured = config_path
+        .parent()
+        .is_some_and(|instance_dir| crate::auth::credentials_path(instance_dir).exists());
+    if has_key("anthropic_key", "ANTHROPIC_API_KEY") || anthropic_oauth_configured {
         providers.push("anthropic");
     }
     if has_key("openai_key", "OPENAI_API_KEY") {

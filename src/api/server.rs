@@ -199,6 +199,7 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         ))
         .routes(routes!(providers::start_anthropic_oauth))
         .routes(routes!(providers::exchange_anthropic_oauth))
+        .routes(routes!(providers::claude_cli_status))
         .routes(routes!(providers::start_openai_browser_oauth))
         .routes(routes!(providers::openai_browser_oauth_status))
         .routes(routes!(providers::test_provider_model))

@@ -152,6 +152,24 @@ pub(super) struct AnthropicOAuthExchangeResponse {
     pub message: String,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct ClaudeCliStatusResponse {
+    /// Whether the `~/.claude/` folder exists (CLI has been used).
+    pub claude_folder_exists: bool,
+    /// Whether `~/.claude/credentials.json` exists (CLI has stored credentials).
+    pub credentials_file_exists: bool,
+    /// Whether the `claude` binary was found on the system.
+    pub cli_installed: bool,
+    /// CLI version string if the binary was found and `--version` succeeded.
+    pub cli_version: Option<String>,
+    /// Whether the CLI reports being authenticated.
+    pub authenticated: bool,
+    /// Email from `claude auth status`, if available.
+    pub email: Option<String>,
+    /// Whether Anthropic OAuth is already configured in this spacebot instance.
+    pub oauth_configured: bool,
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub(super) struct OpenAiOAuthBrowserStartRequest {
     model: String,
@@ -1409,6 +1427,158 @@ pub(super) async fn get_provider_config(
         api_version: None,
         deployment: None,
     }))
+}
+
+/// Status of the local Anthropic Claude CLI: whether it's installed,
+/// authenticated, and which email is signed in. Used by the OAuth UI to
+/// guide users who haven't installed the CLI yet.
+#[utoipa::path(
+    get,
+    path = "/providers/anthropic/claude-cli-status",
+    responses(
+        (status = 200, body = ClaudeCliStatusResponse),
+    ),
+    tag = "providers",
+)]
+pub(super) async fn claude_cli_status(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ClaudeCliStatusResponse>, StatusCode> {
+    let instance_dir = (**state.instance_dir.load()).clone();
+    let oauth_configured = crate::auth::credentials_path(&instance_dir).exists();
+
+    let home = dirs::home_dir().unwrap_or_default();
+    let claude_dir = home.join(".claude");
+    let claude_folder_exists = claude_dir.is_dir();
+    let credentials_file_exists = claude_dir.join("credentials.json").is_file();
+
+    let (cli_installed, cli_version, authenticated, email) =
+        tokio::task::spawn_blocking(detect_claude_cli)
+            .await
+            .unwrap_or((false, None, false, None));
+
+    Ok(Json(ClaudeCliStatusResponse {
+        claude_folder_exists,
+        credentials_file_exists,
+        cli_installed,
+        cli_version,
+        authenticated,
+        email,
+        oauth_configured,
+    }))
+}
+
+/// Locate the `claude` binary, run `--version` and `auth status`. Strips
+/// the CLAUDECODE/CLAUDE_CODE_ENTRYPOINT env vars so the CLI doesn't think
+/// it's inside a nested session and refuse to report status.
+fn detect_claude_cli() -> (bool, Option<String>, bool, Option<String>) {
+    let Some(claude_path) = find_claude_binary() else {
+        return (false, None, false, None);
+    };
+
+    let clean_env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k != "CLAUDECODE" && k != "CLAUDE_CODE_ENTRYPOINT")
+        .collect();
+
+    let version = std::process::Command::new(&claude_path)
+        .arg("--version")
+        .env_clear()
+        .envs(clean_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        });
+
+    if version.is_none() {
+        return (false, None, false, None);
+    }
+
+    let auth_result = std::process::Command::new(&claude_path)
+        .args(["auth", "status"])
+        .env_clear()
+        .envs(clean_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+
+    let (authenticated, email) = match auth_result {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                Ok(json) => {
+                    let logged_in = json
+                        .get("loggedIn")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let email = json
+                        .get("email")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    (logged_in, email)
+                }
+                // Older CLI versions may not return JSON — assume authed if
+                // --version worked and the binary didn't error.
+                Err(_) => (true, None),
+            }
+        }
+        Ok(_) => (false, None),
+        // Command failed to run but binary exists — assume authed (older CLI).
+        Err(_) => (true, None),
+    };
+
+    (true, version, authenticated, email)
+}
+
+fn find_claude_binary() -> Option<String> {
+    let which_cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(output) = std::process::Command::new(which_cmd)
+        .arg("claude")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
+
+    let home = dirs::home_dir()?;
+    let candidates: Vec<std::path::PathBuf> = if cfg!(windows) {
+        vec![
+            home.join(".local").join("bin").join("claude.exe"),
+            home.join("AppData")
+                .join("Local")
+                .join("Programs")
+                .join("claude")
+                .join("claude.exe"),
+        ]
+    } else {
+        vec![
+            home.join(".local").join("bin").join("claude"),
+            std::path::PathBuf::from("/usr/local/bin/claude"),
+        ]
+    };
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    None
 }
 
 #[utoipa::path(
