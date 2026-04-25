@@ -21,6 +21,7 @@ import {AgentCron} from "@/routes/AgentCron";
 import {AgentSkills} from "@/routes/AgentSkills";
 import {AgentWorkers} from "@/routes/AgentWorkers";
 import {AgentProjects} from "@/routes/AgentProjects";
+import {CodeGraphTab} from "@/components/projects/CodeGraphTab";
 import {AgentTasks} from "@/routes/AgentTasks";
 import {GlobalTasks} from "@/routes/GlobalTasks";
 import {Wiki} from "@/routes/Wiki";
@@ -188,6 +189,15 @@ const projectsRoute = createRoute({
 	},
 });
 
+const codegraphRoute = createRoute({
+	getParentRoute: () => rootRoute,
+	path: "/projects/$projectId/codegraph",
+	component: function CodegraphPage() {
+		const {projectId} = codegraphRoute.useParams();
+		return <CodeGraphTab projectId={projectId} />;
+	},
+});
+
 const agentTasksRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: "/agents/$agentId/tasks",
@@ -272,6 +282,7 @@ const routeTree = rootRoute.addChildren([
 
 	agentWorkersRoute,
 	projectsRoute,
+	codegraphRoute,
 	agentTasksRoute,
 	agentCortexRoute,
 	agentSkillsRoute,

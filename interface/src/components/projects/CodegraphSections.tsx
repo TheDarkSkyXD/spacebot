@@ -1,5 +1,6 @@
 import {useState} from "react";
 import {useQuery, useMutation, useQueryClient} from "@tanstack/react-query";
+import {Link} from "@tanstack/react-router";
 import {Button, Card} from "@spacedrive/primitives";
 import {api} from "@/api/client";
 import {LanguageBreakdown} from "./LanguageBreakdown";
@@ -110,14 +111,23 @@ export function ReindexSection({
 						{startIndexing.isPending ? "Starting..." : "Start indexing"}
 					</Button>
 				) : (
-					<Button
-						variant="gray"
-						size="sm"
-						disabled={reindex.isPending || indexing}
-						onClick={() => reindex.mutate()}
-					>
-						{indexing ? "Indexing..." : reindex.isPending ? "Queuing..." : "Re-index"}
-					</Button>
+					<div className="flex gap-2">
+						<Link
+							to="/projects/$projectId/codegraph"
+							params={{projectId}}
+							className="inline-flex items-center rounded-md border border-app-line px-3 py-1.5 text-sm hover:bg-app-hover"
+						>
+							View graph
+						</Link>
+						<Button
+							variant="gray"
+							size="sm"
+							disabled={reindex.isPending || indexing}
+							onClick={() => reindex.mutate()}
+						>
+							{indexing ? "Indexing..." : reindex.isPending ? "Queuing..." : "Re-index"}
+						</Button>
+					</div>
 				)}
 			</Card>
 		</section>
