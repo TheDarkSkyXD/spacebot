@@ -144,32 +144,6 @@ fn as_openai_chatgpt_model(model: &ModelInfo) -> Option<ModelInfo> {
     })
 }
 
-/// Models from providers not in models.dev (private/custom endpoints).
-fn extra_models() -> Vec<ModelInfo> {
-    vec![
-        // MiniMax CN - China-specific endpoint, not on models.dev
-        ModelInfo {
-            id: "minimax-cn/MiniMax-M2.5".into(),
-            name: "MiniMax M2.5".into(),
-            provider: "minimax-cn".into(),
-            context_window: Some(200000),
-            tool_call: true,
-            reasoning: true,
-            input_audio: false,
-        },
-        // Moonshot AI (Kimi) - moonshot-v1-8k not on models.dev
-        ModelInfo {
-            id: "moonshot/moonshot-v1-8k".into(),
-            name: "Moonshot V1 8K".into(),
-            provider: "moonshot".into(),
-            context_window: Some(8000),
-            tool_call: false,
-            reasoning: false,
-            input_audio: false,
-        },
-    ]
-}
-
 /// Fetch the full model catalog from models.dev and transform into ModelInfo entries.
 async fn fetch_models_dev() -> anyhow::Result<Vec<ModelInfo>> {
     let client = reqwest::Client::new();
@@ -432,26 +406,6 @@ pub(super) async fn get_models(
             .filter_map(as_openai_chatgpt_model)
             .collect();
         models.extend(chatgpt_models);
-    }
-
-    for model in extra_models() {
-        if let Some(capability) = requested_capability {
-            if capability == "input_audio" && !model.input_audio {
-                continue;
-            }
-            if capability == "voice_transcription"
-                && (!model.input_audio || !is_known_voice_transcription_model(&model.id))
-            {
-                continue;
-            }
-        }
-        if let Some(provider) = requested_provider {
-            if model.provider == provider {
-                models.push(model);
-            }
-        } else if configured.contains(&model.provider.as_str()) {
-            models.push(model);
-        }
     }
 
     Ok(Json(ModelsResponse { models }))
