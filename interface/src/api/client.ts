@@ -26,6 +26,11 @@ export function getApiBase(): string {
 
 import type * as Types from "./types";
 
+// Code graph subsystem lives in its own module to keep this file focused;
+// re-export everything so consumers can keep importing from "@/api/client".
+export * from "./codegraph-client";
+import { codegraphApi } from "./codegraph-client";
+
 // Re-export commonly used types from schema for backward compatibility
 // Only re-export types that don't have local definitions with extra fields
 export type {
@@ -329,7 +334,7 @@ export interface TimelineWorkerRun {
 
 // Note: TimelineItem is re-exported from types.ts as a union type
 
-async function fetchJson<T>(path: string): Promise<T> {
+export async function fetchJson<T>(path: string): Promise<T> {
 	const response = await fetch(`${getApiBase()}${path}`);
 	if (!response.ok) {
 		throw new Error(`API error: ${response.status}`);
@@ -1427,6 +1432,7 @@ export interface MigrateResponse {
 }
 
 export const api = {
+	...codegraphApi,
 	status: () => fetchJson<Types.StatusResponse>("/status"),
 	overview: () => fetchJson<Types.InstanceOverviewResponse>("/agents/instance"),
 	agents: () => fetchJson<Types.AgentsResponse>("/agents"),

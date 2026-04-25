@@ -685,7 +685,7 @@ export interface paths {
         };
         /**
          * Serve a saved attachment file.
-         * @description Streams the file from disk with the correct Content-Type.
+         * @description Reads the file from disk with the correct Content-Type.
          *     Use `?download=true` to force a download prompt.
          *     Use `?thumbnail=true` to request a thumbnail (currently serves full file).
          */
@@ -944,6 +944,286 @@ export interface paths {
         };
         get: operations["get_channel_settings"];
         put: operations["update_channel_settings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects — List all indexed projects. */
+        get: operations["list_projects"];
+        put?: never;
+        /** POST /codegraph/projects — Create and index a new project. */
+        post: operations["create_project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id — Get project detail. */
+        get: operations["get_project"];
+        put?: never;
+        post?: never;
+        /** DELETE /codegraph/projects/:project_id — Remove project (cascade delete). */
+        delete: operations["delete_project"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/bulk-edges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * GET /codegraph/projects/:project_id/graph/bulk-edges — all edges.
+         * @description Returns every edge whose endpoints are in the bulk node set.
+         */
+        get: operations["get_bulk_edges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/bulk-nodes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * GET /codegraph/projects/:project_id/graph/bulk-nodes — all nodes.
+         * @description Returns every node in the project for the interactive graph canvas.
+         *     Parameter nodes are deleted before finalization (pipeline-only);
+         *     everything else — including Variable, Import, and Decorator — is
+         *     persisted. Hard-capped at 15k nodes with label-priority truncation.
+         */
+        get: operations["get_bulk_nodes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/communities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/communities — List communities. */
+        get: operations["get_communities"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/index-log": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/index-log — Index history. */
+        get: operations["get_index_log"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/nodes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/nodes — List/browse nodes. */
+        get: operations["list_nodes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/nodes/{node_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/nodes/:node_id — Node detail. */
+        get: operations["get_node"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/nodes/{node_id}/edges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/nodes/:node_id/edges — Node edges. */
+        get: operations["get_node_edges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/processes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/processes — List entry points. */
+        get: operations["get_processes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/search — Hybrid search. */
+        get: operations["search_graph"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/stats": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/graph/stats — Graph statistics. */
+        get: operations["get_graph_stats"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/graph/stream": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * GET /codegraph/projects/:project_id/graph/stream — NDJSON graph.
+         * @description Streams every node, then every edge, as newline-delimited JSON:
+         *
+         *     ```text
+         *     {"type":"node","data":{...}}
+         *     {"type":"edge","data":{...}}
+         *     {"type":"error","error":"..."}   // terminal, only on mid-stream failure
+         *     ```
+         *
+         *     Uses the native Kuzu cursor end-to-end (`CodeGraphDb::query_stream`) so
+         *     no result set is ever materialized — this is what lets huge graphs
+         *     load without crashing LadybugDB's native layer. Ports the pattern
+         *     from GitNexus's `/api/graph?stream=true` handler (`server/api.ts:707`).
+         */
+        get: operations["get_graph_stream"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/reindex": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** POST /codegraph/projects/:project_id/reindex — Trigger re-indexing. */
+        post: operations["reindex_project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/codegraph/projects/{project_id}/remove-info": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** GET /codegraph/projects/:project_id/remove-info — Get cascade delete info. */
+        get: operations["get_remove_info"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -1649,6 +1929,67 @@ export interface paths {
         get: operations["get_providers"];
         put?: never;
         post: operations["update_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/providers/anthropic/claude-cli-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Status of the local Anthropic Claude CLI: whether it's installed,
+         *     authenticated, and which email is signed in. Used by the OAuth UI to
+         *     guide users who haven't installed the CLI yet.
+         */
+        get: operations["claude_cli_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/providers/anthropic/oauth/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange the authorization code from the Anthropic OAuth callback for
+         *     access and refresh tokens, save them, and update routing.
+         */
+        post: operations["exchange_anthropic_oauth"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/providers/anthropic/oauth/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start the Anthropic OAuth PKCE flow. Returns an authorization URL the
+         *     frontend should open in a popup/tab so the user can authorize.
+         */
+        post: operations["start_anthropic_oauth"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2566,6 +2907,24 @@ export interface components {
         AgentsResponse: {
             agents: components["schemas"]["AgentInfo"][];
         };
+        AnthropicOAuthExchangeRequest: {
+            code: string;
+            state: string;
+        };
+        AnthropicOAuthExchangeResponse: {
+            message: string;
+            success: boolean;
+        };
+        AnthropicOAuthStartRequest: {
+            mode?: string | null;
+            model: string;
+        };
+        AnthropicOAuthStartResponse: {
+            authorize_url?: string | null;
+            message: string;
+            state?: string | null;
+            success: boolean;
+        };
         ApproveRequest: {
             approved_by?: string | null;
         };
@@ -2643,6 +3002,25 @@ export interface components {
             headless?: boolean | null;
             persist_session?: boolean | null;
         };
+        /**
+         * @description Edge shape for the bulk endpoint. Uses `qualified_name` for source/target
+         *     instead of `id(n)` (which LadybugDB returns as 0 for all nodes).
+         */
+        BulkEdgeSummary: {
+            /** Format: double */
+            confidence: number;
+            edge_type: string;
+            from_label: string;
+            from_qname: string;
+            to_label: string;
+            to_qname: string;
+        };
+        BulkEdgesResponse: {
+            edges: components["schemas"]["BulkEdgeSummary"][];
+        };
+        BulkNodesResponse: {
+            nodes: components["schemas"]["NodeSummary"][];
+        };
         CancelProcessRequest: {
             channel_id: string;
             process_id: string;
@@ -2676,6 +3054,22 @@ export interface components {
         ChannelsResponse: {
             channels: components["schemas"]["ChannelResponse"][];
         };
+        ClaudeCliStatusResponse: {
+            /** @description Whether the CLI reports being authenticated. */
+            authenticated: boolean;
+            /** @description Whether the `~/.claude/` folder exists (CLI has been used). */
+            claude_folder_exists: boolean;
+            /** @description Whether the `claude` binary was found on the system. */
+            cli_installed: boolean;
+            /** @description CLI version string if the binary was found and `--version` succeeded. */
+            cli_version?: string | null;
+            /** @description Whether `~/.claude/credentials.json` exists (CLI has stored credentials). */
+            credentials_file_exists: boolean;
+            /** @description Email from `claude auth status`, if available. */
+            email?: string | null;
+            /** @description Whether Anthropic OAuth is already configured in this spacebot instance. */
+            oauth_configured: boolean;
+        };
         /**
          * @description What happens when a worker explicitly calls "close" on the browser.
          * @enum {string}
@@ -2698,6 +3092,31 @@ export interface components {
             max_wait_ms?: number | null;
             min_messages?: number | null;
             multi_user_only?: boolean | null;
+        };
+        CommunitiesResponse: {
+            communities: components["schemas"]["CommunityInfo"][];
+            total: number;
+        };
+        /** @description A community summary for the UI. */
+        CommunityInfo: {
+            /**
+             * Format: double
+             * @description Internal clustering quality (0.0–1.0).
+             */
+            cohesion?: number | null;
+            description?: string | null;
+            /** Format: int64 */
+            file_count: number;
+            /** Format: int64 */
+            function_count: number;
+            id: string;
+            /** @description Top symbols by centrality. */
+            key_symbols: string[];
+            /** @description Dominant terms extracted from member names. */
+            keywords?: string[];
+            name: string;
+            /** Format: int64 */
+            node_count: number;
         };
         CompactionSection: {
             /** Format: float */
@@ -3127,6 +3546,25 @@ export interface components {
             /** Format: int64 */
             total_bytes: number;
         };
+        EdgeListResponse: {
+            edges: components["schemas"]["EdgeSummary"][];
+            limit: number;
+            offset: number;
+            total: number;
+        };
+        EdgeSummary: {
+            /** Format: double */
+            confidence: number;
+            edge_type: string;
+            /** Format: int64 */
+            from_id: number;
+            from_label: string;
+            from_name: string;
+            /** Format: int64 */
+            to_id: number;
+            to_label: string;
+            to_name: string;
+        };
         EditPageRequest: {
             author_id?: string;
             author_type?: string;
@@ -3191,6 +3629,34 @@ export interface components {
             requires_restart: boolean;
             success: boolean;
         };
+        /** @description A result from the hybrid BM25+semantic+RRF search. */
+        GraphSearchResult: {
+            /** @description Which community this node belongs to. */
+            community?: string | null;
+            label: components["schemas"]["NodeLabel"];
+            /** Format: int32 */
+            line_start?: number | null;
+            name: string;
+            /** Format: int64 */
+            node_id: number;
+            qualified_name: string;
+            /**
+             * Format: double
+             * @description Fusion score from reciprocal rank fusion.
+             */
+            score: number;
+            /** @description Snippet of surrounding code or content. */
+            snippet?: string | null;
+            source_file?: string | null;
+        };
+        GraphStatsResponse: {
+            edges_by_type: components["schemas"]["TypeCount"][];
+            nodes_by_label: components["schemas"]["LabelCount"][];
+            /** Format: int64 */
+            total_edges: number;
+            /** Format: int64 */
+            total_nodes: number;
+        };
         HealthResponse: {
             status: string;
         };
@@ -3222,6 +3688,27 @@ export interface components {
             /** @description Whether to overwrite existing secrets with the same name. */
             overwrite?: boolean;
         };
+        /** @description Index log entry for the UI. */
+        IndexLogEntry: {
+            /** Format: date-time */
+            completed_at?: string | null;
+            current_phase?: null | components["schemas"]["PipelinePhase"];
+            error?: string | null;
+            progress?: null | components["schemas"]["PipelineProgress"];
+            run_id: string;
+            /** Format: date-time */
+            started_at: string;
+            stats?: null | components["schemas"]["PipelineStats"];
+            status: components["schemas"]["IndexStatus"];
+        };
+        IndexLogResponse: {
+            entries: components["schemas"]["IndexLogEntry"][];
+        };
+        /**
+         * @description Overall indexing status for a project.
+         * @enum {string}
+         */
+        IndexStatus: "pending" | "indexing" | "indexed" | "stale" | "error";
         IngestDeleteResponse: {
             success: boolean;
         };
@@ -3290,6 +3777,23 @@ export interface components {
             /** Format: int64 */
             uptime_seconds: number;
             version: string;
+        };
+        LabelCount: {
+            /** Format: int64 */
+            count: number;
+            label: string;
+        };
+        /**
+         * @description Per-language weight in the project breakdown. `name` uses the canonical
+         *     GitHub linguist display name (e.g. "TypeScript", "C++") so the UI can
+         *     look up colors in the bundled github-colors map. `count` is the summed
+         *     file size in bytes — matching GitHub's repo language bar, where a large
+         *     source file outweighs many tiny ones.
+         */
+        LanguageCount: {
+            /** Format: int64 */
+            count: number;
+            name: string;
         };
         McpAgentStatus: {
             agent_id: string;
@@ -3454,6 +3958,54 @@ export interface components {
             message: string;
             success: boolean;
         };
+        NodeDetailResponse: {
+            node: components["schemas"]["NodeFull"];
+        };
+        NodeFull: {
+            /** Format: int64 */
+            id: number;
+            label: string;
+            /** Format: int32 */
+            line_end?: number | null;
+            /** Format: int32 */
+            line_start?: number | null;
+            name: string;
+            properties: {
+                [key: string]: unknown;
+            };
+            qualified_name: string;
+            source?: string | null;
+            source_file?: string | null;
+            written_by?: string | null;
+        };
+        /**
+         * @description All supported graph node labels.
+         * @enum {string}
+         */
+        NodeLabel: "project" | "package" | "module" | "folder" | "file" | "class" | "function" | "method" | "variable" | "parameter" | "interface" | "enum" | "decorator" | "import" | "type" | "struct" | "macro" | "trait" | "impl" | "namespace" | "type_alias" | "const" | "record" | "template" | "property" | "constructor" | "typedef" | "union" | "static" | "delegate" | "code_element" | "community" | "process" | "section" | "test" | "route" | "tool";
+        NodeListResponse: {
+            limit: number;
+            nodes: components["schemas"]["NodeSummary"][];
+            offset: number;
+            total: number;
+        };
+        NodeSummary: {
+            /**
+             * Format: int64
+             * @description File size in bytes (only set for File nodes in the bulk endpoint).
+             */
+            file_size?: number | null;
+            /** Format: int64 */
+            id: number;
+            label: string;
+            /** Format: int32 */
+            line_end?: number | null;
+            /** Format: int32 */
+            line_start?: number | null;
+            name: string;
+            qualified_name: string;
+            source_file?: string | null;
+        };
         /** @description A persisted notification row. */
         Notification: {
             action_url?: string | null;
@@ -3518,6 +4070,44 @@ export interface components {
             permissions?: null | components["schemas"]["OpenCodePermissionsUpdate"];
             /** Format: int64 */
             server_startup_timeout_secs?: number | null;
+        };
+        /**
+         * @description Phases of the indexing pipeline.
+         * @enum {string}
+         */
+        PipelinePhase: "extracting" | "structure" | "parsing" | "imports" | "calls" | "heritage" | "communities" | "processes" | "enriching" | "complete";
+        /** @description Live progress of an indexing pipeline run. */
+        PipelineProgress: {
+            /** @description Human-readable status message. */
+            message: string;
+            /** @description Current phase. */
+            phase: components["schemas"]["PipelinePhase"];
+            /**
+             * Format: float
+             * @description Progress within the current phase (0.0–1.0).
+             */
+            phase_progress: number;
+            /** @description Accumulated stats so far. */
+            stats: components["schemas"]["PipelineStats"];
+        };
+        /** @description Statistics from an indexing run. */
+        PipelineStats: {
+            /** Format: int64 */
+            communities_detected: number;
+            /** Format: int64 */
+            edges_created: number;
+            /** Format: int64 */
+            errors: number;
+            /** Format: int64 */
+            files_found: number;
+            /** Format: int64 */
+            files_parsed: number;
+            /** Format: int64 */
+            files_skipped: number;
+            /** Format: int64 */
+            nodes_created: number;
+            /** Format: int64 */
+            processes_traced: number;
         };
         PlatformCredentials: {
             discord_token?: string | null;
@@ -3627,6 +4217,27 @@ export interface components {
             name: string;
             tags?: string[];
         };
+        /** @description An entry point / process node for the UI. */
+        ProcessInfo: {
+            /** Format: int32 */
+            call_depth: number;
+            /** @description Community IDs touched by this process. */
+            communities?: string[];
+            community?: string | null;
+            entry_function: string;
+            /**
+             * Format: double
+             * @description Entry-point likelihood score (0.0–1.0 normalized).
+             */
+            entry_point_score?: number | null;
+            id: string;
+            /** @description `intra_community` or `cross_community`. */
+            process_type?: string | null;
+            source_file: string;
+            steps: string[];
+            /** @description Terminal node qualified name. */
+            terminal_id?: string | null;
+        };
         ProcessTokens: {
             /** Format: int64 */
             cache_read: number;
@@ -3638,6 +4249,10 @@ export interface components {
             output: number;
             /** Format: int64 */
             reasoning: number;
+        };
+        ProcessesResponse: {
+            processes: components["schemas"]["ProcessInfo"][];
+            total: number;
         };
         Project: {
             created_at: string;
@@ -3653,6 +4268,9 @@ export interface components {
             status: components["schemas"]["ProjectStatus"];
             tags: string[];
             updated_at: string;
+        };
+        ProjectDetailResponse: {
+            project: components["schemas"]["RegisteredProject"];
         };
         ProjectListResponse: {
             projects: components["schemas"]["Project"][];
@@ -3743,6 +4361,7 @@ export interface components {
         };
         ProviderStatus: {
             anthropic: boolean;
+            anthropic_oauth: boolean;
             azure: boolean;
             deepseek: boolean;
             fireworks: boolean;
@@ -3806,6 +4425,39 @@ export interface components {
             agent_id: string;
             server_name: string;
         };
+        /** @description Entry in the project registry (`.spacebot/codegraph/registry.json`). */
+        RegisteredProject: {
+            /** Format: date-time */
+            created_at: string;
+            /** @description Human-readable error message (only set when `status == Error`). */
+            error_message?: string | null;
+            /** @description Git commit hash at the time the index was built. */
+            indexed_commit?: string | null;
+            /** @description True when HEAD differs from the indexed commit. */
+            is_stale?: boolean;
+            /** @description Per-language file counts, sorted descending by count. */
+            language_breakdown?: components["schemas"]["LanguageCount"][];
+            last_index_stats?: null | components["schemas"]["PipelineStats"];
+            /**
+             * Format: date-time
+             * @description When the last index completed.
+             */
+            last_indexed_at?: string | null;
+            name: string;
+            /** @description Primary language detected (top entry of `language_breakdown`). */
+            primary_language?: string | null;
+            progress?: null | components["schemas"]["PipelineProgress"];
+            project_id: string;
+            root_path: string;
+            /**
+             * Format: int32
+             * @description Schema version of the graph database.
+             */
+            schema_version: number;
+            status: components["schemas"]["IndexStatus"];
+            /** Format: date-time */
+            updated_at: string;
+        };
         RegistryBrowseResponse: {
             has_more: boolean;
             skills: components["schemas"]["RegistrySkill"][];
@@ -3836,6 +4488,12 @@ export interface components {
          * @enum {string}
          */
         RelationType: "related_to" | "updates" | "contradicts" | "caused_by" | "result_of" | "part_of";
+        RemoveInfoResponse: {
+            /** Format: int64 */
+            edge_count: number;
+            /** Format: int64 */
+            node_count: number;
+        };
         RemoveSkillRequest: {
             agent_id: string;
             name: string;
@@ -3900,6 +4558,10 @@ export interface components {
             saved_filename: string;
             /** Format: int64 */
             size_bytes: number;
+        };
+        SearchResponse: {
+            results: components["schemas"]["GraphSearchResult"][];
+            total: number;
         };
         /**
          * @description Secret category determines subprocess exposure.
@@ -4079,6 +4741,8 @@ export interface components {
             /** Format: int64 */
             reasoning: number;
         };
+        /** @enum {string} */
+        ToolResultStatus: "pending" | "final" | "waiting_for_input";
         ToolsResponse: {
             binaries: components["schemas"]["BinaryEntry"][];
             tools_bin: string;
@@ -4133,7 +4797,10 @@ export interface components {
             type: "system_text";
         } | {
             call_id: string;
+            /** @description Accumulated streaming output for live display. Cleared when tool completes. */
+            live_output?: string | null;
             name: string;
+            status?: components["schemas"]["ToolResultStatus"];
             text: string;
             /** @enum {string} */
             type: "tool_result";
@@ -4157,6 +4824,11 @@ export interface components {
             max_concurrent_branches?: number | null;
             max_concurrent_workers?: number | null;
             max_turns?: number | null;
+        };
+        TypeCount: {
+            /** Format: int64 */
+            count: number;
+            edge_type: string;
         };
         UnlockBody: {
             master_key: string;
@@ -7059,6 +7731,465 @@ export interface operations {
             };
         };
     };
+    list_projects: {
+        parameters: {
+            query?: {
+                status?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description List of projects */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectListResponse"];
+                };
+            };
+        };
+    };
+    create_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateProjectRequest"];
+            };
+        };
+        responses: {
+            /** @description Project created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDetailResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDetailResponse"];
+                };
+            };
+            /** @description Project not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Project removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description Project not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_bulk_edges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bulk edge list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkEdgesResponse"];
+                };
+            };
+        };
+    };
+    get_bulk_nodes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bulk node list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BulkNodesResponse"];
+                };
+            };
+        };
+    };
+    get_communities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Community list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommunitiesResponse"];
+                };
+            };
+        };
+    };
+    get_index_log: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index log */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexLogResponse"];
+                };
+            };
+        };
+    };
+    list_nodes: {
+        parameters: {
+            query?: {
+                /** @description Filter by node label (e.g. "Function", "Class"). */
+                label?: string | null;
+                offset?: number;
+                limit?: number;
+                /**
+                 * @description Optional output schema vocabulary (`default` or `gitnexus`).
+                 *     When `gitnexus`, label names on response items are translated
+                 *     to GitNexus conventions (e.g. `MacroDef`→`Macro`).
+                 */
+                schema?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Node list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeListResponse"];
+                };
+            };
+        };
+    };
+    get_node: {
+        parameters: {
+            query?: {
+                /** @description Label hint for efficient lookup (avoids scanning all tables). */
+                label?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+                /** @description Node ID */
+                node_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Node detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeDetailResponse"];
+                };
+            };
+            /** @description Node not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_node_edges: {
+        parameters: {
+            query?: {
+                /** @description Direction: "outgoing", "incoming", or "both" (default). */
+                direction?: string;
+                /** @description Filter by edge type (e.g. "CALLS", "IMPORTS"). */
+                edge_type?: string | null;
+                offset?: number;
+                limit?: number;
+                /**
+                 * @description Optional output schema vocabulary (`default` or `gitnexus`).
+                 *     Translates label + edge-type names on response items.
+                 */
+                schema?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+                /** @description Node ID */
+                node_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Edge list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EdgeListResponse"];
+                };
+            };
+        };
+    };
+    get_processes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Process list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProcessesResponse"];
+                };
+            };
+        };
+    };
+    search_graph: {
+        parameters: {
+            query: {
+                q: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Search results */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResponse"];
+                };
+            };
+        };
+    };
+    get_graph_stats: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Graph statistics */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphStatsResponse"];
+                };
+            };
+        };
+    };
+    get_graph_stream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description NDJSON stream of graph nodes and edges */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": unknown;
+                };
+            };
+        };
+    };
+    reindex_project: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Re-indexing started */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description Project not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_remove_info: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Project ID */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removal info */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemoveInfoResponse"];
+                };
+            };
+        };
+    };
     conversation_defaults: {
         parameters: {
             query: {
@@ -8632,6 +9763,85 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProviderUpdateResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    claude_cli_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClaudeCliStatusResponse"];
+                };
+            };
+        };
+    };
+    exchange_anthropic_oauth: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AnthropicOAuthExchangeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AnthropicOAuthExchangeResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    start_anthropic_oauth: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AnthropicOAuthStartRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AnthropicOAuthStartResponse"];
                 };
             };
             /** @description Invalid request */
