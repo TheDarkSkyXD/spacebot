@@ -24,6 +24,17 @@ const OPENAI_DEVICE_OAUTH_MAX_POLL_INTERVAL_SECS: u64 = 30;
 static OPENAI_DEVICE_OAUTH_SESSIONS: LazyLock<RwLock<HashMap<String, DeviceOAuthSession>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Active Anthropic OAuth PKCE sessions: state_key -> (pkce_verifier, model, expires_at).
+static ANTHROPIC_OAUTH_SESSIONS: LazyLock<RwLock<HashMap<String, AnthropicOAuthSession>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+#[derive(Clone, Debug)]
+struct AnthropicOAuthSession {
+    verifier: String,
+    model: String,
+    expires_at: i64,
+}
+
 #[derive(Clone, Debug)]
 struct DeviceOAuthSession {
     expires_at: i64,
@@ -40,6 +51,7 @@ enum DeviceOAuthSessionStatus {
 #[derive(Serialize, utoipa::ToSchema)]
 pub(super) struct ProviderStatus {
     anthropic: bool,
+    anthropic_oauth: bool,
     openai: bool,
     openai_chatgpt: bool,
     openrouter: bool,
@@ -111,6 +123,33 @@ pub(super) struct ProviderModelTestResponse {
     provider: String,
     model: String,
     sample: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct AnthropicOAuthStartRequest {
+    model: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct AnthropicOAuthStartResponse {
+    pub success: bool,
+    pub message: String,
+    pub authorize_url: Option<String>,
+    pub state: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub(super) struct AnthropicOAuthExchangeRequest {
+    code: String,
+    state: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+pub(super) struct AnthropicOAuthExchangeResponse {
+    pub success: bool,
+    pub message: String,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -373,6 +412,7 @@ pub(super) async fn get_providers(
     let config_path = state.config_path.read().await.clone();
     let instance_dir = (**state.instance_dir.load()).clone();
     let secrets_store = state.secrets_store.load();
+    let anthropic_oauth_configured = crate::auth::credentials_path(&instance_dir).exists();
     let openai_oauth_configured = crate::openai_auth::credentials_path(&instance_dir).exists();
     let env_set = |name: &str| {
         std::env::var(name)
@@ -508,8 +548,11 @@ pub(super) async fn get_providers(
         )
     };
 
+    let anthropic = anthropic || anthropic_oauth_configured;
+
     let providers = ProviderStatus {
         anthropic,
+        anthropic_oauth: anthropic_oauth_configured,
         openai,
         openai_chatgpt,
         openrouter,
@@ -534,6 +577,7 @@ pub(super) async fn get_providers(
         azure,
     };
     let has_any = providers.anthropic
+        || providers.anthropic_oauth
         || providers.openai
         || providers.openai_chatgpt
         || providers.openrouter
@@ -558,6 +602,161 @@ pub(super) async fn get_providers(
         || providers.azure;
 
     Ok(Json(ProvidersResponse { providers, has_any }))
+}
+
+/// Start the Anthropic OAuth PKCE flow. Returns an authorization URL the
+/// frontend should open in a popup/tab so the user can authorize.
+#[utoipa::path(
+    post,
+    path = "/providers/anthropic/oauth/start",
+    request_body = AnthropicOAuthStartRequest,
+    responses(
+        (status = 200, body = AnthropicOAuthStartResponse),
+        (status = 400, description = "Invalid request"),
+    ),
+    tag = "providers",
+)]
+pub(super) async fn start_anthropic_oauth(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<AnthropicOAuthStartRequest>,
+) -> Result<Json<AnthropicOAuthStartResponse>, StatusCode> {
+    let model = request.model.trim().to_string();
+    if model.is_empty() {
+        return Ok(Json(AnthropicOAuthStartResponse {
+            success: false,
+            message: "Model cannot be empty".to_string(),
+            authorize_url: None,
+            state: None,
+        }));
+    }
+
+    let mode = match request.mode.as_deref() {
+        Some("console") => crate::auth::AuthMode::Console,
+        _ => crate::auth::AuthMode::Max,
+    };
+
+    let (url, verifier) = crate::auth::authorize_url(mode);
+    let state_key = Uuid::new_v4().to_string();
+    let expires_at = chrono::Utc::now().timestamp() + 10 * 60;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut sessions = ANTHROPIC_OAUTH_SESSIONS.write().await;
+    sessions.insert(
+        state_key.clone(),
+        AnthropicOAuthSession {
+            verifier,
+            model,
+            expires_at,
+        },
+    );
+    sessions.retain(|_, s| s.expires_at > now);
+    drop(sessions);
+
+    Ok(Json(AnthropicOAuthStartResponse {
+        success: true,
+        message: "Authorization URL generated".to_string(),
+        authorize_url: Some(url),
+        state: Some(state_key),
+    }))
+}
+
+/// Exchange the authorization code from the Anthropic OAuth callback for
+/// access and refresh tokens, save them, and update routing.
+#[utoipa::path(
+    post,
+    path = "/providers/anthropic/oauth/exchange",
+    request_body = AnthropicOAuthExchangeRequest,
+    responses(
+        (status = 200, body = AnthropicOAuthExchangeResponse),
+        (status = 400, description = "Invalid request"),
+    ),
+    tag = "providers",
+)]
+pub(super) async fn exchange_anthropic_oauth(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<AnthropicOAuthExchangeRequest>,
+) -> Result<Json<AnthropicOAuthExchangeResponse>, StatusCode> {
+    let state_key = request.state.trim().to_string();
+    let code = request.code.trim().to_string();
+
+    if state_key.is_empty() || code.is_empty() {
+        return Ok(Json(AnthropicOAuthExchangeResponse {
+            success: false,
+            message: "State and code are required".to_string(),
+        }));
+    }
+
+    let session = ANTHROPIC_OAUTH_SESSIONS.write().await.remove(&state_key);
+    let Some(session) = session else {
+        return Ok(Json(AnthropicOAuthExchangeResponse {
+            success: false,
+            message: "OAuth session not found or expired. Please try again.".to_string(),
+        }));
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if now >= session.expires_at {
+        return Ok(Json(AnthropicOAuthExchangeResponse {
+            success: false,
+            message: "OAuth session expired. Please try again.".to_string(),
+        }));
+    }
+
+    let credentials = match crate::auth::exchange_code(&code, &session.verifier).await {
+        Ok(creds) => creds,
+        Err(error) => {
+            return Ok(Json(AnthropicOAuthExchangeResponse {
+                success: false,
+                message: format!("Token exchange failed: {error}"),
+            }));
+        }
+    };
+
+    let instance_dir = (**state.instance_dir.load()).clone();
+    if let Err(error) = crate::auth::save_credentials(&instance_dir, &credentials) {
+        tracing::warn!(%error, "failed to save Anthropic OAuth credentials");
+        return Ok(Json(AnthropicOAuthExchangeResponse {
+            success: false,
+            message: format!("Failed to save credentials: {error}"),
+        }));
+    }
+
+    if let Some(llm_manager) = state.llm_manager.read().await.as_ref() {
+        llm_manager
+            .set_anthropic_oauth_credentials(credentials)
+            .await;
+    }
+
+    let config_path = state.config_path.read().await.clone();
+    let content = if config_path.exists() {
+        tokio::fs::read_to_string(&config_path)
+            .await
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() {
+        apply_model_routing(&mut doc, &session.model);
+        if let Err(error) = tokio::fs::write(&config_path, doc.to_string()).await {
+            tracing::warn!(%error, "failed to write config.toml after Anthropic OAuth");
+        }
+    }
+
+    refresh_defaults_config(&state).await;
+
+    state
+        .provider_setup_tx
+        .try_send(crate::ProviderSetupEvent::ProvidersConfigured)
+        .ok();
+
+    Ok(Json(AnthropicOAuthExchangeResponse {
+        success: true,
+        message: format!(
+            "Anthropic OAuth configured. Model '{}' applied to routing.",
+            session.model
+        ),
+    }))
 }
 
 #[utoipa::path(
@@ -1492,6 +1691,26 @@ pub(super) async fn delete_provider(
     axum::extract::Path(provider): axum::extract::Path<String>,
 ) -> Result<Json<ProviderUpdateResponse>, StatusCode> {
     let provider = provider.trim().to_lowercase();
+    // Anthropic OAuth credentials are stored in auth.json next to the
+    // TOML config (separate from the API key) — handle removal separately.
+    if provider == "anthropic-oauth" {
+        let instance_dir = (**state.instance_dir.load()).clone();
+        let cred_path = crate::auth::credentials_path(&instance_dir);
+        if cred_path.exists() {
+            tokio::fs::remove_file(&cred_path).await.map_err(|error| {
+                tracing::error!(%error, path = %cred_path.display(), "failed to remove Anthropic OAuth credentials");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        }
+        if let Some(mgr) = state.llm_manager.read().await.as_ref() {
+            mgr.clear_anthropic_oauth_credentials().await;
+        }
+        return Ok(Json(ProviderUpdateResponse {
+            success: true,
+            message: "Anthropic OAuth credentials removed".into(),
+        }));
+    }
+
     // OpenAI ChatGPT OAuth credentials are stored as a separate JSON file,
     // not in the TOML config, so handle removal separately.
     if provider == "openai-chatgpt" {
