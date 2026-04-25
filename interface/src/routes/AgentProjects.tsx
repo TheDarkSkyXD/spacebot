@@ -46,6 +46,12 @@ import {
 } from "@spacedrive/primitives";
 import {formatTimeAgo} from "@/lib/format";
 import {clsx} from "clsx";
+import {
+	DirectoryBrowserButton,
+	LanguageBreakdownSection,
+	ReindexSection,
+	folderNameFromPath,
+} from "@/components/projects/CodegraphSections";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -222,12 +228,26 @@ function CreateProjectDialog({
 					</div>
 					<div>
 						<Label>Root Path</Label>
-						<Input
-							value={rootPath}
-							onChange={(e) => setRootPath(e.target.value)}
-							placeholder="/home/user/projects/my-project"
-							className="font-mono"
-						/>
+						<div className="flex gap-2">
+							<Input
+								value={rootPath}
+								onChange={(e) => {
+									const next = e.target.value;
+									setRootPath(next);
+									// Auto-fill name from folder when the user hasn't
+									// already typed something.
+									if (!name.trim()) setName(folderNameFromPath(next));
+								}}
+								placeholder="/home/user/projects/my-project"
+								className="font-mono"
+							/>
+							<DirectoryBrowserButton
+								onPick={(picked) => {
+									setRootPath(picked);
+									if (!name.trim()) setName(folderNameFromPath(picked));
+								}}
+							/>
+						</div>
 					</div>
 					<div>
 						<Label>Description (optional)</Label>
@@ -929,6 +949,14 @@ function ProjectDetail({
 						</div>
 					)}
 				</section>
+
+				{/* Code Graph: language breakdown + reindex/start indexing controls. */}
+				<LanguageBreakdownSection projectId={projectId} />
+				<ReindexSection
+					projectId={projectId}
+					rootPath={project.root_path}
+					projectName={project.name}
+				/>
 
 				{/* Meta */}
 				<div className="flex items-center gap-4 text-xs text-ink-faint">
