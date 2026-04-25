@@ -1660,6 +1660,51 @@ async fn run(
     api_state.set_notification_store(global_notification_store.clone());
     let api_state = Arc::new(api_state);
 
+    // Initialize the Code Graph Manager and bridge its events to the
+    // ApiEvent SSE stream so the frontend gets real-time graph updates.
+    let codegraph_manager = Arc::new(spacebot::codegraph::CodeGraphManager::new(
+        config.instance_dir.clone(),
+    ));
+    if let Err(err) = codegraph_manager.load_registry().await {
+        tracing::warn!(%err, "failed to load code graph project registry");
+    }
+    api_state.set_codegraph_manager(codegraph_manager.clone());
+    {
+        let mut cg_rx = codegraph_manager.subscribe();
+        let api_tx = api_state.event_tx.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = cg_rx.recv().await {
+                let api_event = match &event {
+                    spacebot::codegraph::events::CodeGraphEvent::GraphStale {
+                        project_id,
+                        stale_files,
+                    } => Some(spacebot::api::ApiEvent::CodeGraphStale {
+                        project_id: project_id.clone(),
+                        changed_files: stale_files.clone(),
+                    }),
+                    spacebot::codegraph::events::CodeGraphEvent::GraphChanged {
+                        project_id,
+                        changed_files,
+                        ..
+                    } => Some(spacebot::api::ApiEvent::CodeGraphChanged {
+                        project_id: project_id.clone(),
+                        changed_files: changed_files.clone(),
+                    }),
+                    spacebot::codegraph::events::CodeGraphEvent::GraphIndexed {
+                        project_id,
+                        ..
+                    } => Some(spacebot::api::ApiEvent::CodeGraphIndexed {
+                        project_id: project_id.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(evt) = api_event {
+                    let _ = api_tx.send(evt);
+                }
+            }
+        });
+    }
+
     // Keep the secrets API available in setup mode so encrypted stores can be
     // unlocked before providers/agents are initialized.
     if let Some(store) = &bootstrapped_store {
