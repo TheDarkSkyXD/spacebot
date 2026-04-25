@@ -5,7 +5,17 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::Emitter;
 use tauri::Manager;
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+
+/// In debug builds on Windows, allocate a visible console so the
+/// backend sidecar's piped stdout/stderr have somewhere to land.
+/// Without this, the GUI subsystem swallows all print output.
+#[cfg(all(debug_assertions, windows))]
+fn alloc_debug_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::AllocConsole();
+    }
+}
 
 // ── Voice overlay dimensions ─────────────────────────────────────────────
 const OVERLAY_INITIAL_WIDTH: f64 = 520.0;
@@ -191,6 +201,9 @@ fn apply_overlay_window_chrome(window: &tauri::WebviewWindow) {
 }
 
 fn main() {
+    #[cfg(all(debug_assertions, windows))]
+    alloc_debug_console();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -201,15 +214,14 @@ fn main() {
     // Option+Space toggles the overlay. Option+Shift+Space is hold-to-talk.
     let toggle_shortcut = Shortcut::new(Some(Modifiers::ALT), Code::Space);
     let voice_shortcut = Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::Space);
+    let toggle_shortcut_setup = toggle_shortcut.clone();
+    let voice_shortcut_setup = voice_shortcut.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcut(toggle_shortcut.clone())
-                .unwrap()
-                .with_shortcut(voice_shortcut.clone())
-                .unwrap()
                 .with_handler(
                     move |app, _shortcut, event| match (_shortcut, event.state) {
                         (shortcut, tauri_plugin_global_shortcut::ShortcutState::Pressed)
@@ -239,7 +251,7 @@ fn main() {
             toggle_voice_overlay,
             resize_overlay_window,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // Apply macOS titlebar style (invisible toolbar for traffic light padding)
             #[cfg(target_os = "macos")]
             {
@@ -256,19 +268,107 @@ fn main() {
                 }
             }
 
+            // Register global shortcuts (non-fatal if already registered by another instance)
+            let gs = app.global_shortcut();
+            if let Err(e) = gs.register(toggle_shortcut_setup) {
+                tracing::warn!("Failed to register toggle shortcut: {e}");
+            }
+            if let Err(e) = gs.register(voice_shortcut_setup) {
+                tracing::warn!("Failed to register voice shortcut: {e}");
+            }
+
+            // In debug builds, spawn the backend server and pipe its output
+            // to this console window so developers can see server logs live.
+            #[cfg(debug_assertions)]
+            {
+                // Resolve the backend binary. Try the sidecar location first
+                // (works under `tauri dev`), then fall back to the repo-root
+                // target/debug build (works when running the exe directly).
+                let backend_bin = {
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    let exe_dir = exe.parent().unwrap_or(std::path::Path::new("."));
+
+                    // Sidecar location: next to Tauri exe (set up by tauri dev)
+                    let triple = if cfg!(target_arch = "x86_64") {
+                        "x86_64-pc-windows-msvc"
+                    } else {
+                        "aarch64-pc-windows-msvc"
+                    };
+                    let sidecar = exe_dir.join(format!("binaries/spacebot-{triple}.exe"));
+
+                    if sidecar.exists() {
+                        sidecar
+                    } else {
+                        // Direct exe launch: go from desktop/src-tauri/target/debug/
+                        // up to repo root, then target/debug/spacebot.exe
+                        let repo_root_bin = exe_dir
+                            .join("../../../../target/debug/spacebot.exe");
+                        if repo_root_bin.exists() {
+                            repo_root_bin
+                        } else {
+                            // Last resort: bundled sidecar dir
+                            exe_dir
+                                .join("../../binaries")
+                                .join(format!("spacebot-{triple}.exe"))
+                        }
+                    }
+                };
+
+                tracing::info!(?backend_bin, "starting backend server");
+
+                match std::process::Command::new(&backend_bin)
+                    .args(["start", "--foreground", "--debug"])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        // Pipe stderr (where tracing logs go) to this console
+                        if let Some(stderr) = child.stderr.take() {
+                            std::thread::spawn(move || {
+                                use std::io::BufRead;
+                                let reader = std::io::BufReader::new(stderr);
+                                for line in reader.lines() {
+                                    if let Ok(line) = line {
+                                        eprintln!("{line}");
+                                    }
+                                }
+                            });
+                        }
+                        if let Some(stdout) = child.stdout.take() {
+                            std::thread::spawn(move || {
+                                use std::io::BufRead;
+                                let reader = std::io::BufReader::new(stdout);
+                                for line in reader.lines() {
+                                    if let Ok(line) = line {
+                                        println!("{line}");
+                                    }
+                                }
+                            });
+                        }
+                        tracing::info!("backend server started — logs streaming below");
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, ?backend_bin, "failed to start backend server");
+                    }
+                }
+            }
+
             // Show window after setup
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(debug_assertions)]
+                window.open_devtools();
                 let _ = window.show();
             }
 
             Ok(())
         })
-        .on_window_event(|window, event| {
+        .on_window_event(|_window, _event| {
             // Re-apply titlebar style on fullscreen transitions (macOS)
             #[cfg(target_os = "macos")]
-            if let tauri::WindowEvent::Resized(_) = event {
-                if let Ok(is_fullscreen) = window.is_fullscreen() {
-                    if let Ok(ns_window) = window.ns_window() {
+            if let tauri::WindowEvent::Resized(_) = _event {
+                if let Ok(is_fullscreen) = _window.is_fullscreen() {
+                    if let Ok(ns_window) = _window.ns_window() {
                         unsafe {
                             sb_desktop_macos::set_titlebar_style(&ns_window, is_fullscreen);
                         }
