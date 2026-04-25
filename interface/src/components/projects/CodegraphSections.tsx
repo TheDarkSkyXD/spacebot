@@ -1,4 +1,4 @@
-import {useState} from "react";
+import {useEffect, useState} from "react";
 import {useQuery, useMutation, useQueryClient} from "@tanstack/react-query";
 import {Link} from "@tanstack/react-router";
 import {Button, Card} from "@spacedrive/primitives";
@@ -13,7 +13,9 @@ import {LanguageBreakdown} from "./LanguageBreakdown";
 /// no codegraph project exists yet (lets callers show a "start indexing"
 /// affordance).
 function useCodegraphProject(projectId: string) {
-	return useQuery({
+	const queryClient = useQueryClient();
+
+	const query = useQuery({
 		queryKey: ["codegraph", "project", projectId],
 		queryFn: async () => {
 			try {
@@ -23,10 +25,28 @@ function useCodegraphProject(projectId: string) {
 				return null;
 			}
 		},
-		// Indexing emits SSE events; this poll catches the terminal state
-		// even if the SSE connection lapsed mid-index.
-		refetchInterval: 5_000,
+		// Only poll while indexing — SSE drives steady-state updates.
+		// Polling at idle leaves orphaned in-flight requests hammering the
+		// backend during project switches.
+		refetchInterval: (q) => {
+			const status = q.state.data?.project.status;
+			if (status === "indexing" || status === "pending") return 1_500;
+			return false;
+		},
 	});
+
+	// Cancel in-flight codegraph queries for the outgoing project on
+	// unmount / projectId change so a switch doesn't keep CONNECTION_REFUSED-
+	// generating fetches alive while the new project's LadybugDB warms up.
+	useEffect(() => {
+		return () => {
+			queryClient.cancelQueries({
+				queryKey: ["codegraph", "project", projectId],
+			});
+		};
+	}, [projectId, queryClient]);
+
+	return query;
 }
 
 export function LanguageBreakdownSection({projectId}: {projectId: string}) {

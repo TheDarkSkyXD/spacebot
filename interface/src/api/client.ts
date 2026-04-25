@@ -25,6 +25,7 @@ export function getApiBase(): string {
 }
 
 import type * as Types from "./types";
+import { fetchWithRetry } from "./fetchRetry";
 
 // Code graph subsystem lives in its own module to keep this file focused;
 // re-export everything so consumers can keep importing from "@/api/client".
@@ -335,7 +336,7 @@ export interface TimelineWorkerRun {
 // Note: TimelineItem is re-exported from types.ts as a union type
 
 export async function fetchJson<T>(path: string): Promise<T> {
-	const response = await fetch(`${getApiBase()}${path}`);
+	const response = await fetchWithRetry(`${getApiBase()}${path}`);
 	if (!response.ok) {
 		throw new Error(`API error: ${response.status}`);
 	}
