@@ -192,6 +192,18 @@ impl ProjectStore {
 
     pub async fn create_project(&self, input: CreateProjectInput) -> Result<Project> {
         let id = uuid::Uuid::new_v4().to_string();
+        self.create_project_with_id(&id, input).await
+    }
+
+    /// Insert a Project at a caller-specified id. Used by the startup
+    /// auto-import so a pre-existing codegraph project (whose project_id is
+    /// a slug like "spacebot") can be adopted into the upstream Project
+    /// store under the same id, keeping the two views linked.
+    pub async fn create_project_with_id(
+        &self,
+        id: &str,
+        input: CreateProjectInput,
+    ) -> Result<Project> {
         let tags_json = serde_json::to_string(&input.tags).context("failed to serialize tags")?;
         let settings_json =
             serde_json::to_string(&input.settings).context("failed to serialize settings")?;
@@ -202,7 +214,7 @@ impl ProjectStore {
             VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
             "#,
         )
-        .bind(&id)
+        .bind(id)
         .bind(&input.name)
         .bind(&input.description)
         .bind(&input.icon)
@@ -214,7 +226,7 @@ impl ProjectStore {
         .context("failed to insert project")?;
 
         Ok(self
-            .get_project(&id)
+            .get_project(id)
             .await?
             .context("project not found after insert")?)
     }

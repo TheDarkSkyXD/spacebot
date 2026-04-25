@@ -1705,6 +1705,43 @@ async fn run(
         });
     }
 
+    // Bridge fork-era codegraph projects into upstream's Project store on
+    // startup. The codegraph subsystem stored its registry independently of
+    // upstream's projects table, so a fresh integrate/spaceui-merge
+    // instance with a pre-existing codegraph registry shows zero entries
+    // in the SpaceUI Sidebar / /projects view. For each codegraph project
+    // without a matching upstream Project (by id), insert one — using the
+    // codegraph project_id as the upstream Project id so the two views
+    // share the same key.
+    {
+        let cg_projects = codegraph_manager.list_projects().await;
+        for cg in cg_projects {
+            match global_project_store.get_project(&cg.project_id).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, project_id = %cg.project_id, "failed to probe upstream project store; skipping import");
+                    continue;
+                }
+            }
+            let input = spacebot::projects::CreateProjectInput {
+                name: cg.name.clone(),
+                description: "Imported from codegraph (auto)".to_string(),
+                icon: String::new(),
+                tags: Vec::new(),
+                root_path: cg.root_path.to_string_lossy().to_string(),
+                settings: serde_json::Value::Null,
+            };
+            match global_project_store
+                .create_project_with_id(&cg.project_id, input)
+                .await
+            {
+                Ok(_) => tracing::info!(project_id = %cg.project_id, "imported codegraph project into upstream project store"),
+                Err(error) => tracing::warn!(%error, project_id = %cg.project_id, "failed to import codegraph project"),
+            }
+        }
+    }
+
     // Keep the secrets API available in setup mode so encrypted stores can be
     // unlocked before providers/agents are initialized.
     if let Some(store) = &bootstrapped_store {
