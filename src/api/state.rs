@@ -263,6 +263,8 @@ pub struct ApiState {
     pub project_store: ArcSwap<Option<Arc<ProjectStore>>>,
     /// Instance-level notification store for the dashboard inbox.
     pub notification_store: ArcSwap<Option<Arc<NotificationStore>>>,
+    /// Instance-wide code graph manager (project indexing + queries).
+    pub codegraph_manager: ArcSwap<Option<Arc<crate::codegraph::CodeGraphManager>>>,
     /// Per-agent RuntimeConfig for reading live hot-reloaded configuration.
     pub runtime_configs: ArcSwap<HashMap<String, Arc<RuntimeConfig>>>,
     /// Per-agent MCP managers for status and reconnect APIs.
@@ -343,6 +345,20 @@ pub struct ChannelToolCallEntry {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiEvent {
+    /// Code graph project's source files have changed and the graph is now stale.
+    CodeGraphStale {
+        project_id: String,
+        changed_files: Vec<String>,
+    },
+    /// Code graph incremental update completed — graph data changed.
+    CodeGraphChanged {
+        project_id: String,
+        changed_files: Vec<String>,
+    },
+    /// Code graph full indexing completed.
+    CodeGraphIndexed {
+        project_id: String,
+    },
     /// An inbound message from a user.
     InboundMessage {
         agent_id: String,
@@ -532,6 +548,7 @@ impl ApiState {
             wiki_store: ArcSwap::from_pointee(None),
             project_store: ArcSwap::from_pointee(None),
             notification_store: ArcSwap::from_pointee(None),
+            codegraph_manager: ArcSwap::from_pointee(None),
             runtime_configs: ArcSwap::from_pointee(HashMap::new()),
             mcp_managers: ArcSwap::from_pointee(HashMap::new()),
             sandboxes: ArcSwap::from_pointee(HashMap::new()),
@@ -1155,6 +1172,11 @@ impl ApiState {
     /// Set the instance-level notification store.
     pub fn set_notification_store(&self, store: Arc<NotificationStore>) {
         self.notification_store.store(Arc::new(Some(store)));
+    }
+
+    /// Set the instance-wide code graph manager.
+    pub fn set_codegraph_manager(&self, manager: Arc<crate::codegraph::CodeGraphManager>) {
+        self.codegraph_manager.store(Arc::new(Some(manager)));
     }
 
     /// Insert a notification and broadcast `NotificationCreated` via SSE.

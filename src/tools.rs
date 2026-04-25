@@ -33,6 +33,7 @@ pub mod branch_tool;
 pub mod browser;
 pub mod cancel;
 pub mod channel_recall;
+pub mod codegraph;
 pub mod config_inspect;
 pub mod cron;
 pub mod email_search;

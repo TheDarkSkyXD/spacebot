@@ -2,9 +2,10 @@
 
 use super::state::ApiState;
 use super::{
-    activity, agents, attachments, bindings, channels, config, cortex, cron, factory, ingest,
-    links, mcp, memories, messaging, models, notifications, opencode_proxy, portal, projects,
-    providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki, workers,
+    activity, agents, attachments, bindings, channels, codegraph, config, cortex, cron, factory,
+    ingest, links, mcp, memories, messaging, models, notifications, opencode_proxy, portal,
+    projects, providers, secrets, settings, skills, ssh, system, tasks, tools, usage, wiki,
+    workers,
 };
 
 use axum::Json;
@@ -148,6 +149,28 @@ pub fn api_router() -> OpenApiRouter<Arc<ApiState>> {
         .routes(routes!(wiki::edit_page))
         .routes(routes!(wiki::get_history))
         .routes(routes!(wiki::restore_version))
+        // Code graph routes
+        .routes(routes!(
+            codegraph::list_projects,
+            codegraph::create_project
+        ))
+        .routes(routes!(
+            codegraph::get_project,
+            codegraph::delete_project
+        ))
+        .routes(routes!(codegraph::reindex_project))
+        .routes(routes!(codegraph::get_communities))
+        .routes(routes!(codegraph::get_processes))
+        .routes(routes!(codegraph::search_graph))
+        .routes(routes!(codegraph::get_index_log))
+        .routes(routes!(codegraph::get_remove_info))
+        .routes(routes!(codegraph::list_nodes))
+        .routes(routes!(codegraph::get_node))
+        .routes(routes!(codegraph::get_node_edges))
+        .routes(routes!(codegraph::get_graph_stats))
+        .routes(routes!(codegraph::get_bulk_nodes))
+        .routes(routes!(codegraph::get_bulk_edges))
+        .routes(routes!(codegraph::get_graph_stream))
         // Project routes
         .routes(routes!(projects::list_projects, projects::create_project))
         .routes(routes!(projects::reorder_projects))

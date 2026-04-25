@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod api;
 pub mod auth;
+pub mod codegraph;
 pub mod config;
 pub mod conversation;
 pub mod cron;
