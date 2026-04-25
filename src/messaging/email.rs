@@ -1,5 +1,10 @@
 //! Email messaging adapter using IMAP polling and SMTP delivery.
 
+// imap::error::Error is large (256+ bytes) and TlsStream<TcpStream> is
+// much larger than bare TcpStream — both lints are about external library
+// types we don't control.
+#![allow(clippy::result_large_err, clippy::large_enum_variant)]
+
 use crate::config::EmailConfig;
 use crate::messaging::traits::{HistoryMessage, InboundStream, Messaging};
 use crate::{InboundMessage, MessageContent, OutboundResponse};
