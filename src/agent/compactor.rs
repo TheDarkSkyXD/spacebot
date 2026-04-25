@@ -11,7 +11,6 @@ use crate::{AgentDeps, ChannelId, ProcessId, ProcessType};
 use rig::agent::AgentBuilder;
 use rig::completion::CompletionModel;
 use rig::message::{AssistantContent, Message, UserContent};
-// ToolServerHandle removed — compactor no longer has tools (Phase 5b).
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -260,9 +259,8 @@ async fn run_compaction(
         .with_context(&*deps.agent_id, "compactor")
         .with_routing((**routing).clone());
 
-    // Give the compaction worker memory_save so it can directly persist memories
     // No tool server — the compactor's sole job is producing a summary.
-    // Memory extraction is handled by persistence branches (Phase 5a).
+    // Memory extraction is handled by persistence branches.
     let agent = AgentBuilder::new(model)
         .preamble(compactor_prompt)
         .default_max_turns(1)

@@ -1349,7 +1349,11 @@ fn signal_from_event(event: ProcessEvent) -> Option<Signal> {
         | ProcessEvent::OpenCodePartUpdated { .. }
         | ProcessEvent::WorkerInitialResult { .. }
         | ProcessEvent::WorkerText { .. }
-        | ProcessEvent::CortexChatUpdate { .. } => return None,
+        | ProcessEvent::CortexChatUpdate { .. }
+        | ProcessEvent::CodeGraphIndexing { .. }
+        | ProcessEvent::CodeGraphIndexed { .. }
+        | ProcessEvent::CodeGraphChanged { .. }
+        | ProcessEvent::CodeGraphError { .. } => return None,
     })
 }
 
@@ -2372,7 +2376,7 @@ pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool 
     tracing::info!("cortex generating memory bulletin");
     let started = Instant::now();
 
-    // Phase 1: Programmatically gather raw memory sections (no LLM needed)
+    // Programmatically gather raw memory sections (no LLM needed).
     let raw_sections = gather_bulletin_sections(deps).await;
     let section_count = raw_sections.matches("### ").count();
 
@@ -2394,7 +2398,7 @@ pub async fn generate_bulletin(deps: &AgentDeps, logger: &CortexLogger) -> bool 
         return true;
     }
 
-    // Phase 2: LLM synthesis of raw sections into a cohesive bulletin
+    // LLM synthesis of raw sections into a cohesive bulletin.
     let cortex_config = **deps.runtime_config.cortex.load();
     let prompt_engine = deps.runtime_config.prompts.load();
     let bulletin_prompt = match prompt_engine.render_static("cortex_bulletin") {

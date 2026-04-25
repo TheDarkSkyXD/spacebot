@@ -20,5 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 sb-desktop-macos = { path = "crates/macos" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

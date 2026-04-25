@@ -156,6 +156,12 @@ export function ServerProvider({ children }: { children: ReactNode }) {
 	const [hasBootstrapped, setHasBootstrapped] = useState(sameOrigin);
 	const onBootstrapped = useCallback(() => setHasBootstrapped(true), []);
 	const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+	// Require two consecutive failed polls before declaring disconnected.
+	// The sidecar lazy-opens per-project LadybugDB databases on first access
+	// and the schema init (~47 DDL statements) can briefly delay
+	// /api/health enough to fail one poll — that transient shouldn't
+	// cascade into disabling SSE and showing the disconnection banner.
+	const consecutiveFailuresRef = useRef(0);
 
 	// On mount, reconcile with Tauri-persisted URL (async)
 	useEffect(() => {
@@ -177,8 +183,16 @@ export function ServerProvider({ children }: { children: ReactNode }) {
 			return;
 		}
 		const ok = await checkHealth(serverUrl);
-		setState(ok ? "connected" : "disconnected");
-		if (ok) setHasConnected(true);
+		if (ok) {
+			consecutiveFailuresRef.current = 0;
+			setState("connected");
+			setHasConnected(true);
+		} else {
+			consecutiveFailuresRef.current += 1;
+			if (consecutiveFailuresRef.current >= 2) {
+				setState("disconnected");
+			}
+		}
 	}, [serverUrl, sameOrigin]);
 
 	const setServerUrl = useCallback((raw: string) => {
